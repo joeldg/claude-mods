@@ -38,6 +38,21 @@ Puts files you just downloaded into your prompt with one click.
 
 Settings: `folder` (`~/Downloads`), `extensions`, `pollSeconds` (5), `maxAgeMinutes` (120).
 
+## effort-router
+
+Sets effort per message, so you don't have to switch it by hand.
+
+- **Git chores** ("merged", "#219 merged", "commit and push", "push it", "open a PR", "close the issue") run at **low** effort and come back faster.
+- **Deep asks** (audit, review, plan, design, investigate, root cause, "why does…", "figure out") run at **max**.
+- **Everything else**, including approvals like "yes", "go ahead" and "continue" and anything that starts new work ("merged 219, go ahead with #214"), keeps your session's own effort.
+- **Prompt cache:** changing effort makes the whole conversation get cached again. So it never switches mid-turn, raises effort at once, and over a large, warm cache lowers it only after 2 routine turns in a row. In small contexts, or once the cache has lapsed, it switches right away.
+- **Model guard:** set `avoidModel` (a regex such as `fable`) to send those requests to `fallbackModel` instead, subagents included.
+- `/route` shows the last decision and the session's counts. `/route off` and `/route on` toggle it; `/route deep` and `/route routine` force the next turn.
+- Status line while a turn is routed: `effort: low (routine)`.
+- Makes no model calls.
+
+Settings: `routineEffort` (low), `deepEffort` (max), `routinePattern`, `deepPattern`, `avoidModel`, `fallbackModel` (opus), `stickyTurns` (2), `freeSwitchTokens` (30000), `cacheTtlMinutes` (60).
+
 ## job-watch
 
 A **Jobs** pane for long-running work: training runs, downloads, extractions.
@@ -185,7 +200,7 @@ The quit request goes out when Claude issues the command, before any permission 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router" } }
   ```
 
 ## Checking
@@ -204,4 +219,5 @@ claude plugin validate second-opinion && claude plugin test second-opinion
 claude plugin validate downloads-drop && claude plugin test downloads-drop
 claude plugin validate dev-servers && claude plugin test dev-servers
 claude plugin validate standing-orders && claude plugin test standing-orders
+claude plugin validate effort-router && claude plugin test effort-router
 ```

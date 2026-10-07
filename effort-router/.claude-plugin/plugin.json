@@ -1,0 +1,85 @@
+{
+  "name": "effort-router",
+  "version": "0.1.0",
+  "description": "Routes each turn's effort from your prompt: git housekeeping replies (\"merged\", \"commit and push\", \"push it\") run at low effort, deep asks (review, audit, plan, why does...) at max, everything else (approvals like \"yes\" or \"continue\" included) at the session's own. Switches only when the prompt cache makes it worth it, never mid-turn; optional model guard; /route shows and steers it. No model calls of its own.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Route effort",
+      "description": "Off: every request is left as the session would send it, and the model guard is off too.",
+      "default": true
+    },
+    "routineEffort": {
+      "type": "string",
+      "title": "Effort for routine replies",
+      "description": "The effort a turn started by a git housekeeping reply (\"merged\", \"#219 merged\", \"commit and push\", \"push it\") runs at. Approvals like \"yes\" or \"continue\" never count as routine.",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "low"
+    },
+    "deepEffort": {
+      "type": "string",
+      "title": "Effort for deep asks",
+      "description": "The effort a turn started by a deep ask (review, audit, plan, investigate, why does...) runs at.",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "max"
+    },
+    "routinePattern": {
+      "type": "string",
+      "title": "Routine phrases (regex)",
+      "description": "Phrases a routine reply opens with, matched case-insensitively at the start of prompts of 120 characters or less, with at most a few words after them and none that start new work, e.g. merged|ship it. Empty uses the built-in list (merged, commit and push, push it, open a PR, close it).",
+      "default": ""
+    },
+    "deepPattern": {
+      "type": "string",
+      "title": "Deep wording (regex)",
+      "description": "Wording that asks for deep thought anywhere in the prompt, case-insensitive, e.g. \\b(audit|threat model)\\b. Empty uses the built-in list.",
+      "default": ""
+    },
+    "avoidModel": {
+      "type": "string",
+      "title": "Avoid models (regex)",
+      "description": "Requests whose model id matches this (e.g. fable) are sent to the fallback model instead, subagents included. Empty turns the model guard off.",
+      "default": ""
+    },
+    "fallbackModel": {
+      "type": "string",
+      "title": "Fallback model",
+      "description": "Where avoided requests go: opus, sonnet, haiku or fable (each sent as its current model id), or a full model id.",
+      "default": "opus"
+    },
+    "stickyTurns": {
+      "type": "number",
+      "title": "Turns before lowering effort",
+      "description": "Over a large, warm prompt cache, a lower effort is only sent once this many turns in a row want it, since each switch rewrites the cache. 1 switches every time.",
+      "default": 2
+    },
+    "freeSwitchTokens": {
+      "type": "number",
+      "title": "Switch freely below (context tokens)",
+      "description": "Below this context size a cache rewrite costs little, so the effort switches at once.",
+      "default": 30000
+    },
+    "cacheTtlMinutes": {
+      "type": "number",
+      "title": "Prompt cache lifetime (minutes)",
+      "description": "After this long idle the cache has lapsed and a switch costs nothing extra. Claude Code keeps the main thread's cache 60 minutes on a subscription, 5 with an API key.",
+      "default": 60
+    }
+  }
+}
