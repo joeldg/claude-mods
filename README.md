@@ -103,6 +103,22 @@ Keeps scheduled routines (daily digests, newsletters) from silently stalling whi
 - `/routine` shows the routine's name, how long it has run, its waits, and the settings.
 - Makes no model calls.
 
+## second-opinion
+
+A Fable review in the background, without switching your session's model. **Each run is one Fable call against your usage.**
+
+- `/second-opinion`: reviews recent work. On a feature branch that's the branch against the default branch; otherwise the last 12 commits, plus the diff and `git status`, capped at 60k characters.
+- Other forms:
+  - `/second-opinion commits 5`
+  - `/second-opinion diff` (uncommitted changes)
+  - `/second-opinion file docs/ADR-007.md`
+  - `/second-opinion <question>`: adds a question for Fable to answer first.
+- The command returns at once, and the status line shows `second opinion: reviewing…`. When the review is ready you get a toast, and a pane opens with it, ranked: wrong assumptions, bugs and risks, what's missing, what to do next.
+- **Send to Claude** attaches the review to your next prompt (once) and drafts "What do you agree with, and what would you act on?".
+- Reviews are saved in `~/.claude/second-opinions/<project>/`. `/second-opinion list` lists them, and `/second-opinion show [n]` reopens one.
+
+Settings: `model` (`claude-fable-5-1`), `effort` (high), `maxContextChars` (60000).
+
 ## slicer-handoff
 
 Makes Claude's `open` commands hand 3D files to the right slicer.
@@ -129,7 +145,7 @@ The quit request goes out when Claude issues the command, before any permission 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion" } }
   ```
 
 ## Checking
@@ -144,4 +160,5 @@ claude plugin validate slicer-handoff && claude plugin test slicer-handoff
 claude plugin validate pr-autopilot && claude plugin test pr-autopilot
 claude plugin validate routine-watch && claude plugin test routine-watch
 claude plugin validate modal-meter && claude plugin test modal-meter
+claude plugin validate second-opinion && claude plugin test second-opinion
 ```

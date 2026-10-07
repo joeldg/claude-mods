@@ -1,0 +1,30 @@
+{
+  "name": "second-opinion",
+  "version": "0.1.0",
+  "description": "/second-opinion asks Fable (or the model you set) for a candid senior review of your recent commits, branch, uncommitted diff or a plan file, in the background without switching the session's model. Each run is one paid model call against your usage; the review opens in a pane, is saved under ~/.claude/second-opinions/, and can be handed to Claude with your next prompt.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Reviewer model",
+      "description": "The model id or alias that writes the second opinion. Every /second-opinion run makes one call to it, billed to your usage.",
+      "default": "claude-fable-5-1"
+    },
+    "effort": {
+      "type": "string",
+      "title": "Reviewer effort",
+      "description": "How hard the reviewer thinks: higher is slower and uses more of your usage.",
+      "options": ["low", "medium", "high", "xhigh", "max"],
+      "default": "high"
+    },
+    "maxContextChars": {
+      "type": "number",
+      "title": "Context cap (characters)",
+      "description": "The most git log, diff, status and file text sent with one review; larger sections are cut to fit.",
+      "default": 60000
+    }
+  }
+}
