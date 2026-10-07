@@ -1,0 +1,29 @@
+{
+  "name": "secret-guard",
+  "version": "0.1.0",
+  "description": "Holds back a prompt that looks like it carries a secret (API keys, tokens, access-key pairs, private keys, passwords) before it reaches the transcript, puts it back in the box, and offers to save the secret as an env var in ~/.zshrc and send $NAME instead. No model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Check prompts for secrets",
+      "description": "Scan each prompt you send for keys, tokens and passwords and hold it back when one is found. Off: prompts are never checked (/secrets test still works).",
+      "default": true
+    },
+    "extraPatterns": {
+      "type": "string",
+      "title": "Also a secret (regex)",
+      "description": "A regular expression for more secrets to catch, e.g. kit_[a-z0-9]{32}. With a capture group, group 1 is the secret.",
+      "default": ""
+    },
+    "zshrcPath": {
+      "type": "string",
+      "title": "Shell file to save secrets to",
+      "description": "Where Save as env var appends export NAME='value' lines. ~ is your home folder; a relative path is under it.",
+      "default": "~/.zshrc"
+    }
+  }
+}

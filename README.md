@@ -174,6 +174,23 @@ Keeps your "always / never / don't / from now on" instructions alive across comp
 - `/orders` lists them. `/orders add [project|session] <text>`, `/orders forget <n>`, `/orders clear session|project`, and `/orders export` (a Markdown block for CLAUDE.md).
 - Makes no model calls.
 
+## secret-guard
+
+Stops keys and passwords from going into a prompt, and so into your transcripts, and turns them into env vars instead.
+
+- Catches known token shapes: AWS, GitHub, Anthropic, OpenAI, Slack, Google, Hugging Face, GitLab, npm, Stripe, private keys and bearer tokens.
+- Also catches labelled values ("password: …", "api key = …", "the wifi password is …") and the two-line "Access Key ID / Secret Access Key" paste.
+- Leaves alone `$NAME` references, placeholders, plain URLs, paths, git SHAs and ordinary prose about passwords.
+- On a hit, the prompt isn't sent and goes back in the box. A band shows the secret masked (`…vxrm`) with a suggested name such as `OPENDATALAB_SECRET_ACCESS_KEY`, which you can edit:
+  - **Save as env var** appends `export NAME='…'` to `~/.zshrc` (reusing an existing identical export) and replaces the secret in your prompt with `$NAME`.
+  - **Send anyway** lets exactly that text through once.
+  - **Edit** dismisses the band.
+- The value is never shown in toasts, status, state or the transcript, and `/secrets test <text>` output is masked too.
+- `/secrets test <text>` shows what would be caught. `/secrets off` and `/secrets on` toggle it for the session.
+- Makes no model calls.
+
+Settings: `enabled` (on), `extraPatterns` (a regex), `zshrcPath` (`~/.zshrc`).
+
 ## slicer-handoff
 
 Makes Claude's `open` commands hand 3D files to the right slicer.
@@ -200,7 +217,7 @@ The quit request goes out when Claude issues the command, before any permission 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard" } }
   ```
 
 ## Checking
@@ -220,4 +237,5 @@ claude plugin validate downloads-drop && claude plugin test downloads-drop
 claude plugin validate dev-servers && claude plugin test dev-servers
 claude plugin validate standing-orders && claude plugin test standing-orders
 claude plugin validate effort-router && claude plugin test effort-router
+claude plugin validate secret-guard && claude plugin test secret-guard
 ```
