@@ -1,0 +1,35 @@
+{
+  "name": "modal-meter",
+  "version": "0.1.0",
+  "description": "Watches your Modal apps from the CLI: running apps and containers on the status line, a toast when one has been up too long, today's spend where the CLI reports it, and a pane to stop an app (after you confirm). No model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "modalCommand": {
+      "type": "string",
+      "title": "Modal command",
+      "description": "How to run the Modal CLI, split on spaces (for example `python3 -m modal` or `uv run modal`). Empty tries `modal`, then `python3 -m modal`.",
+      "default": ""
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Check every (seconds)",
+      "description": "How often `modal app list --json` is run.",
+      "default": 60
+    },
+    "alertMinutes": {
+      "type": "number",
+      "title": "Alert after (minutes)",
+      "description": "Toast when an app has had containers running for longer than this, and again every this many minutes while it keeps running. Deployed apps with no containers never alert.",
+      "default": 30
+    },
+    "budgetToday": {
+      "type": "number",
+      "title": "Daily budget (USD)",
+      "description": "Toast once when today's Modal spend passes this many dollars. Needs a Modal CLI with `modal billing report`; 0 turns it off.",
+      "default": 0
+    }
+  }
+}

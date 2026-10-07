@@ -40,6 +40,17 @@ Memory, swap and GPU on the status line. It refuses heavy local jobs when the Ma
 - Remote runs (`modal run`, `ssh`), tests (`pytest`) and installs are never treated as heavy.
 - Add your own heavy commands with the "Also heavy" setting (a regex), e.g. `overnight_|nightly_run\.sh`.
 
+## modal-meter
+
+Keeps an eye on Modal so idle GPU containers don't burn credits.
+
+- Status line while containers run: `Modal: 1 running (2 containers)`. Deployed apps with no containers cost nothing, so they stay off it.
+- A toast when an app has had containers up longer than `alertMinutes` (30), repeated at most every 30 minutes.
+- `/modal` opens a pane of apps with state, containers and uptime. **Stop** asks for Confirm, then runs `modal app stop`. Nothing is stopped any other way.
+- Shows today's spend and alerts on a `budgetToday` where the Modal CLI supports `billing report` (1.3.3+, Team/Enterprise workspaces). Otherwise `/modal` says why spend isn't shown.
+- Finds the CLI as `modal` or `python3 -m modal`, and stays silent when Modal isn't set up.
+- Makes no model calls: only the Modal CLI, every 60s.
+
 ## pr-autopilot
 
 Does the "merged #219, clean up branches and start #214" round trip for you, and surfaces CI failures with their logs.
@@ -80,6 +91,18 @@ Catches Claude up on the repo when a session starts, so you don't have to ask "c
 
 Settings: focus labels, refresh minutes, and whether to brief Claude.
 
+## routine-watch
+
+Keeps scheduled routines (daily digests, newsletters) from silently stalling while you're away.
+
+- Knows a session is a routine from its scheduled-task prompt, and does nothing in your other sessions.
+- When a routine stops to wait for your OK on a permission prompt or an `AskUserQuestion`, you get a Mac notification and a toast, and the status line shows `routine: daily-report · waiting on you 3m`.
+- When a turn ends in an error, or the routine finishes, you get a notification: `Routine daily-report finished after 23m · waited on you 2 times`.
+- **Phone push (optional):** `notifyCommand` runs a command on the same events, e.g. `curl -s -d {message} ntfy.sh/your-topic`. `{title}` and `{message}` are filled in as single arguments, never through a shell.
+- **`allowWebReads` (off by default):** lets routines use WebFetch and WebSearch without asking. It only replaces a prompt; your deny rules still apply, and nothing else is ever auto-allowed.
+- `/routine` shows the routine's name, how long it has run, its waits, and the settings.
+- Makes no model calls.
+
 ## slicer-handoff
 
 Makes Claude's `open` commands hand 3D files to the right slicer.
@@ -106,7 +129,7 @@ The quit request goes out when Claude issues the command, before any permission 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter" } }
   ```
 
 ## Checking
@@ -119,4 +142,6 @@ claude plugin validate machine-guard && claude plugin test machine-guard
 claude plugin validate repo-brief && claude plugin test repo-brief
 claude plugin validate slicer-handoff && claude plugin test slicer-handoff
 claude plugin validate pr-autopilot && claude plugin test pr-autopilot
+claude plugin validate routine-watch && claude plugin test routine-watch
+claude plugin validate modal-meter && claude plugin test modal-meter
 ```
