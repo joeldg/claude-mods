@@ -1,0 +1,29 @@
+{
+  "name": "dev-servers",
+  "version": "0.1.0",
+  "description": "A Servers pane for this project's dev servers: what is listening, on which port, since when, with Start, Stop, Restart and Log buttons; names the process holding a port when a command fails with EADDRINUSE. No model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "pollSeconds": {
+      "type": "number",
+      "title": "Refresh every (seconds)",
+      "description": "How often listening ports and their processes are re-read (lsof and ps only; nothing is started or stopped on a timer).",
+      "default": 15
+    },
+    "logDir": {
+      "type": "string",
+      "title": "Log folder",
+      "description": "Where servers started from the pane write their output, one folder per project.",
+      "default": "~/.claude/dev-servers"
+    },
+    "stopGraceSeconds": {
+      "type": "number",
+      "title": "Stop grace (seconds)",
+      "description": "How long Stop waits after SIGTERM before saying the server is still running. SIGKILL is only sent when Stop is pressed a second time.",
+      "default": 5
+    }
+  }
+}
