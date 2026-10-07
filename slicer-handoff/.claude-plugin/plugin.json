@@ -1,0 +1,28 @@
+{
+  "name": "slicer-handoff",
+  "version": "0.1.0",
+  "description": "Hands models to the right slicer: full-spectrum (Snapmaker U1) files Claude tries to open in Bambu Studio go to Snapmaker Orca instead, and previous slicer windows are gently quit first so they don't pile up. /slice opens a file the same way.",
+  "author": {
+    "name": "joeldg"
+  },
+  "userConfig": {
+    "closePrevious": {
+      "type": "boolean",
+      "title": "Close previous slicer windows",
+      "description": "Before a model opens in a slicer, ask that slicer's running instances to quit normally (they still ask to save unsaved work; nothing is ever killed).",
+      "default": true
+    },
+    "fullSpectrumPattern": {
+      "type": "string",
+      "title": "Full-spectrum file names (regex)",
+      "description": "A case-insensitive regular expression for paths of full-spectrum (Snapmaker U1 only) files, matched against the file name and its folders.",
+      "default": "full.?spectrum|snapmaker-only|-fs\\.3mf$|-u1[-.]"
+    },
+    "checkContents": {
+      "type": "boolean",
+      "title": "Look inside 3MF files",
+      "description": "When a 3MF's name doesn't say, read its Metadata/project_settings.config (unzip -p) and treat it as full-spectrum when it names a Full Spectrum filament profile.",
+      "default": true
+    }
+  }
+}

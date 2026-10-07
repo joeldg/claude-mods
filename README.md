@@ -57,12 +57,33 @@ Catches Claude up on the repo when a session starts, so you don't have to ask "c
 
 Settings: focus labels, refresh minutes, and whether to brief Claude.
 
+## slicer-handoff
+
+Makes Claude's `open` commands hand 3D files to the right slicer.
+
+- **Full-spectrum files go to Snapmaker Orca.** Bambu Studio and OrcaSlicer can't open them. A file counts as full-spectrum when:
+  - its name or folder matches `full.?spectrum|snapmaker-only|-fs\.3mf$|-u1[-.]`, or
+  - its 3MF names a Full Spectrum filament profile.
+
+  An `open -a BambuStudio …` for one becomes `open -b com.snapmaker.snapmaker-orca …`, with the rest of the command untouched. You get a toast, and Claude gets a note so it doesn't try again.
+- **Earlier windows close first.** Before opening a file, it asks the running slicer to quit (a normal quit, never forced), so windows don't pile up. If one won't close, for example because it's waiting on a save prompt, it stops trying and tells Claude to leave it alone.
+- `/slice <file> [bambu|snapmaker|orca]` opens a file yourself, with the same rules.
+- Recognizes `open -a <app>`, `open -a /Applications/X.app` and `open -b <bundle id>`, including variables set earlier in the command (`S=… && open -a BambuStudio "$S/x.3mf"`) and files copied in the same command.
+- Makes no model calls.
+
+Settings:
+- `closePrevious` (on): turn it off if you keep your own slicer window open, since the quit request reaches your windows too.
+- `fullSpectrumPattern` (the regex above)
+- `checkContents` (on)
+
+The quit request goes out when Claude issues the command, before any permission prompt for it.
+
 ## Loading
 
 - **One session from a terminal:** `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/machine-guard`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff" } }
   ```
 
 ## Checking
@@ -71,4 +92,5 @@ Settings: focus labels, refresh minutes, and whether to brief Claude.
 claude plugin validate job-watch && claude plugin test job-watch
 claude plugin validate machine-guard && claude plugin test machine-guard
 claude plugin validate repo-brief && claude plugin test repo-brief
+claude plugin validate slicer-handoff && claude plugin test slicer-handoff
 ```
