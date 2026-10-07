@@ -40,12 +40,29 @@ Memory, swap and GPU on the status line. It refuses heavy local jobs when the Ma
 - Remote runs (`modal run`, `ssh`), tests (`pytest`) and installs are never treated as heavy.
 - Add your own heavy commands with the "Also heavy" setting (a regex), e.g. `overnight_|nightly_run\.sh`.
 
+## repo-brief
+
+Catches Claude up on the repo when a session starts, so you don't have to ask "check the recent commits/PRs and issues".
+
+- Gathers in the background at session start:
+  - branch, ahead/behind and uncommitted files
+  - the last 8 commits
+  - open PRs with CI ✓/✗/…
+  - issues labelled `owner`, `todo`, `P0` or `blocked`
+  - stale branches (merged, or upstream gone)
+- A one-line band above the prompt, e.g. `main ↑1 · 3 changed · PRs #123 ✗ #124 ✓ · 2 owner issues · 2 stale branches · last commit 2h ago`. **Hide** dismisses it.
+- Claude gets the same summary once, in its first message, so the prompt cache stays warm. It refreshes after compaction.
+- `/brief` re-gathers now and prints the full summary.
+- Makes no model calls: only `git` and `gh`. The band refreshes after a turn at most every 2 minutes.
+
+Settings: focus labels, refresh minutes, and whether to brief Claude.
+
 ## Loading
 
 - **One session from a terminal:** `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/machine-guard`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief" } }
   ```
 
 ## Checking
@@ -53,4 +70,5 @@ Memory, swap and GPU on the status line. It refuses heavy local jobs when the Ma
 ```bash
 claude plugin validate job-watch && claude plugin test job-watch
 claude plugin validate machine-guard && claude plugin test machine-guard
+claude plugin validate repo-brief && claude plugin test repo-brief
 ```

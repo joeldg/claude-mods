@@ -1,0 +1,29 @@
+{
+  "name": "repo-brief",
+  "version": "0.1.0",
+  "description": "Gathers the repo's state at session start (branch, ahead/behind, uncommitted work, recent commits, open PRs with CI, focus-label issues, stale branches) with no model calls, shows it in a band above the prompt and hands Claude the same summary in its first message.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "focusLabels": {
+      "type": "string",
+      "title": "Focus labels",
+      "description": "Comma-separated issue labels to list by name (case-insensitive); other open issues are only counted.",
+      "default": "owner,todo,P0,blocked"
+    },
+    "refreshMinutes": {
+      "type": "number",
+      "title": "Refresh at most every (minutes)",
+      "description": "After a turn completes or the conversation is compacted, the band is re-gathered when it is older than this.",
+      "default": 2
+    },
+    "briefClaude": {
+      "type": "boolean",
+      "title": "Brief Claude at the start",
+      "description": "Add the repo summary to the context of the conversation's first message, so Claude starts caught up. Off: only the band shows it.",
+      "default": true
+    }
+  }
+}
