@@ -1,3 +1,4 @@
+import type { RenderElement } from 'claude-code'
 import type { Changed, Ci, Commit, FocusIssue, PullRequest, Snapshot } from '../types'
 
 /** How many changed files a snapshot keeps by name. */
@@ -407,3 +408,11 @@ export const bandParts = (s: Snapshot, focusLabels: readonly string[]): BandPart
 }
 
 export const bandLine = (parts: readonly BandPart[]): string => parts.map(part => part.text).join('')
+
+/** True for what the engine draws when no plugin draws the band, or an empty Box. */
+export function isBlankTree(tree: RenderElement): boolean {
+  if (tree.type === 'engine') {
+    return true
+  }
+  return tree.type === 'Box' && (tree.children ?? []).length === 0
+}

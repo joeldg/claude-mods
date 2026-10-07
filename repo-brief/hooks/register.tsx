@@ -10,6 +10,7 @@ import {
   countWorktrees,
   emptySnapshot,
   goneBranches,
+  isBlankTree,
   isGitHubRemote,
   parseFocusLabels,
   parseIssues,
@@ -246,7 +247,7 @@ export const register: Register = (on, options) => {
     const span = (part: BandPart) =>
       part.color ? <Text color={part.color}>{part.text}</Text> : part.dim ? <Text dimColor>{part.text}</Text> : part.text
 
-    return (
+    const band = (
       <Box flexDirection="row" gap={1}>
         <Box flexShrink={1}>
           <Text wrap="truncate-end">{bandParts(current, config.focusLabels).map(span)}</Text>
@@ -254,6 +255,16 @@ export const register: Register = (on, options) => {
         <Box flexShrink={0}>
           <Button key="hide" label="Hide" plain dimColor onPress={() => update($, isHidden, () => true)} />
         </Box>
+      </Box>
+    )
+    // Another plugin's band beneath stays, under this one.
+    const below = await next(e)
+    return isBlankTree(below) ? (
+      band
+    ) : (
+      <Box flexDirection="column">
+        {band}
+        {below}
       </Box>
     )
   })

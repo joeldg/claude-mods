@@ -64,7 +64,7 @@ const keyOf = (argv: readonly string[]): string => {
 }
 
 /** Answers the host beneath the plugin: the session's folder, git and gh, and the engine's own answers. */
-const world = (on: On, replies: Record<string, Reply> = REPLIES): World => {
+const world = (on: On, replies: Record<string, Reply> = REPLIES, otherBand: string | null = null): World => {
   const w: World = { replies: { ...replies }, ran: [], cwds: [] }
   on('process.run', (_$, e) => {
     const key = keyOf(e.argv)
@@ -90,10 +90,10 @@ const world = (on: On, replies: Record<string, Reply> = REPLIES): World => {
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('prompt.context', (_$, e) => ({ blocks: e.blocks }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
-  // The engine's own band, drawn when the plugin passes: empty.
+  // The engine's own band, drawn when the plugin passes: empty; or another plugin's band beneath.
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box />
+    const { Box, Text } = $.ui.resolve(e)
+    return otherBand === null ? <Box /> : <Text>{otherBand}</Text>
   })
   return w
 }
@@ -268,3 +268,18 @@ test(
     expect(out.blocks.map(block => block.name)).toEqual(['currentDate'])
   },
 )
+
+test("another plugin's band beneath stays, under the brief", async ($, on) => {
+  mock.clock(on, { now: 0 })
+  world(on, REPLIES, 'New in Downloads: paper.pdf')
+  await $.command.run(typed('brief', ''))
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'repo-brief', surface, component: 'AbovePrompt', props: BAND })
+    expect(shown((await ui.drawn()) as Node)).toBe(`${LINE}New in Downloads: paper.pdf`)
+    await ui.press({ key: 'hide' })
+    expect(shown((await ui.drawn()) as Node)).toBe('New in Downloads: paper.pdf')
+    await ui.unmount()
+    await $.command.run(typed('brief', ''))
+  }
+})
