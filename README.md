@@ -40,6 +40,29 @@ Memory, swap and GPU on the status line. It refuses heavy local jobs when the Ma
 - Remote runs (`modal run`, `ssh`), tests (`pytest`) and installs are never treated as heavy.
 - Add your own heavy commands with the "Also heavy" setting (a regex), e.g. `overnight_|nightly_run\.sh`.
 
+## pr-autopilot
+
+Does the "merged #219, clean up branches and start #214" round trip for you, and surfaces CI failures with their logs.
+
+- Watches your open PRs in the session's repo: it adopts them at session start, and picks up every `gh pr create` Claude runs. It polls `gh pr view` every 60s.
+- Status line: `PRs: #219 ✓ · #220 CI… · #221 ✗`. Toasts when CI fails (with the failing check names) or passes.
+- **When a PR merges**, it cleans up with plain local git, then toasts the outcome and suggests carrying on (Tab to accept):
+  - `git fetch --prune`, switch to the default branch (only from the PR's own branch) and `git pull --ff-only`.
+  - Never with uncommitted changes, never `--force`, never other branches.
+  - Deletes the local branch only if it points at exactly the commit GitHub merged, so nothing local is lost. It also leaves a branch checked out in another worktree alone.
+  - A merge seen mid-turn is cleaned up when the turn ends, so git never races Claude.
+- **When you mention failing CI** ("#258 is failing", "CI failed, fix it"), your message goes to Claude with `gh pr checks` and the tail of the failed log attached, so you don't paste it.
+- `/prs` lists watched PRs. `/prs watch <n|url>` and `/prs forget <n|all>` add and remove them.
+- Makes no model calls: only `gh` and `git`, at about one GitHub API call per open PR per minute.
+
+Settings:
+- `pollSeconds` (60)
+- `attachCiLogs` (on)
+- `logLines` (120)
+- `deleteRemoteBranch` (off): deletes the branch on GitHub too, only while it still points at the merged commit. GitHub's own "Automatically delete head branches" setting does the same job.
+
+It never closes issues; put "Closes #N" in PR bodies for that.
+
 ## repo-brief
 
 Catches Claude up on the repo when a session starts, so you don't have to ask "check the recent commits/PRs and issues".
@@ -80,17 +103,20 @@ The quit request goes out when Claude issues the command, before any permission 
 
 ## Loading
 
-- **One session from a terminal:** `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/machine-guard`
+- **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot" } }
   ```
 
 ## Checking
+
+Run with Claude Code 2.1.289 or newer; older CLIs ignore per-test settings, so a few tests fall back to defaults.
 
 ```bash
 claude plugin validate job-watch && claude plugin test job-watch
 claude plugin validate machine-guard && claude plugin test machine-guard
 claude plugin validate repo-brief && claude plugin test repo-brief
 claude plugin validate slicer-handoff && claude plugin test slicer-handoff
+claude plugin validate pr-autopilot && claude plugin test pr-autopilot
 ```

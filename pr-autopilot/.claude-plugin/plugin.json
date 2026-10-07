@@ -1,0 +1,35 @@
+{
+  "name": "pr-autopilot",
+  "version": "0.1.0",
+  "description": "Watches your open pull requests: CI pass/fail toasts, failing-check logs attached when you mention them, and the post-merge ritual (fetch --prune, switch, ff-only pull, delete the branch) done for you with no model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "pollSeconds": {
+      "type": "number",
+      "title": "Check PRs every (seconds)",
+      "description": "How often each watched open PR's state and CI checks are read with gh.",
+      "default": 60
+    },
+    "deleteRemoteBranch": {
+      "type": "boolean",
+      "title": "Delete the remote branch after a merge",
+      "description": "Also delete the PR's branch on origin once it is merged, when it still points at the merged head. GitHub's \"Automatically delete head branches\" setting is the recommended way.",
+      "default": false
+    },
+    "attachCiLogs": {
+      "type": "boolean",
+      "title": "Attach CI logs when you mention a failing PR",
+      "description": "When your prompt mentions a failing PR (\"#258 failed checks\", \"CI failed\"), attach gh pr checks and the tail of the failed run's log for Claude.",
+      "default": true
+    },
+    "logLines": {
+      "type": "number",
+      "title": "Failed log lines to attach",
+      "description": "How many lines from the end of the failed run's log are attached.",
+      "default": 120
+    }
+  }
+}
