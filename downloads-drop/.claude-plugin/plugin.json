@@ -1,0 +1,35 @@
+{
+  "name": "downloads-drop",
+  "version": "0.1.0",
+  "description": "Notices files that land in Downloads while you work (PDFs, 3MF models, images, notes) and offers them in a band above the prompt: Attach puts @\"path\" mentions in the prompt box, Dismiss clears them. /downloads lists the newest files and attaches any by number. No model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "folder": {
+      "type": "string",
+      "title": "Folder to watch",
+      "description": "The folder whose top level is watched for new files; ~ is your home folder.",
+      "default": "~/Downloads"
+    },
+    "extensions": {
+      "type": "string",
+      "title": "File types",
+      "description": "Comma-separated extensions that count (case-insensitive); * counts every file.",
+      "default": "pdf,md,txt,csv,json,png,jpg,jpeg,heic,webp,gif,3mf,stl,obj,ply,glb,zip,mp4,mov"
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Check every (seconds)",
+      "description": "How often the folder is listed. A file is offered once two checks in a row see the same size, so a download still in progress waits.",
+      "default": 5
+    },
+    "maxAgeMinutes": {
+      "type": "number",
+      "title": "Ignore files older than (minutes)",
+      "description": "A file last modified longer ago than this never counts as new, however long the session has run.",
+      "default": 120
+    }
+  }
+}

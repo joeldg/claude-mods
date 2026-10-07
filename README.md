@@ -8,6 +8,19 @@ Requires a Claude Code build with function-hook plugins (2.1.289 or newer). mach
 git clone https://github.com/joeldg/claude-mods ~/Projects/claude-mods
 ```
 
+## downloads-drop
+
+Puts files you just downloaded into your prompt with one click.
+
+- Watches `~/Downloads` (top level). When a new file arrives (PDF, Markdown, images, 3MF/STL/OBJ, zip, video…), a band appears above the prompt: `New in Downloads: paper.pdf, model-b.3mf · 2m ago [Attach] [Dismiss]`.
+- **Attach** puts `@"/Users/you/Downloads/paper.pdf"` mentions in your prompt. **Dismiss** hides those files.
+- Waits until a file has finished downloading (skips partial downloads and files still growing), and ignores hidden and zero-byte files.
+- `/downloads` lists the 10 newest files, numbered. `/downloads attach 1 3` (or `2-4`) adds those, and `/downloads clear` dismisses everything new.
+- Stacks with other mods' bands (repo-brief, standing-orders, secret-guard) instead of hiding them.
+- Makes no model calls.
+
+Settings: `folder` (`~/Downloads`), `extensions`, `pollSeconds` (5), `maxAgeMinutes` (120).
+
 ## job-watch
 
 A **Jobs** pane for long-running work: training runs, downloads, extractions.
@@ -145,7 +158,7 @@ The quit request goes out when Claude issues the command, before any permission 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop" } }
   ```
 
 ## Checking
@@ -161,4 +174,5 @@ claude plugin validate pr-autopilot && claude plugin test pr-autopilot
 claude plugin validate routine-watch && claude plugin test routine-watch
 claude plugin validate modal-meter && claude plugin test modal-meter
 claude plugin validate second-opinion && claude plugin test second-opinion
+claude plugin validate downloads-drop && claude plugin test downloads-drop
 ```
