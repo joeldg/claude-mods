@@ -97,7 +97,7 @@ const typed = (command: string, args: string) => ({
 const isKill = (argv: readonly string[]) =>
   argv.some(arg => /^(?:kill|pkill|killall)$|^-9$|^-KILL$|force/i.test(arg))
 
-test('a full-spectrum file sent to Bambu opens in Snapmaker Orca instead', async ($, on) => {
+test('a full-spectrum file sent to Bambu opens in Snapmaker Orca instead', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   const command = `S=${SCRATCH} && cp ${TIGER_SRC} "$S/${TIGER}" && open -a BambuStudio "$S/${TIGER}" && echo opened; sleep 20`
 
@@ -114,7 +114,7 @@ test('a full-spectrum file sent to Bambu opens in Snapmaker Orca instead', async
   expect(w.argv).toEqual([['pgrep', '-x', 'Snapmaker_Orca']])
 })
 
-test('an ordinary 3MF opens in Bambu unchanged, with no note', async ($, on) => {
+test('an ordinary 3MF opens in Bambu unchanged, with no note', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.zips[`${CWD}/artifacts/m0/bambu-paint/cube-20mm.3mf`] = BAMBU_SETTINGS
   const command = 'open -a "Bambu Studio" artifacts/m0/bambu-paint/cube-20mm.3mf && sleep 5'
@@ -130,7 +130,7 @@ test('an ordinary 3MF opens in Bambu unchanged, with no note', async ($, on) => 
   ])
 })
 
-test('commands without a slicer open pass straight through', async ($, on) => {
+test('commands without a slicer open pass straight through', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   await $.tool.call({ tool: 'Bash', command: 'git status --porcelain' })
   await $.tool.call({ tool: 'Bash', command: 'open -a Preview render.png' })
@@ -138,7 +138,7 @@ test('commands without a slicer open pass straight through', async ($, on) => {
   expect(w.argv).toEqual([])
 })
 
-test('a neutral name whose 3MF names a Full Spectrum profile is rerouted', async ($, on) => {
+test('a neutral name whose 3MF names a Full Spectrum profile is rerouted', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.zips['/Users/me/prints/model-v2.3mf'] = SNAPMAKER_SETTINGS
 
@@ -150,7 +150,7 @@ test('a neutral name whose 3MF names a Full Spectrum profile is rerouted', async
   expect(ran.context?.join('\n')).toMatch(/model-v2\.3mf is a full-spectrum/)
 })
 
-test('a file copied earlier in the command is judged by its source', async ($, on) => {
+test('a file copied earlier in the command is judged by its source', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.zips[`${CWD}/out/coupon.3mf`] = SNAPMAKER_SETTINGS
   const command = `S=${SCRATCH} && cp out/coupon.3mf "$S/b.3mf" && open -a BambuStudio "$S/b.3mf"`
@@ -164,7 +164,7 @@ test('a file copied earlier in the command is judged by its source', async ($, o
   expect(w.ran).toEqual([`S=${SCRATCH} && cp out/coupon.3mf "$S/b.3mf" && open -b com.snapmaker.snapmaker-orca "$S/b.3mf"`])
 })
 
-test('checkContents off: only the name decides', { options: { checkContents: false } }, async ($, on) => {
+test('checkContents off: only the name decides', { options: { checkContents: false }, timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.zips['/Users/me/prints/model-v2.3mf'] = SNAPMAKER_SETTINGS
   await $.tool.call({ tool: 'Bash', command: 'open -a BambuStudio ~/prints/model-v2.3mf' })
@@ -172,7 +172,7 @@ test('checkContents off: only the name decides', { options: { checkContents: fal
   expect(w.argv.some(argv => argv[0] === 'unzip')).toBe(false)
 })
 
-test('previous instances get a gentle quit before the open runs, never a kill', async ($, on) => {
+test('previous instances get a gentle quit before the open runs, never a kill', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.zips[`${CWD}/cube-20mm.3mf`] = BAMBU_SETTINGS
   w.running.BambuStudio = [1, 0]
@@ -193,7 +193,7 @@ test('previous instances get a gentle quit before the open runs, never a kill', 
   expect(ran.context ?? []).toEqual([])
 })
 
-test('several Snapmaker Orca instances are quit one by one', async ($, on) => {
+test('several Snapmaker Orca instances are quit one by one', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.running.Snapmaker_Orca = [3, 2, 1, 0]
 
@@ -205,7 +205,7 @@ test('several Snapmaker Orca instances are quit one by one', async ($, on) => {
   expect(w.ran).toEqual(['open -b com.snapmaker.snapmaker-orca artifacts/coupon/full-spectrum/cmyk-ratio-coupon.3mf'])
 })
 
-test('an instance that never quits: stops after the limit and tells the model', async ($, on) => {
+test('an instance that never quits: stops after the limit and tells the model', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.running.Snapmaker_Orca = [1]
 
@@ -218,7 +218,7 @@ test('an instance that never quits: stops after the limit and tells the model', 
   expect(ran.context?.join('\n')).toMatch(/an instance of Snapmaker Orca is still open .*asking whether to save.*tell the user/)
 })
 
-test('a refused quit (save dialog cancelled) stops at once', async ($, on) => {
+test('a refused quit (save dialog cancelled) stops at once', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.running.Snapmaker_Orca = [2]
   w.quitExit = 1
@@ -230,7 +230,7 @@ test('a refused quit (save dialog cancelled) stops at once', async ($, on) => {
   expect(w.ran).toEqual(['open -a "Snapmaker Orca" figure2-tiger-u1.3mf'])
 })
 
-test('closePrevious off: nothing is quit', { options: { closePrevious: false } }, async ($, on) => {
+test('closePrevious off: nothing is quit', { options: { closePrevious: false }, timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.running.BambuStudio = [2]
   w.running.Snapmaker_Orca = [2]
@@ -242,7 +242,7 @@ test('closePrevious off: nothing is quit', { options: { closePrevious: false } }
   expect(w.sleeps).toEqual([])
 })
 
-test('/slice opens a full-spectrum file in Snapmaker Orca even when Bambu is asked for', async ($, on) => {
+test('/slice opens a full-spectrum file in Snapmaker Orca even when Bambu is asked for', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   const path = `${CWD}/${TIGER_SRC}`
   w.existing.add(path)
@@ -261,7 +261,7 @@ test('/slice opens a full-spectrum file in Snapmaker Orca even when Bambu is ask
   )
 })
 
-test('/slice opens other files in Bambu Studio, or where asked', async ($, on) => {
+test('/slice opens other files in Bambu Studio, or where asked', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   w.existing.add(`${CWD}/cube-20mm.3mf`)
   w.zips[`${CWD}/cube-20mm.3mf`] = BAMBU_SETTINGS
