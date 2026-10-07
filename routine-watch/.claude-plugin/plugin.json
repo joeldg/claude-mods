@@ -1,0 +1,35 @@
+{
+  "name": "routine-watch",
+  "version": "0.1.0",
+  "description": "Tells you when a scheduled routine (a scheduled-task run) stops to wait on you: a Mac notification, an optional phone push and a status line when it asks for permission or asks a question, plus a note when it finishes. Optionally lets routines read the web without asking. No model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "notifyMac": {
+      "type": "boolean",
+      "title": "Mac notification when a routine waits",
+      "description": "Post a macOS notification (osascript, with a sound) when a routine is waiting for your OK, asks you a question, stops on an error or finishes.",
+      "default": true
+    },
+    "allowWebReads": {
+      "type": "boolean",
+      "title": "Let routines read the web without asking",
+      "description": "In routine runs only, allow WebFetch and WebSearch instead of asking you. Nothing else is ever allowed, and a rule that denies still denies. Off by default because it loosens permissions.",
+      "default": false
+    },
+    "notifyCommand": {
+      "type": "string",
+      "title": "Phone push command",
+      "description": "Also run this command on the same events, e.g. curl -s -d {message} ntfy.sh/my-topic. It is split on spaces and {title} and {message} are filled into single arguments; no shell is involved. Empty: no push.",
+      "default": ""
+    },
+    "notifyOnFinish": {
+      "type": "boolean",
+      "title": "Notify when a routine finishes",
+      "description": "When a routine's session ends, say how long it ran and how many times it waited on you.",
+      "default": true
+    }
+  }
+}
