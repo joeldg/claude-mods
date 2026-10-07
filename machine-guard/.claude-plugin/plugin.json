@@ -1,0 +1,35 @@
+{
+  "name": "machine-guard",
+  "version": "0.1.0",
+  "description": "Memory, swap and GPU on the status line; refuses heavy local jobs (training, inference, rendering, Docker) while memory is critical or the Mac is reserved with /busy.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "sampleSeconds": {
+      "type": "number",
+      "title": "Sample every (seconds)",
+      "description": "How often memory pressure, swap, GPU and the biggest apps are read.",
+      "default": 15
+    },
+    "blockOnCritical": {
+      "type": "boolean",
+      "title": "Block heavy jobs when memory is critical",
+      "description": "Refuse heavy local jobs while macOS reports critical memory pressure. Off: only warn.",
+      "default": true
+    },
+    "busyHours": {
+      "type": "number",
+      "title": "Default /busy length (hours)",
+      "description": "How long /busy reserves the Mac when no duration is given.",
+      "default": 4
+    },
+    "extraHeavy": {
+      "type": "string",
+      "title": "Also heavy (regex)",
+      "description": "A regular expression for more commands to treat as heavy, e.g. overnight_|nightly_run\\.sh",
+      "default": ""
+    }
+  }
+}

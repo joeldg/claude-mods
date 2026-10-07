@@ -1,0 +1,41 @@
+{
+  "name": "job-watch",
+  "version": "0.1.0",
+  "description": "Live pane of long-running jobs (training, downloads, extractions): progress, ETA, stalls and finishes, read from their logs with no model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "stallMinutes": {
+      "type": "number",
+      "title": "Stall after (minutes)",
+      "description": "A job whose log has not grown for this long is flagged as stalled (if its process is alive) or quiet.",
+      "default": 10
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Refresh every (seconds)",
+      "description": "How often logs, processes and disks are re-read.",
+      "default": 10
+    },
+    "keepDoneMinutes": {
+      "type": "number",
+      "title": "Keep finished jobs (minutes)",
+      "description": "How long a finished job stays in the pane before it is dropped.",
+      "default": 120
+    },
+    "autoOpen": {
+      "type": "boolean",
+      "title": "Open the pane when a job starts",
+      "description": "Open the Jobs pane automatically the first time a long job is picked up.",
+      "default": true
+    },
+    "disks": {
+      "type": "string",
+      "title": "Disks to show",
+      "description": "Comma-separated mount points to show free space for. Empty shows / and everything under /Volumes.",
+      "default": ""
+    }
+  }
+}
