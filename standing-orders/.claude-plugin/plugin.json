@@ -1,0 +1,29 @@
+{
+  "name": "standing-orders",
+  "version": "0.1.0",
+  "description": "Keeps the instructions you give Claude (\"never…\", \"from now on…\", \"in this project…\") as standing orders for the project or the session, offered in a band above the prompt, and hands them back to Claude after every compaction or /clear, with the active /goal. No model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "capture": {
+      "type": "boolean",
+      "title": "Offer to keep instructions",
+      "description": "When a prompt gives a lasting instruction (always, never, don't, from now on, make sure to, in this project…), offer to keep it as a standing order in a band above the prompt. Nothing is kept without your answer.",
+      "default": true
+    },
+    "deliver": {
+      "type": "boolean",
+      "title": "Give Claude the standing orders",
+      "description": "Add the standing orders and the active goal to the conversation's context (at its start and again after each compaction or /clear), and attach an order kept mid-conversation to your next prompt once.",
+      "default": true
+    },
+    "maxOrders": {
+      "type": "number",
+      "title": "Most orders per scope",
+      "description": "How many standing orders a project, and a session, can hold; /orders forget makes room.",
+      "default": 30
+    }
+  }
+}

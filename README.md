@@ -8,6 +8,23 @@ Requires a Claude Code build with function-hook plugins (2.1.289 or newer). mach
 git clone https://github.com/joeldg/claude-mods ~/Projects/claude-mods
 ```
 
+## dev-servers
+
+A pane of your project's running dev servers, so you don't have to ask Claude to restart them.
+
+- `/servers` opens the **Servers** pane:
+  - running servers whose working folder is in this repo: name, port, pid and uptime, with **Restart**, **Stop** and **Log**
+  - known start commands that aren't running, with **Start**: `package.json` `dev`/`start`/`serve`/`preview` scripts (run with your lockfile's package manager), `.claude/launch.json` and `Procfile`
+  - a count of other listeners on the Mac
+- Only button presses start or stop anything:
+  - **Start** runs the command detached, logging to `~/.claude/dev-servers/<project>/`.
+  - **Stop** sends SIGTERM. If the server ignores it, pressing again within 10s force-stops it.
+  - **Restart** stops the server, waits for the port to free up, then starts it.
+  - Before any signal, it checks the pid still runs the same command.
+- When a command fails with "address already in use", Claude gets a note (and you a toast) naming the holder, e.g. `Port 4000 is held by node (pid 123, up 2h, in /Users/me/other)`.
+- Status line: `servers: :4000 :5173`.
+- Makes no model calls: `lsof` and `ps` every 15s.
+
 ## downloads-drop
 
 Puts files you just downloaded into your prompt with one click.
@@ -132,6 +149,16 @@ A Fable review in the background, without switching your session's model. **Each
 
 Settings: `model` (`claude-fable-5-1`), `effort` (high), `maxContextChars` (60000).
 
+## standing-orders
+
+Keeps your "always / never / don't / from now on" instructions alive across compaction.
+
+- When you write an instruction like "never open bambu with full spectrum files", a band asks: `Keep as a standing order? [Project] [This session] [No]`. Nothing is saved without a click.
+- Project orders live in `~/.claude/standing-orders/<repo>.json` and apply to every session in that repo. Session orders and your active `/goal` last for the session.
+- Claude gets them at the start of every conversation and again after each compaction or `/clear`, so the prompt cache isn't disturbed. A newly saved order also rides along once with your next message.
+- `/orders` lists them. `/orders add [project|session] <text>`, `/orders forget <n>`, `/orders clear session|project`, and `/orders export` (a Markdown block for CLAUDE.md).
+- Makes no model calls.
+
 ## slicer-handoff
 
 Makes Claude's `open` commands hand 3D files to the right slicer.
@@ -158,7 +185,7 @@ The quit request goes out when Claude issues the command, before any permission 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders" } }
   ```
 
 ## Checking
@@ -175,4 +202,6 @@ claude plugin validate routine-watch && claude plugin test routine-watch
 claude plugin validate modal-meter && claude plugin test modal-meter
 claude plugin validate second-opinion && claude plugin test second-opinion
 claude plugin validate downloads-drop && claude plugin test downloads-drop
+claude plugin validate dev-servers && claude plugin test dev-servers
+claude plugin validate standing-orders && claude plugin test standing-orders
 ```
