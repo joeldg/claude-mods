@@ -1,0 +1,47 @@
+{
+  "name": "mod-monitor",
+  "version": "0.1.0",
+  "description": "Watches how your other mods really behave: hook failures and slow hooks (read off the chain's own trace), what each one did (toasts, status lines, commands, processes, model calls, writes), with /mods for a live pane and /mods report for the last day, week or month. Changes nothing they do; no model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "alerts": {
+      "type": "boolean",
+      "title": "Toast a mod's first failure",
+      "description": "Toast the first time each mod's hook fails in a session, and once when a mod's commands fail 5 times in 10 minutes. Later failures are only counted.",
+      "default": true
+    },
+    "slowMs": {
+      "type": "number",
+      "title": "Slow hook after (ms)",
+      "description": "A hook that takes longer than this (its own time, the hooks beneath it not counted) is logged as slow. Drawing a pane or the band counts as slow from 250 ms, or from this value when it is lower.",
+      "default": 1500
+    },
+    "watchRender": {
+      "type": "boolean",
+      "title": "Watch panes and the band",
+      "description": "Also watch the mods' Pane and band (AbovePrompt) drawing for failures and slow draws. Draws are never counted, only their failures and slow ones.",
+      "default": true
+    },
+    "watchCommands": {
+      "type": "boolean",
+      "title": "Watch mod commands",
+      "description": "Record which mod commands you use and catch failures in them. Off: mod-monitor's name stops appearing beside other mods' command output.",
+      "default": true
+    },
+    "retentionDays": {
+      "type": "number",
+      "title": "Keep logs (days)",
+      "description": "Day folders under ~/.claude/mods/monitor older than this are deleted when a session starts.",
+      "default": 30
+    },
+    "flushSeconds": {
+      "type": "number",
+      "title": "Write the log every (seconds)",
+      "description": "How often this session's log file is rewritten from memory; it is also written when the session ends.",
+      "default": 60
+    }
+  }
+}

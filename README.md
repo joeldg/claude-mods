@@ -85,6 +85,21 @@ Memory, swap and GPU on the status line. It refuses heavy local jobs when the Ma
 - Remote runs (`modal run`, `ssh`), tests (`pytest`) and installs are never treated as heavy.
 - Add your own heavy commands with the "Also heavy" setting (a regex), e.g. `overnight_|nightly_run\.sh`.
 
+## mod-monitor
+
+Watches how the other mods behave in real use, without changing them. It is listed first in `CLAUDE_CODE_PLUGIN_DIRS`, so the other mods' hooks run beneath it.
+
+- **Failures:** any mod hook that throws, times out or rejects, read from the hook chain's results (`next.trace`), with the mod's name, the event and how long it ran. Slow hooks (over 1.5 s) are recorded too. The first failure of each mod in a session raises a toast.
+- **What each mod did:** its toasts ("#219 merged → …", "Blocked: …"), status-line changes, the mod commands you used (never their arguments), and failed subprocesses (a burst of 5 in 10 minutes raises a toast). Git checks run outside a repository are logged as expected, not as failures. It also records model calls (the only usage the mods cost: `/second-opinion`, `/recall ask`) and file writes (folders only, never contents).
+- **`/mods`:** a pane with one row per mod: ✓ active, ⚠ failing, ✗ not seen this session, · seen but idle. Each row shows today's counts and last activity, with **Details** for its recent events. It also says which mods it can't see, if any of them run above it.
+- **`/mods report [24h|7d|30d]`:** a per-mod report across all sessions, also written to `~/.claude/mods/monitor/report-latest.md` for a scheduled review or Claude to read.
+- **`/mods failures [7d]`:** failures and failed subprocesses only.
+- **Logs:** `~/.claude/mods/monitor/<date>/<session>.jsonl`, flushed every minute and at session end, with secrets masked and old days removed after 30 days.
+- Makes no model calls and adds no measurable latency.
+- **What it can't see:** effort-router's per-request stream (`turn.step`) and secret-guard's transcript-row hook (`session.append`).
+
+Settings: `alerts` (on), `slowMs` (1500), `watchRender` (on), `watchCommands` (on; off stops "mod-monitor" appearing beside other mods' command output), `retentionDays` (30), `flushSeconds` (60).
+
 ## modal-meter
 
 Keeps an eye on Modal so idle GPU containers don't burn credits.
@@ -243,9 +258,9 @@ The quit request goes out when Claude issues the command, before any permission 
 ## Loading
 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
-- **Every session, including the desktop app:** add to `~/.claude/settings.json`:
+- **Every session, including the desktop app:** add to `~/.claude/settings.json`. Put mod-monitor first so it sees the others; `CLAUDE_CODE_PLUGIN_DIR_WATCH` makes desktop sessions pick up edits and show mod failures:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1", "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/mod-monitor:~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall" } }
   ```
 
 ## Checking
@@ -267,5 +282,6 @@ claude plugin validate standing-orders && claude plugin test standing-orders
 claude plugin validate effort-router && claude plugin test effort-router
 claude plugin validate secret-guard && claude plugin test secret-guard
 claude plugin validate recall && claude plugin test recall
+claude plugin validate mod-monitor && claude plugin test mod-monitor
 (cd recall/engine && /usr/bin/python3 -m unittest)
 ```
