@@ -35,6 +35,7 @@ export type EventLine = EventBase &
     | { kind: 'proc-fail'; cmd: string; exit: number | null; ms: number; err?: string }
     | { kind: 'proc-slow'; cmd: string; ms: number }
     | { kind: 'proc-expected'; cmd: string; exit: number | null; why: string }
+    | { kind: 'log'; text: string; isError: boolean }
     | { kind: 'model'; model: string; outcome: string; ms: number; usage?: TokenUsage }
     | { kind: 'write'; dir: string }
     | { kind: 'command'; command: string; hasArgs: boolean; by: string }
@@ -68,6 +69,8 @@ export type CountsLine = {
   cmds: number
   /** Calls of the tools it registered. */
   tools: number
+  /** Error lines it logged itself ($.ui.log with failure wording); absent in older logs. */
+  logErrors?: number
 }
 
 export type Line = EventLine | CountsLine

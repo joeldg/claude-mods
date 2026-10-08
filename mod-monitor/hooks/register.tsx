@@ -35,6 +35,11 @@ const PROC_SLOW_MS = 20_000
 /** This many process failures of one mod within the window is one toast. */
 const PROC_BURST = 5
 const PROC_WINDOW_MS = 10 * 60_000
+/** A mod's own log line that reports a failure ($.ui.log is where mods without a toast say so). */
+const LOG_ERROR = /\b(failed|error|exception|threw|could not|couldn't|did not register|timed out|withheld)\b/i
+/** Error lines in an hour that mark a mod failing and raise one toast. */
+const LOG_BURST = 3
+const LOG_WINDOW_MS = 60 * 60_000
 /** Repeats of one thing (a toast, a failure, a status change) within this long fold into one line. */
 const FOLD_MS = 60_000
 /** Event lines one mod may add between two writes; past it, things are only counted. */
@@ -69,6 +74,7 @@ type Config = {
   renderSlowMs: number
   watchRender: boolean
   watchCommands: boolean
+  watchAppend: boolean
   retentionDays: number
   flushMs: number
 }
@@ -87,6 +93,7 @@ type Delta = {
   fails: number
   cmds: number
   tools: number
+  logErrors: number
   slow: Record<string, { n: number; max: number }>
 }
 
@@ -96,6 +103,7 @@ const DEFAULTS: Config = {
   renderSlowMs: RENDER_SLOW_MS,
   watchRender: true,
   watchCommands: true,
+  watchAppend: true,
   retentionDays: 30,
   flushMs: 60_000,
 }
@@ -113,6 +121,8 @@ let deltas = new Map<string, Delta>()
 let reservoirs = new Map<string, Reservoir>()
 let alerted = new Set<string>()
 let procAlerted = new Set<string>()
+let logAlerted = new Set<string>()
+let logErrorTimes = new Map<string, number[]>()
 let failureCounts = new Map<string, number>()
 let procFailTimes = new Map<string, number[]>()
 let statuses = new Map<string, string>()
@@ -177,7 +187,7 @@ async function syncClock($: Engine) {
 function deltaOf(plugin: string): Delta {
   let delta = deltas.get(plugin)
   if (!delta) {
-    delta = { runs: {}, procs: 0, procFails: 0, writes: 0, toasts: 0, models: 0, fails: 0, cmds: 0, tools: 0, slow: {} }
+    delta = { runs: {}, procs: 0, procFails: 0, writes: 0, toasts: 0, models: 0, fails: 0, cmds: 0, tools: 0, logErrors: 0, slow: {} }
     deltas.set(plugin, delta)
   }
   hasChanged = true
@@ -407,6 +417,24 @@ function callerOf(origin: { readonly plugin: string; readonly tier: string }): s
   return origin.plugin
 }
 
+function onLog($: Engine, plugin: string, text: string) {
+  const shown = keep(text, 200)
+  const isError = LOG_ERROR.test(text)
+  logEvent({ t: 'event', ts: now(), plugin, kind: 'log', text: shown, isError }, `log|${plugin}|${shown}`)
+  if (!isError) {
+    return
+  }
+  deltaOf(plugin).logErrors += 1
+  const at = now()
+  const times = (logErrorTimes.get(plugin) ?? []).filter(time => at - time < LOG_WINDOW_MS)
+  times.push(at)
+  logErrorTimes.set(plugin, times.slice(-50))
+  if (times.length >= LOG_BURST && config.alerts && !logAlerted.has(plugin)) {
+    logAlerted.add(plugin)
+    toast($, `mod-monitor: ${plugin} logged ${times.length} errors in the last hour (last: ${keep(text, 80)}) — /mods for details`)
+  }
+}
+
 function onToast(plugin: string, text: string) {
   deltaOf(plugin).toasts += 1
   const shown = keep(text, 160)
@@ -582,7 +610,7 @@ function isEmpty(delta: Delta): boolean {
   return (
     Object.keys(delta.runs).length === 0 &&
     Object.keys(delta.slow).length === 0 &&
-    delta.procs + delta.procFails + delta.writes + delta.toasts + delta.models + delta.fails + delta.cmds + delta.tools === 0
+    delta.procs + delta.procFails + delta.writes + delta.toasts + delta.models + delta.fails + delta.cmds + delta.tools + delta.logErrors === 0
   )
 }
 
@@ -605,6 +633,7 @@ function countsLine(plugin: string, delta: Delta, at: number): CountsLine {
     fails: delta.fails,
     cmds: delta.cmds,
     tools: delta.tools,
+    ...(delta.logErrors > 0 ? { logErrors: delta.logErrors } : {}),
   }
 }
 
@@ -865,6 +894,8 @@ function newSession(ended: string, at: number) {
   procAlerted = new Set()
   failureCounts = new Map()
   procFailTimes = new Map()
+  logErrorTimes = new Map()
+  logAlerted = new Set()
   statuses = new Map()
   noted = new Set()
   day = dayOf(at)
@@ -924,6 +955,12 @@ function procBursts(at: number): Set<string> {
   const bursting = new Set<string>()
   for (const [plugin, times] of procFailTimes) {
     if (times.filter(time => at - time < PROC_WINDOW_MS).length >= PROC_BURST) {
+      bursting.add(plugin)
+    }
+  }
+  // A mod that keeps logging its own errors is failing too, though no hook threw.
+  for (const [plugin, times] of logErrorTimes) {
+    if (times.filter(time => at - time < LOG_WINDOW_MS).length >= LOG_BURST) {
       bursting.add(plugin)
     }
   }
@@ -1047,6 +1084,7 @@ export const register: Register = (on, options) => {
     renderSlowMs: Math.min(RENDER_SLOW_MS, slowMs),
     watchRender: options.watchRender !== false,
     watchCommands: options.watchCommands !== false,
+    watchAppend: options.watchAppend !== false,
     retentionDays: Math.max(1, Math.round(Number(options.retentionDays ?? DEFAULTS.retentionDays) || DEFAULTS.retentionDays)),
     flushMs: Math.min(3_600, Math.max(5, Number(options.flushSeconds ?? 60) || 60)) * 1000,
   }
@@ -1063,6 +1101,8 @@ export const register: Register = (on, options) => {
   procAlerted = new Set()
   failureCounts = new Map()
   procFailTimes = new Map()
+  logErrorTimes = new Map()
+  logAlerted = new Set()
   statuses = new Map()
   noted = new Set()
   folding = new Map()
@@ -1133,6 +1173,10 @@ export const register: Register = (on, options) => {
   on('turn.start', ($, e, next) => watch($, 'turn.start', next, () => next(e)))
   on('turn.complete', ($, e, next) => watch($, 'turn.complete', next, () => next(e)))
   on('session.compact', ($, e, next) => watch($, 'session.compact', next, () => next(e)))
+  if (config.watchAppend) {
+    // Every transcript row: failures and slow hooks only, no per-run counts (secret-guard masks rows here).
+    on('session.append', ($, e, next) => watch($, 'session.append', next, () => next(e), true))
+  }
   if (config.watchRender) {
     // Only the components mods draw; transcript rows are left alone.
     on('ui.render', { component: ['Pane', 'AbovePrompt'] }, ($, e, next) => watch($, 'ui.render', next, () => next(e), true))
@@ -1154,6 +1198,15 @@ export const register: Register = (on, options) => {
       const plugin = callerOf(next.origin)
       if (plugin) {
         onStatus(plugin, e.text)
+      }
+    })
+    return next(e)
+  })
+  on('ui.log', ($, e, next) => {
+    safely(() => {
+      const plugin = callerOf(next.origin)
+      if (plugin) {
+        onLog($, plugin, e.text)
       }
     })
     return next(e)

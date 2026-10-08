@@ -338,3 +338,18 @@ test('turned off in settings, nothing is touched', { options: { enabled: false, 
   const shown = await $.command.run(typed('route', ''))
   expect(shown.text).toMatch(/turned off in its settings/)
 })
+
+test('a failure while choosing sends the request unchanged and logs it for mod-monitor', async ($, on) => {
+  const w = world(on)
+  const logs: string[] = []
+  on('ui.log', (_$, e) => {
+    logs.push(e.text)
+    return { value: undefined }
+  })
+  on('clock.now', () => ({ deny: 'clock unavailable' }))
+  await turn($, w, 'commit and push')
+  // A routine prompt would go out at low; with routing broken it keeps the session's own effort.
+  expect(w.sent.length).toBeGreaterThan(0)
+  expect(w.sent.every(step => step.effort === 'xhigh')).toBe(true)
+  expect(logs.some(line => line.startsWith('effort-router: choosing the effort failed, so the request went out unchanged'))).toBe(true)
+})

@@ -96,9 +96,10 @@ Watches how the other mods behave in real use, without changing them. It is list
 - **`/mods failures [7d]`:** failures and failed subprocesses only.
 - **Logs:** `~/.claude/mods/monitor/<date>/<session>.jsonl`, flushed every minute and at session end, with secrets masked and old days removed after 30 days.
 - Makes no model calls and adds no measurable latency.
-- **What it can't see:** effort-router's per-request stream (`turn.step`) and secret-guard's transcript-row hook (`session.append`).
+- **Error lines mods log themselves** (`$.ui.log` with wording like "failed" or "could not"): shown in Details and in `/mods failures`. Three in an hour mark the mod ⚠ and raise one toast. That is how effort-router's per-request hook, which runs inside the response stream where no monitor should sit, reports a failure. It also always sends the request on unchanged.
+- **Transcript-row hooks** (secret-guard masks `/secrets` records there) are watched for failures and slow runs, but not counted per run.
 
-Settings: `alerts` (on), `slowMs` (1500), `watchRender` (on), `watchCommands` (on; off stops "mod-monitor" appearing beside other mods' command output), `retentionDays` (30), `flushSeconds` (60).
+Settings: `alerts` (on), `slowMs` (1500), `watchRender` (on), `watchCommands` (on; off stops "mod-monitor" appearing beside other mods' command output), `watchAppend` (on), `retentionDays` (30), `flushSeconds` (60).
 
 ## modal-meter
 
@@ -108,7 +109,7 @@ Keeps an eye on Modal so idle GPU containers don't burn credits.
 - A toast when an app has had containers up longer than `alertMinutes` (30), repeated at most every 30 minutes.
 - `/modal` opens a pane of apps with state, containers and uptime. **Stop** asks for Confirm, then runs `modal app stop`. Nothing is stopped any other way.
 - Shows today's spend and alerts on a `budgetToday` where the Modal CLI supports `billing report` (1.3.3+, Team/Enterprise workspaces). Otherwise `/modal` says why spend isn't shown.
-- Finds the CLI as `modal` or `python3 -m modal`, and stays silent when Modal isn't set up.
+- Finds the CLI as `modal` or `python3 -m modal`. It checks `PATH` first rather than running a command that can only fail, and stays silent when Modal isn't set up.
 - Makes no model calls: only the Modal CLI, every 60s.
 
 ## pr-autopilot

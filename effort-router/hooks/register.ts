@@ -153,6 +153,12 @@ async function noteResponse($: Engine, messageCount: number, model: string, resu
   }
 }
 
+/** A failure in effort-router's own code, logged (to the debug log) for mod-monitor to count. */
+function reportFailure($: Engine, what: string, error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  $.ui.log(`effort-router: ${what} failed, so the request went out unchanged: ${message.slice(0, 200)}`, { to: 'debug' })
+}
+
 export const register: Register = (on, options) => {
   const compiled = compilePatterns(textOf(options.routinePattern), textOf(options.deepPattern))
   const errors = [...compiled.errors]
@@ -239,14 +245,35 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.step', async function* ($, e, next) {
-    const model = await guardedModel($, e.model)
-    if (e.agentId !== undefined || !isLevel(e.effort)) {
-      // A subagent keeps its own effort; a model without effort levels has none to route.
-      return yield* next(model === e.model ? e : { ...e, model })
+    // Routing must never cost a request: if choosing fails, the request goes out exactly as it came, and
+    // the failure is logged where mod-monitor reads it (this stream is not a hook it can watch).
+    let routed = e
+    let model = e.model
+    let isRouted = false
+    try {
+      model = await guardedModel($, e.model)
+      if (e.agentId !== undefined || !isLevel(e.effort)) {
+        // A subagent keeps its own effort; a model without effort levels has none to route.
+        routed = model === e.model ? e : { ...e, model }
+      } else {
+        const effort = await chooseEffort($, e, model, e.effort)
+        routed = effort === e.effort && model === e.model ? e : { ...e, model, effort }
+        isRouted = true
+      }
+    } catch (error) {
+      routed = e
+      model = e.model
+      isRouted = false
+      reportFailure($, 'choosing the effort', error)
     }
-    const effort = await chooseEffort($, e, model, e.effort)
-    const result = yield* next(effort === e.effort && model === e.model ? e : { ...e, model, effort })
-    await noteResponse($, e.messageCount, model, result)
+    const result = yield* next(routed)
+    if (isRouted) {
+      try {
+        await noteResponse($, e.messageCount, model, result)
+      } catch (error) {
+        reportFailure($, 'noting the response', error)
+      }
+    }
     return result
   })
 

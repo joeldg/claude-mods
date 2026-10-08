@@ -432,3 +432,17 @@ test("today's spend shows in /modal and the pane, and passing budgetToday toasts
   await $.command.run(typed('modal', ''))
   expect(w.toasts).toHaveLength(1)
 })
+
+test('a CLI that is not on PATH is skipped without spawning it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, 'python3 -m modal')
+  mock.env(on, { PATH: '/usr/local/bin:/usr/bin' })
+  on('fs.exists', (_$, e) => ({ value: e.path === '/usr/bin/python3' }))
+  await $.session.start(START)
+  await clock.settle()
+
+  // No `modal --version` that could only fail: python3 is found on PATH and used straight away.
+  expect(ran(w, 'modal --version')).toBe(0)
+  expect(w.ran.slice(0, 2)).toEqual(['python3 -m modal --version', 'python3 -m modal app list --json'])
+  expect(w.statuses.at(-1)).toBe('Modal: 1 running (2 containers) · 1 deployed')
+})

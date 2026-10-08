@@ -90,6 +90,21 @@ const GIT_PROBE: Plugin = {
   },
 }
 
+/** A mod that reports its own trouble only through $.ui.log, as several mods do. */
+const LOGGER: Plugin = {
+  name: 'logger',
+  register(on) {
+    on('command.run', { command: 'trouble' }, async $ => {
+      $.ui.log('logger: could not reach the service', { to: 'debug' })
+      return { text: 'tried' }
+    })
+    on('command.run', { command: 'fine' }, async $ => {
+      $.ui.log('logger: the index is up to date', { to: 'debug' })
+      return { text: 'fine' }
+    })
+  },
+}
+
 /** A mod whose command runs a process that fails. */
 const POLLER: Plugin = {
   name: 'poller',
@@ -529,4 +544,23 @@ test('a git probe outside a repository is expected: logged, not counted, never a
   expect(alerts(w).filter(text => text.includes('processes failed'))).toEqual([])
   const summary = await mods($)
   expect(summary).not.toContain('⚠ git-probe')
+})
+
+test('error lines a mod logs itself are counted; three in an hour mark it failing and raise one toast', { ...SLOW, plugins: [LOGGER] }, async ($, on) => {
+  const w = world(on, {})
+  await start($, w)
+  await $.command.run(typed('fine'))
+  await w.clock.settle()
+  expect(alerts(w)).toEqual([])
+  expect(await mods($)).not.toContain('⚠ logger')
+
+  for (let i = 0; i < 3; i++) {
+    await $.command.run(typed('trouble'))
+  }
+  await w.clock.settle()
+  expect(alerts(w)).toEqual(['mod-monitor: logger logged 3 errors in the last hour (last: logger: could not reach the service) — /mods for details'])
+  await $.command.run(typed('trouble'))
+  await w.clock.settle()
+  expect(alerts(w)).toHaveLength(1)
+  expect(await mods($)).toContain('⚠ logger')
 })

@@ -31,6 +31,12 @@
       "description": "Record which mod commands you use and catch failures in them. Off: mod-monitor's name stops appearing beside other mods' command output.",
       "default": true
     },
+    "watchAppend": {
+      "type": "boolean",
+      "title": "Watch transcript-row hooks",
+      "description": "Catch failures in hooks that rewrite transcript rows (secret-guard masks /secrets records there). Failures and slow runs only.",
+      "default": true
+    },
     "retentionDays": {
       "type": "number",
       "title": "Keep logs (days)",

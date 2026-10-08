@@ -197,6 +197,9 @@ async function status($: Engine): Promise<string> {
   return `${state}${extra}\n${USAGE}`
 }
 
+/** What a /secrets record shows when it could not be masked. */
+const WITHHELD = '/secrets … (withheld: secret-guard could not mask this record)'
+
 export const register: Register = (on, options) => {
   let extra: RegExp | null = null
   let extraError: string | null = null
@@ -250,14 +253,25 @@ export const register: Register = (on, options) => {
   // `/secrets test <text>` would leave the text in the command's record: the record keeps it masked.
   on('session.append', { door: 'command' }, async ($, e, next) => {
     let isChanged = false
-    const content = e.message.content.map(block => {
-      if (block.type !== 'text' || typeof block.text !== 'string' || !SECRETS_COMMAND.test(block.text)) {
-        return block
-      }
-      const text = masked(block.text)
-      isChanged ||= text !== block.text
-      return { ...block, text }
-    })
+    const isSecretsText = (block: (typeof e.message.content)[number]) =>
+      block.type === 'text' && typeof block.text === 'string' && SECRETS_COMMAND.test(block.text)
+    let content: typeof e.message.content
+    try {
+      content = e.message.content.map(block => {
+        if (block.type !== 'text' || typeof block.text !== 'string' || !SECRETS_COMMAND.test(block.text)) {
+          return block
+        }
+        const text = masked(block.text)
+        isChanged ||= text !== block.text
+        return { ...block, text }
+      })
+    } catch (error) {
+      // Fail closed: a record that could not be masked keeps no text, rather than the secret it may hold.
+      const message = error instanceof Error ? error.message : String(error)
+      $.ui.log(`secret-guard: masking a /secrets record failed, so its text was withheld: ${message.slice(0, 200)}`, { to: 'debug' })
+      content = e.message.content.map(block => (isSecretsText(block) && block.type === 'text' ? { ...block, text: WITHHELD } : block))
+      isChanged = true
+    }
     return next(isChanged ? { ...e, message: { ...e.message, content } } : e)
   })
 

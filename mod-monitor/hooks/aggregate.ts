@@ -39,6 +39,8 @@ export type ModSummary = {
   tools: number
   procs: number
   procFails: number
+  /** Error lines the mod logged itself. */
+  logErrors: number
   procGroups: Map<string, ProcGroup>
   writes: number
   models: number
@@ -74,6 +76,7 @@ function blank(name: string): ModSummary {
     tools: 0,
     procs: 0,
     procFails: 0,
+    logErrors: 0,
     procGroups: new Map(),
     writes: 0,
     models: 0,
@@ -109,6 +112,7 @@ function addCounts(mod: ModSummary, line: CountsLine) {
   const tools = num(line.tools)
   mod.procs += procs
   mod.procFails += procFails
+  mod.logErrors += num(line.logErrors)
   mod.writes += writes
   mod.toasts += toasts
   mod.models += models
@@ -246,6 +250,8 @@ export function eventText(line: EventLine): string {
       return `slow process ${line.cmd}: ${msText(line.ms)}`
     case 'proc-expected':
       return `· ${line.cmd}: ${line.why} (expected)${n}`
+    case 'log':
+      return `${line.isError ? '✗ logged' : 'logged'}: ${line.text}${n}`
     case 'model': {
       const usage = line.usage
       const tokens = usage ? `, ${countText(usage.in + usage.cacheRead + usage.cacheWrite)} in / ${countText(usage.out)} out` : ''
@@ -336,6 +342,7 @@ export function countsText(mod: ModSummary | undefined): string {
     ['commands', mod.cmds],
     ['tool calls', mod.tools],
     ['process failures', mod.procFails],
+    ['errors logged', mod.logErrors],
     ['model calls', mod.models],
   ]
   return parts
@@ -537,7 +544,7 @@ export function reportText(input: ReportInput): string {
   const never = names.filter(name => !wasSeen(input.mods.get(name)))
   const failing = seen.filter(name => {
     const mod = input.mods.get(name)
-    return mod !== undefined && (mod.fails > 0 || mod.failureGroups.size > 0 || mod.procFails > 0)
+    return mod !== undefined && (mod.fails > 0 || mod.failureGroups.size > 0 || mod.procFails > 0 || mod.logErrors > 0)
   })
   const lines = [
     `# Mods report: last ${input.range} (${stampOf(input.since)} to ${stampOf(input.now)})`,

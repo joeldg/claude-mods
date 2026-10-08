@@ -67,9 +67,37 @@ async function run($: Engine, argv: readonly string[], timeoutMs: number): Promi
   }
 }
 
+/**
+ * Whether `exe` can start: a path is checked as given, a bare name against each `PATH` folder. With no
+ * `PATH` to read it is assumed present, so the probe still runs. Checking first spares a process that
+ * can only fail (`modal` is often not on `PATH` when Modal runs as `python3 -m modal`).
+ */
+async function canStart($: Engine, exe: string): Promise<boolean> {
+  try {
+    if (exe.includes('/')) {
+      return await $.fs.exists(exe)
+    }
+    const folders = ((await $.env.get('PATH')) ?? '').split(':').filter(Boolean)
+    if (folders.length === 0) {
+      return true
+    }
+    for (const folder of folders) {
+      if (await $.fs.exists(`${folder.replace(/\/+$/, '')}/${exe}`)) {
+        return true
+      }
+    }
+    return false
+  } catch {
+    return true
+  }
+}
+
 /** The first candidate that answers `--version`: the option as given, else `modal`, then `python3 -m modal`. */
 async function resolveCli($: Engine): Promise<string[] | null> {
   for (const argv of cliCandidates(config.command)) {
+    if (!(await canStart($, argv[0] ?? ''))) {
+      continue
+    }
     const out = await run($, [...argv, '--version'], PROBE_TIMEOUT_MS)
     if (out.started && out.code === 0 && !isMissingModule(`${out.stderr}\n${out.stdout}`)) {
       return argv
