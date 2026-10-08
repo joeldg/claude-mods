@@ -406,6 +406,28 @@ export function oneLine(text: string, max: number): string {
   return flat.length <= max ? flat : `${flat.slice(0, Math.max(0, max - 1)).trimEnd()}…`
 }
 
+/** The END of the text on one line, masked, at most `max` characters, `…` where the start was cut. */
+export function tailLine(text: string, max: number): string {
+  const flat = maskSecrets(text).replace(/\s+/g, ' ').trim()
+  return flat.length <= max ? flat : `…${flat.slice(flat.length - Math.max(0, max - 1)).trimStart()}`
+}
+
+/**
+ * A decision as the engine stores it, `Q: <the question> → A: <the reply>`, turned answer-first so a
+ * cut never loses the reply: `"go with (a)" — to: …which order should we land them in?`. The
+ * question's end is kept, since that is where the actual ask is. Other decisions are one line.
+ */
+export function decisionText(text: string, max: number): string {
+  const found = text.match(/^\s*Q:\s*([\s\S]*?)\s*→\s*A:\s*([\s\S]*)$/)
+  if (!found) {
+    return oneLine(text, max)
+  }
+  const answer = oneLine(found[2] ?? '', Math.max(24, Math.floor(max * 0.55)))
+  const room = max - answer.length - 10
+  const question = (found[1] ?? '').replace(/^\s*…\s*/, '')
+  return room >= 24 && question ? `"${answer}" — to: ${tailLine(question, room)}` : `"${answer}"`
+}
+
 /** The text masked, at most `max` characters, its lines kept, `…` where it was cut. */
 export function clip(text: string, max: number): string {
   const masked = maskSecrets(text).replace(/\r\n?/g, '\n').trim()
@@ -807,7 +829,7 @@ export function recapLines(r: RecallRecap, now: number): string[] {
   const bullets = (label: string, all: readonly string[]) => {
     if (all.length > 0) {
       const shown = all.slice(0, 8)
-      lines.push(`${label}:`, ...shown.map(one => `- ${oneLine(one, 200)}`))
+      lines.push(`${label}:`, ...shown.map(one => `- ${label === 'Decisions' ? decisionText(one, 240) : oneLine(one, 200)}`))
       if (all.length > shown.length) {
         lines.push(`- (+${all.length - shown.length} more)`)
       }
@@ -875,7 +897,8 @@ export function listLine(item: RecallListItem, max = 360): string {
   const head = [`[${item.ref}] ${dayOf(item.ts)}`, oneLine(item.projectName, 40), item.title ? `"${oneLine(item.title, 60)}"` : '']
     .filter(Boolean)
     .join(' · ')
-  return `${head} — ${oneLine(item.text, Math.max(40, max - head.length - 3))}`
+  const room = Math.max(40, max - head.length - 3)
+  return `${head} — ${item.kind === 'decision' ? decisionText(item.text, room) : oneLine(item.text, room)}`
 }
 
 export type ListOutcome = {

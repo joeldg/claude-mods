@@ -22,6 +22,7 @@ import {
   agoOf,
   clockOf,
   dayOf,
+  decisionText,
   fitParts,
   kindLabel,
   modelLabel,
@@ -290,7 +291,7 @@ function listRow(kit: Kit, item: RecallListItem, open: RecallOpen | undefined, i
       </Text>
       <Box flexDirection="row" gap={1}>
         <Box flexShrink={1} flexGrow={1}>
-          <Text wrap="wrap">{oneLine(item.text, 500)}</Text>
+          <Text wrap="wrap">{item.kind === 'decision' ? decisionText(item.text, 500) : oneLine(item.text, 500)}</Text>
         </Box>
         {rowButtons(kit, item.ref, open, isArmed, actions)}
       </Box>

@@ -37,6 +37,8 @@ import {
   snippetParts,
   spanOf,
   takeLines,
+  decisionText,
+  tailLine,
 } from '../hooks/format'
 import type { SearchOutcome } from '../hooks/format'
 
@@ -593,4 +595,17 @@ describe('budgets', () => {
     const cut = capText(`${'a'.repeat(60)}\n${'b'.repeat(60)}`, 100)
     expect(cut).toBe(`${'a'.repeat(60)}\n[… cut to fit]`)
   })
+})
+
+test('a decision shows the reply first and the end of the question, so a cut never loses the answer', () => {
+  const question = 'Q: …' + 'background detail '.repeat(20) + 'Want me to start with the retry fix or the cache change?'
+  const stored = `${question} → A: go with the retry fix first, the cache change can wait`
+  const shown = decisionText(stored, 200)
+  expect(shown.startsWith('"go with the retry fix first, the cache change can wait" — to: …')).toBe(true)
+  expect(shown.endsWith('the retry fix or the cache change?')).toBe(true)
+  expect(shown.length).toBeLessThanOrEqual(200)
+  expect(decisionText('We will not use the hosted service; we build our own.', 200)).toBe(
+    'We will not use the hosted service; we build our own.',
+  )
+  expect(tailLine('one two three four five', 10)).toBe('…four five')
 })
