@@ -119,6 +119,34 @@ Settings:
 
 It never closes issues; put "Closes #N" in PR bodies for that.
 
+## recall
+
+Search everything you've done with coding agents, from Claude or from `/recall`. It replaces the broken agent-memory plugin.
+
+- **What it searches:** Claude Code sessions, Codex sessions, subagent and workflow runs, Claude's memory files, standing orders, second-opinion reviews, and your `/remember` notes. Routine (scheduled) runs are left out unless you add `routines:include` to a query.
+- **What it keeps:** prompts, answers, compaction summaries, session titles, commands, files touched, commits, PRs, issues, URLs, tasks and **decisions** (what you approved or ruled out). Read-only look-ups like `grep` and `cat` are kept but ranked low.
+- **History survives cleanup:** extracts stay searchable after Claude Code deletes old transcripts.
+- **Claude searches it itself** with four read-only tools, `search`, `expand`, `recap` and `list`, which run without permission prompts. It checks them when you say "like last time" or "what did we decide", and before asking you something you already settled.
+- **Commands:**
+  - `/recall <query>` opens a pane of hits grouped by session. **Open** shows the conversation around a hit, **Attach** sends it with your next message, and **Copy resume command** copies `claude --resume <id>`.
+  - `/recall last [n]` recaps your last session in this repo: last asks, last answer, PRs, commits, open tasks and decisions. **Send to Claude** attaches it.
+  - `/recall timeline [7d|30d|90d] [all]`
+  - `/recall decisions|commands|files|prs|commits|issues|urls|tasks|notes [query]`
+  - `/recall ask <question>` answers from your history with Haiku 4.5, citing sessions. It costs a little usage and sends the matching excerpts to the model.
+  - `/recall stats`, `/recall reindex`, `/recall forget session <id>|project <name>|before <date>` (asks you to confirm), `/recall help`.
+  - `/remember <fact>`, `/remember list`, `/remember forget <ref>`.
+- **Bands:**
+  - Once per session: `Last session here (2d ago): "…" · PR #99 · 3 open tasks [Recap]`.
+  - When a prompt mentions `#214`, `ABC-12`, a file name or a quoted phrase seen in past sessions, a band offers what happened then. Nothing is sent unless you click.
+- **Query syntax:** words must all match. `OR` gives alternatives, `"quotes"` an exact phrase, and `-word` excludes. Filters: `project:name`, `kind:decision`, `since:7d`, `until:2026-09-30`, `source:codex`, `routines:include`.
+- **Privacy:**
+  - The index lives at `~/.claude/recall/index.db`, readable only by you, and never goes in a repo.
+  - Secrets are masked before anything is stored: known token shapes, labelled values ("password: …"), the values of secret-named exports in `~/.zshrc`, `~/.zprofile`, `~/.bashrc` and `~/.bash_profile`, and any literal strings you list in `~/.claude/recall/redact.txt` (one per line). Editing that list re-masks the existing index on the next update.
+- **Cost:** no model calls except `/recall ask`. The first index takes about 2 minutes in the background, with progress on the status line. After that it updates incrementally (about 1s) at session start and every 10 minutes.
+- **Requires** macOS's `/usr/bin/python3` (Command Line Tools), whose SQLite has FTS5. Nothing else to install.
+
+Settings: `dbPath`, `python`, `sources`, `includeSubagents` (on), `includeRoutines` (off), `updateMinutes` (10), `relatedBand` (on), `lastSessionBand` (on), `maxResults` (8), `askModel` (`claude-haiku-4-5-20251001`).
+
 ## repo-brief
 
 Catches Claude up on the repo when a session starts, so you don't have to ask "check the recent commits/PRs and issues".
@@ -217,7 +245,7 @@ The quit request goes out when Claude issues the command, before any permission 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall" } }
   ```
 
 ## Checking
@@ -238,4 +266,6 @@ claude plugin validate dev-servers && claude plugin test dev-servers
 claude plugin validate standing-orders && claude plugin test standing-orders
 claude plugin validate effort-router && claude plugin test effort-router
 claude plugin validate secret-guard && claude plugin test secret-guard
+claude plugin validate recall && claude plugin test recall
+(cd recall/engine && /usr/bin/python3 -m unittest)
 ```

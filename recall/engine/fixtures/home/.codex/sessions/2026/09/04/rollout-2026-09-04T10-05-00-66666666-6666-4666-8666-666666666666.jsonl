@@ -1,0 +1,3 @@
+{"timestamp":"2026-09-04T10:10:00.000Z","type":"session_meta","payload":{"id":"66666666-6666-4666-8666-666666666666","cwd":"/Users/me/acme/widgets","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review","originator":"Codex Desktop"}}
+{"timestamp":"2026-09-04T10:10:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":">>> TRANSCRIPT START GUARDIANMARK"}]}}
+{"timestamp":"2026-09-04T10:10:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Guardian review approves the command because it is read only. GUARDIANMARK"}]}}

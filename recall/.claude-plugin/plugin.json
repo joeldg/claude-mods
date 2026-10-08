@@ -1,0 +1,71 @@
+{
+  "name": "recall",
+  "version": "0.1.0",
+  "description": "Makes past sessions recallable: indexes Claude Code and Codex transcripts, subagent runs, memory files, standing orders and second-opinion reviews into a local SQLite index (kept after Claude Code deletes old transcripts), gives Claude search, expand, recap and list tools, and adds /recall (search, last session, timeline, decisions, commands, files, PRs, ask), /remember, a pick-up-where-you-left-off band and a related-work band. Nothing calls a model except /recall ask: one call to the ask model per question, billed to your usage.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "dbPath": {
+      "type": "string",
+      "title": "Index file",
+      "description": "Where the SQLite index is kept (~ is your home folder). It holds extracts of your past sessions, with known secret shapes masked.",
+      "default": "~/.claude/recall/index.db"
+    },
+    "python": {
+      "type": "string",
+      "title": "Python",
+      "description": "The python3 that runs the indexing engine (standard library only).",
+      "default": "/usr/bin/python3"
+    },
+    "sources": {
+      "type": "string",
+      "title": "Sources",
+      "description": "Comma-separated sources to index: claude (Claude Code sessions), codex (Codex sessions), memory (memory files), orders (standing orders), reviews (second-opinion reviews).",
+      "default": "claude,codex,memory,orders,reviews"
+    },
+    "includeSubagents": {
+      "type": "boolean",
+      "title": "Index subagent transcripts",
+      "description": "Also index what subagents did inside a session.",
+      "default": true
+    },
+    "includeRoutines": {
+      "type": "boolean",
+      "title": "Include routine sessions",
+      "description": "Show scheduled (routine) sessions in search results, lists and the timeline. Off: they are indexed but left out unless a query asks for them (routines:include).",
+      "default": false
+    },
+    "updateMinutes": {
+      "type": "number",
+      "title": "Re-index every (minutes)",
+      "description": "How often new and changed sessions are indexed in the background while a session is open.",
+      "default": 10
+    },
+    "relatedBand": {
+      "type": "boolean",
+      "title": "Related-work band",
+      "description": "When your prompt names a PR or issue number, a ticket, a file or a quoted phrase that past sessions mention, show a band above the prompt with Show and Attach.",
+      "default": true
+    },
+    "lastSessionBand": {
+      "type": "boolean",
+      "title": "Last-session band",
+      "description": "At the start of a session, show this project's last session (title, PR, open tasks) in a band with Recap.",
+      "default": true
+    },
+    "maxResults": {
+      "type": "number",
+      "title": "Results per search",
+      "description": "How many hits the search tool returns to Claude.",
+      "default": 8
+    },
+    "askModel": {
+      "type": "string",
+      "title": "/recall ask model",
+      "description": "The model that answers /recall ask from the excerpts it finds. Every /recall ask is one call to it, billed to your usage.",
+      "default": "claude-haiku-4-5-20251001"
+    }
+  }
+}
