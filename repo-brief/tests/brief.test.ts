@@ -9,6 +9,7 @@ import {
   countWorktrees,
   emptySnapshot,
   goneBranches,
+  isGhAuthFailure,
   isGitHubRemote,
   parseFocusLabels,
   parseIssues,
@@ -115,11 +116,34 @@ test('lists merged branches, leaving out current, worktree and default branches'
   expect(branchNames(merged, ['main'])).toEqual(['fix/merged'])
 })
 
-test('picks the default branch', () => {
-  expect(pickDefaultBranch('origin/develop\n', null)).toBe('origin/develop')
-  expect(pickDefaultBranch(null, 'main\norigin/main\n')).toBe('origin/main')
-  expect(pickDefaultBranch(null, 'master\n')).toBe('master')
-  expect(pickDefaultBranch(null, '')).toBeNull()
+test('picks the default branch from one for-each-ref read, else the current branch', () => {
+  // origin/HEAD set: what it points to.
+  expect(
+    pickDefaultBranch('refs/remotes/origin/HEAD\trefs/remotes/origin/develop\nrefs/remotes/origin/main\t\nrefs/heads/main\t\n', 'main'),
+  ).toBe('origin/develop')
+  // Not set (a clone made without it): origin/main, origin/master, main, master, in that order.
+  expect(pickDefaultBranch('refs/heads/main\t\nrefs/remotes/origin/main\t\n', 'feature')).toBe('origin/main')
+  expect(pickDefaultBranch('refs/remotes/origin/master\t\nrefs/heads/master\t\n', 'feature')).toBe('origin/master')
+  expect(pickDefaultBranch('refs/heads/master\t\n', 'feature')).toBe('master')
+  // None of them: the branch checked out now, or nothing on a detached HEAD.
+  expect(pickDefaultBranch('', 'trunk')).toBe('trunk')
+  expect(pickDefaultBranch(null, 'trunk')).toBe('trunk')
+  expect(pickDefaultBranch('', null)).toBeNull()
+})
+
+test('tells a gh auth failure from any other', () => {
+  expect(
+    isGhAuthFailure('', 'GraphQL: Resource not accessible by personal access token (repository.pullRequest.statusCheckRollup.contexts.nodes)'),
+  ).toBe(true)
+  expect(isGhAuthFailure('', 'HTTP 401: Requires authentication (https://api.github.com/graphql)')).toBe(true)
+  expect(isGhAuthFailure('', 'To get started with GitHub CLI, please run:  gh auth login')).toBe(true)
+  expect(isGhAuthFailure('', 'HTTP 403: Must have admin rights to Repository.')).toBe(true)
+  expect(isGhAuthFailure('', 'HTTP 401: Bad credentials')).toBe(true)
+  expect(isGhAuthFailure('Requires authentication', '')).toBe(true)
+  // A rate limit is an HTTP 403 too, but not an auth problem; nor is a remote that is not GitHub.
+  expect(isGhAuthFailure('', 'HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/graphql)')).toBe(false)
+  expect(isGhAuthFailure('', 'none of the git remotes configured for this repository point to a known GitHub host')).toBe(false)
+  expect(isGhAuthFailure('', '')).toBe(false)
 })
 
 test('counts worktrees beyond the main one and spots GitHub remotes', () => {
@@ -200,6 +224,23 @@ test('the brief says what gh could not tell and what is clean', () => {
   expect(text).toContain('Working tree: clean')
   expect(text).not.toContain('Open PRs')
   expect(text).toContain('PRs and issues: not gathered')
+})
+
+test('the brief says when gh may not read the PRs, and keeps the issues it could read', () => {
+  const denied = summary({ ...busy(), prs: [], prsDenied: true }, LEAD, LABELS)
+  expect(denied).toContain("PRs: gh token can't read them")
+  expect(denied).not.toContain('Open PRs')
+  expect(denied).not.toContain('not gathered')
+  expect(denied).toContain('Open issues: 14; labelled owner, todo, P0, blocked (2):')
+  // With nothing else from gh, the note stands alone.
+  const alone = summary({ ...busy(), ghOk: false, prs: [], issueCount: 0, focusIssues: [], prsDenied: true }, LEAD, LABELS)
+  expect(alone).toContain("PRs: gh token can't read them")
+  expect(alone).not.toContain('Open issues')
+  expect(alone).not.toContain('not gathered')
+  // The band lists no PRs then.
+  expect(bandLine(bandParts({ ...busy(), prs: [], prsDenied: true }, LABELS))).toBe(
+    'main ↑1 ↓2 · 3 changed · 2 owner issues · 2 stale branches · last commit 2h ago',
+  )
 })
 
 test('the brief stays under its length bound however much there is', () => {

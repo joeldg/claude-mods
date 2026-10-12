@@ -1,6 +1,6 @@
 {
   "name": "repo-brief",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Gathers the repo's state at session start (branch, ahead/behind, uncommitted work, recent commits, open PRs with CI, focus-label issues, stale branches) with no model calls, shows it in a band above the prompt and hands Claude the same summary in its first message.",
   "author": {
     "name": "joeldg"

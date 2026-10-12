@@ -185,9 +185,10 @@ Catches Claude up on the repo when a session starts, so you don't have to ask "c
   - the last 8 commits
   - open PRs with CI ✓/✗/…
   - issues labelled `owner`, `todo`, `P0` or `blocked`
-  - stale branches (merged, or upstream gone)
+  - stale branches (merged into the default branch, or upstream gone). The default branch is what `origin/HEAD` points to, else `origin/main`, `origin/master`, `main`, `master`, else the branch you are on — found with one `git for-each-ref` read, so a clone made without `origin/HEAD` costs no failing command.
 - A one-line band above the prompt, e.g. `main ↑1 · 3 changed · PRs #123 ✗ #124 ✓ · 2 owner issues · 2 stale branches · last commit 2h ago`. **Hide** dismisses it.
-- Claude gets the same summary once, in its first message, so the prompt cache stays warm. It refreshes after compaction.
+- Claude gets the same summary once, in its first message, so the prompt cache stays warm. It refreshes after compaction. The gather is started, not awaited, at session start: the first message uses it if it has landed, otherwise waits up to 5 s for a quick one, otherwise goes without.
+- When gh's token can't read the PRs (a fine-grained token without "Checks: read", or no login), the brief says `PRs: gh token can't read them` in their place, keeps the issues it could read, and leaves gh alone for 30 minutes instead of failing at every refresh. `/brief` asks again at once.
 - `/brief` re-gathers now and prints the full summary.
 - Makes no model calls: only `git` and `gh`. The band refreshes after a turn at most every 2 minutes.
 

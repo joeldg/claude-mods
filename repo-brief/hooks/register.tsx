@@ -11,6 +11,7 @@ import {
   emptySnapshot,
   goneBranches,
   isBlankTree,
+  isGhAuthFailure,
   isGitHubRemote,
   parseFocusLabels,
   parseIssues,
@@ -36,6 +37,8 @@ const FULL: Timing = { gitMs: 10_000, ghMs: 15_000 }
 const QUICK: Timing = { gitMs: 3_000, ghMs: 5_000 }
 /** The longest the first message waits for a gather still under way. */
 const BRIEF_WAIT_MS = 5_000
+/** How long a gh list refused over auth is not asked again in this session. */
+const AUTH_HOLD_MS = 30 * 60_000
 
 const LEAD_START =
   'Repo state when this session started (gathered by the repo-brief mod; run git yourself for anything newer):'
@@ -45,14 +48,18 @@ const LEAD_NOW = 'Repo state just now (gathered by the repo-brief mod):'
 
 type Config = { focusLabels: string[]; refreshMs: number; briefClaude: boolean }
 
+/** Until when each gh list is not asked again (ms) after it was refused over auth; 0 while it is asked. */
+type GhHeld = { prs: number; issues: number }
+
 let config: Config = { focusLabels: ['owner', 'todo', 'P0', 'blocked'], refreshMs: 120_000, briefClaude: true }
 let inflight: Promise<Snapshot | null> | null = null
 let lastGatherAt = 0
 let hasBriefed = false
+let ghHeld: GhHeld = { prs: 0, issues: 0 }
 
-type GitHub = Pick<Snapshot, 'ghOk' | 'prs' | 'issueCount' | 'focusIssues'>
+type GitHub = Pick<Snapshot, 'ghOk' | 'prsDenied' | 'prs' | 'issueCount' | 'focusIssues'>
 
-const NO_GITHUB: GitHub = { ghOk: false, prs: [], issueCount: 0, focusIssues: [] }
+const NO_GITHUB: GitHub = { ghOk: false, prsDenied: false, prs: [], issueCount: 0, focusIssues: [] }
 
 /** A command's stdout, or null when it could not start, timed out or exited non-zero. */
 async function run($: Engine, cwd: string, argv: readonly string[], timeoutMs: number): Promise<string | null> {
@@ -60,27 +67,59 @@ async function run($: Engine, cwd: string, argv: readonly string[], timeoutMs: n
   return out && out.exitCode === 0 ? out.stdout : null
 }
 
-async function gatherGitHub($: Engine, cwd: string, timing: Timing): Promise<GitHub> {
-  const [prJson, issueJson] = await Promise.all([
-    run(
-      $,
-      cwd,
-      ['gh', 'pr', 'list', '--state', 'open', '--limit', String(PR_LIMIT), '--json', 'number,title,headRefName,isDraft,statusCheckRollup'],
-      timing.ghMs,
-    ),
-    run(
-      $,
-      cwd,
-      ['gh', 'issue', 'list', '--state', 'open', '--limit', String(ISSUE_LIMIT), '--json', 'number,title,labels'],
-      timing.ghMs,
-    ),
+/** One gh list's stdout, or null and whether gh refused it over auth. */
+type Listed = { out: string | null; isDenied: boolean }
+/** Where and how a gh list is asked: the folder, how long it may take, and the time now. */
+type Ask = { cwd: string; timeoutMs: number; now: number }
+
+/**
+ * A gh list's stdout, or null when it could not start, timed out, exited non-zero or is held: a list
+ * refused over auth (a token that may not read it, no login) is expected and quiet, so it is not asked
+ * again for AUTH_HOLD_MS in this session; /brief asks anyway.
+ */
+async function ghList($: Engine, ask: Ask, kind: keyof GhHeld, argv: readonly string[]): Promise<Listed> {
+  if (ask.now < ghHeld[kind]) {
+    return { out: null, isDenied: true }
+  }
+  const ran = await $.process.run(argv, { cwd: ask.cwd, timeoutMs: ask.timeoutMs }).catch(() => null)
+  if (ran && ran.exitCode === 0) {
+    return { out: ran.stdout, isDenied: false }
+  }
+  const isDenied = ran !== null && isGhAuthFailure(ran.stdout, ran.stderr)
+  if (isDenied) {
+    ghHeld[kind] = ask.now + AUTH_HOLD_MS
+  }
+  return { out: null, isDenied }
+}
+
+async function gatherGitHub($: Engine, cwd: string, timing: Timing, now: number): Promise<GitHub> {
+  const ask: Ask = { cwd, timeoutMs: timing.ghMs, now }
+  const [prList, issueList] = await Promise.all([
+    ghList($, ask, 'prs', [
+      'gh',
+      'pr',
+      'list',
+      '--state',
+      'open',
+      '--limit',
+      String(PR_LIMIT),
+      '--json',
+      'number,title,headRefName,isDraft,statusCheckRollup',
+    ]),
+    ghList($, ask, 'issues', ['gh', 'issue', 'list', '--state', 'open', '--limit', String(ISSUE_LIMIT), '--json', 'number,title,labels']),
   ])
-  const prs = prJson === null ? null : parsePrs(prJson)
-  if (prs === null) {
+  const prs = prList.out === null ? null : parsePrs(prList.out)
+  if (prs === null && !prList.isDenied) {
     return NO_GITHUB
   }
-  const issues = issueJson === null ? null : parseIssues(issueJson, config.focusLabels)
-  return { ghOk: true, prs, issueCount: issues?.count ?? 0, focusIssues: issues?.focus ?? [] }
+  const issues = issueList.out === null ? null : parseIssues(issueList.out, config.focusLabels)
+  return {
+    ghOk: prs !== null || issues !== null,
+    prsDenied: prList.isDenied,
+    prs: prs ?? [],
+    issueCount: issues?.count ?? 0,
+    focusIssues: issues?.focus ?? [],
+  }
 }
 
 async function collect($: Engine, timing: Timing): Promise<Snapshot | null> {
@@ -103,27 +142,26 @@ async function collect($: Engine, timing: Timing): Promise<Snapshot | null> {
   }
 
   const parsed = parseStatus(status.stdout)
-  const [log, branchVv, symbolic, worktreeList, remote] = await Promise.all([
+  const [log, branchVv, refs, worktreeList, remote] = await Promise.all([
     git('log', '-8', '--format=%h%x09%cr%x09%an%x09%s'),
     git('branch', '-vv'),
-    git('symbolic-ref', '--short', 'refs/remotes/origin/HEAD'),
+    // origin/HEAD (a symref, its target beside it) and the branches that stand in for it, in one read that never fails.
+    git(
+      'for-each-ref',
+      '--format=%(refname)%09%(symref)',
+      'refs/remotes/origin/HEAD',
+      'refs/remotes/origin/main',
+      'refs/remotes/origin/master',
+      'refs/heads/main',
+      'refs/heads/master',
+    ),
     git('worktree', 'list', '--porcelain'),
     git('remote', 'get-url', 'origin'),
   ])
-  const candidates = symbolic?.trim()
-    ? null
-    : await git(
-        'for-each-ref',
-        '--format=%(refname:short)',
-        'refs/remotes/origin/main',
-        'refs/remotes/origin/master',
-        'refs/heads/main',
-        'refs/heads/master',
-      )
-  const defaultBranch = pickDefaultBranch(symbolic, candidates)
+  const defaultBranch = pickDefaultBranch(refs, parsed.branch)
   const [merged, github] = await Promise.all([
     defaultBranch ? git('branch', '--merged', defaultBranch) : Promise.resolve(null),
-    isGitHubRemote(remote) ? gatherGitHub($, cwd, timing) : Promise.resolve(NO_GITHUB),
+    isGitHubRemote(remote) ? gatherGitHub($, cwd, timing, now) : Promise.resolve(NO_GITHUB),
   ])
 
   const defaultName = defaultBranch?.replace(/^origin\//, '') ?? ''
@@ -186,7 +224,10 @@ export const register: Register = (on, options) => {
   inflight = null
   lastGatherAt = 0
   hasBriefed = false
+  ghHeld = { prs: 0, issues: 0 }
 
+  // The gather is started, not awaited: the first message reads the snapshot if it is ready, else waits
+  // for a quick one up to BRIEF_WAIT_MS (prompt.context), and the band draws once it lands.
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'brief',
@@ -226,6 +267,8 @@ export const register: Register = (on, options) => {
     if (inflight) {
       await inflight
     }
+    // Asked for by the person: gh is asked again, hold or not.
+    ghHeld = { prs: 0, issues: 0 }
     const current = await gather($, FULL)
     await update($, isHidden, () => false)
     if (current === null) {

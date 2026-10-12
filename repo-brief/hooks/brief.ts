@@ -29,6 +29,7 @@ export const emptySnapshot = (at: number, isRepo = false): Snapshot => ({
   staleBranches: [],
   worktrees: 0,
   ghOk: false,
+  prsDenied: false,
   prs: [],
   issueCount: 0,
   focusIssues: [],
@@ -130,17 +131,27 @@ export const branchNames = (output: string, exclude: readonly string[]): string[
     .map(line => line.trim())
     .filter(name => name.length > 0 && !name.startsWith('(') && !exclude.includes(name))
 
+/** `refs/remotes/origin/main` as `origin/main`, `refs/heads/main` as `main`. */
+const shortRef = (ref: string): string => ref.replace(/^refs\/(?:remotes|heads)\//, '')
+
+/** The branches that stand in for an unset origin/HEAD, in order. */
+const STAND_INS = ['refs/remotes/origin/main', 'refs/remotes/origin/master', 'refs/heads/main', 'refs/heads/master']
+
 /**
- * The default branch to check merges against: `git symbolic-ref --short refs/remotes/origin/HEAD`
- * when it answers, else the first of origin/main, origin/master, main, master that exists.
+ * The default branch to check merges against, from one `git for-each-ref --format=%(refname)%09%(symref)`
+ * read over origin/HEAD and its stand-ins (a read that never fails): what origin/HEAD points to when
+ * it is set (a clone made without it has none), else the first of origin/main, origin/master, main,
+ * master that exists, else the branch checked out now (null on a detached HEAD).
  */
-export const pickDefaultBranch = (symbolicRef: string | null, existingRefs: string | null): string | null => {
-  const named = symbolicRef?.trim()
-  if (named) {
-    return named
+export const pickDefaultBranch = (refs: string | null, currentBranch: string | null): string | null => {
+  const rows = (refs ?? '').split('\n').map(line => line.split('\t'))
+  const head = rows.find(([name, target]) => name === 'refs/remotes/origin/HEAD' && target)
+  if (head?.[1]) {
+    return shortRef(head[1])
   }
-  const refs = (existingRefs ?? '').split('\n').map(ref => ref.trim())
-  return ['origin/main', 'origin/master', 'main', 'master'].find(ref => refs.includes(ref)) ?? null
+  const names = new Set(rows.map(([name]) => name ?? ''))
+  const found = STAND_INS.find(ref => names.has(ref))
+  return found ? shortRef(found) : currentBranch
 }
 
 /** Linked worktrees besides the main one, from `git worktree list --porcelain`. */
@@ -148,6 +159,20 @@ export const countWorktrees = (output: string): number =>
   Math.max(0, output.split('\n').filter(line => line.startsWith('worktree ')).length - 1)
 
 export const isGitHubRemote = (url: string | null): boolean => /github\.com[:/]/i.test(url ?? '')
+
+const GH_AUTH_FAILURE =
+  /Resource not accessible by (?:personal access token|integration)|Requires authentication|HTTP 40[13]\b|not logged into|gh auth login|Bad credentials/i
+const GH_RATE_LIMIT = /rate limit/i
+
+/**
+ * True when gh failed over its login or its token's permissions (a fine-grained PAT lacking
+ * "Checks: read" cannot read statusCheckRollup): expected, and not worth asking again soon. A rate
+ * limit comes as an HTTP 403 too, and is not one.
+ */
+export const isGhAuthFailure = (stdout: string, stderr: string): boolean => {
+  const said = `${stderr}\n${stdout}`
+  return !GH_RATE_LIMIT.test(said) && GH_AUTH_FAILURE.test(said)
+}
 
 type Check = { status?: string | null; conclusion?: string | null; state?: string | null }
 
@@ -298,7 +323,9 @@ const briefWith = (s: Snapshot, lead: string, focusLabels: readonly string[], li
     )
   }
 
-  if (s.ghOk) {
+  if (s.prsDenied) {
+    lines.push("PRs: gh token can't read them")
+  } else if (s.ghOk) {
     if (s.prs.length === 0) {
       lines.push('Open PRs: none')
     } else {
@@ -312,6 +339,8 @@ const briefWith = (s: Snapshot, lead: string, focusLabels: readonly string[], li
         ...more(prs.length, s.prs.length),
       )
     }
+  }
+  if (s.ghOk) {
     const count = `${s.issueCount}${s.issueCount >= ISSUE_LIMIT ? '+' : ''}`
     const labels = focusLabels.join(', ')
     if (s.focusIssues.length === 0) {
@@ -324,7 +353,7 @@ const briefWith = (s: Snapshot, lead: string, focusLabels: readonly string[], li
         ...more(issues.length, s.focusIssues.length),
       )
     }
-  } else {
+  } else if (!s.prsDenied) {
     lines.push('PRs and issues: not gathered (gh unavailable, or the remote is not GitHub)')
   }
 

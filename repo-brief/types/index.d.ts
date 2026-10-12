@@ -34,6 +34,8 @@ export type Snapshot = {
   worktrees: number
   /** True when `gh` answered for a GitHub remote; PRs and issues are empty otherwise. */
   ghOk: boolean
+  /** True when gh refused the PR list over auth (a token that may not read them): the brief says so in its place. */
+  prsDenied: boolean
   prs: PullRequest[]
   issueCount: number
   focusIssues: FocusIssue[]

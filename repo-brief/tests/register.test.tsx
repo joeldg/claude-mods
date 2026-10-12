@@ -27,7 +27,25 @@ const done = (conclusion: string) => ({ __typename: 'CheckRun', status: 'COMPLET
 /** What a command answers: its stdout, an exit code with output, or `deny` when it cannot start. */
 type Reply = string | { exitCode: number; stdout?: string; stderr?: string } | 'deny'
 
-type World = { replies: Record<string, Reply>; ran: string[]; cwds: (string | undefined)[] }
+type World = { replies: Record<string, Reply>; ran: string[]; argvs: string[]; cwds: (string | undefined)[] }
+
+/** What `gh pr list --json …` prints: two open PRs. */
+const GH_PRS = JSON.stringify([
+  {
+    number: 123,
+    title: 'Fix login redirect',
+    headRefName: 'fix/login',
+    isDraft: false,
+    statusCheckRollup: [done('SUCCESS'), done('FAILURE')],
+  },
+  { number: 124, title: 'Add repo-brief', headRefName: 'repo-brief', isDraft: true, statusCheckRollup: [done('SUCCESS')] },
+])
+
+/** What gh answers when its token may not read the checks: the error the 3-day logs were full of. */
+const CHECKS_DENIED: Reply = {
+  exitCode: 1,
+  stderr: 'GraphQL: Resource not accessible by personal access token (repository.pullRequest.statusCheckRollup.contexts.nodes)\n',
+}
 
 /** A repo mid-work, as git and gh print it. */
 const REPLIES: Record<string, Reply> = {
@@ -35,20 +53,11 @@ const REPLIES: Record<string, Reply> = {
   'git log': '220cc0c\t2 hours ago\tjoeldg\tAdd job-watch and machine-guard mods\n1a2b3c4\t3 days ago\tjoeldg\tInitial commit\n',
   'git branch -vv':
     '* main      220cc0c [origin/main: ahead 1, behind 2] Add job-watch\n  old-spike 1d2c7be [origin/old-spike: gone] Try a thing\n',
-  'git symbolic-ref': 'origin/main\n',
+  'git for-each-ref': 'refs/remotes/origin/HEAD\trefs/remotes/origin/main\nrefs/remotes/origin/main\t\nrefs/heads/main\t\n',
   'git worktree': `worktree ${CWD}\nHEAD 220cc0c\nbranch refs/heads/main\n`,
   'git remote': 'https://github.com/joeldg/claude-mods.git\n',
   'git branch --merged': '* main\n  fix/merged\n',
-  'gh pr': JSON.stringify([
-    {
-      number: 123,
-      title: 'Fix login redirect',
-      headRefName: 'fix/login',
-      isDraft: false,
-      statusCheckRollup: [done('SUCCESS'), done('FAILURE')],
-    },
-    { number: 124, title: 'Add repo-brief', headRefName: 'repo-brief', isDraft: true, statusCheckRollup: [done('SUCCESS')] },
-  ]),
+  'gh pr': GH_PRS,
   'gh issue': JSON.stringify([
     { number: 12, title: 'Ship the band', labels: [{ name: 'owner' }] },
     { number: 15, title: 'Write the docs', labels: [{ name: 'owner' }, { name: 'docs' }] },
@@ -65,10 +74,11 @@ const keyOf = (argv: readonly string[]): string => {
 
 /** Answers the host beneath the plugin: the session's folder, git and gh, and the engine's own answers. */
 const world = (on: On, replies: Record<string, Reply> = REPLIES, otherBand: string | null = null): World => {
-  const w: World = { replies: { ...replies }, ran: [], cwds: [] }
+  const w: World = { replies: { ...replies }, ran: [], argvs: [], cwds: [] }
   on('process.run', (_$, e) => {
     const key = keyOf(e.argv)
     w.ran.push(key)
+    w.argvs.push(e.argv.join(' '))
     w.cwds.push(e.init?.cwd)
     const reply = w.replies[key]
     if (reply === undefined || reply === 'deny') {
@@ -282,4 +292,70 @@ test("another plugin's band beneath stays, under the brief", async ($, on) => {
     await ui.unmount()
     await $.command.run(typed('brief', ''))
   }
+})
+
+test(
+  'a gh auth error is quiet: the PR list becomes a note, issues stay, and gh pr is not asked again for 30 minutes',
+  { timeoutMs: 30_000 },
+  async ($, on) => {
+    const clock = mock.clock(on, { now: 0 })
+    const w = world(on, { ...REPLIES, 'gh pr': CHECKS_DENIED })
+
+    const brief = (await $.prompt.context(firstContext)).blocks.at(-1)?.text ?? ''
+    expect(brief).toContain('Branch: main tracking origin/main, ahead 1, behind 2')
+    expect(brief).toContain("PRs: gh token can't read them")
+    expect(brief).not.toContain('Open PRs')
+    expect(brief).not.toContain('not gathered')
+    expect(brief).toContain('Open issues: 3; labelled owner, todo, P0, blocked (2):')
+    const ui = await $.ui.mount({ plugin: 'repo-brief', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+    expect(shown((await ui.drawn()) as Node)).toBe('main ↑1 ↓2 · 3 changed · 2 owner issues · 2 stale branches · last commit 2h ago')
+    await ui.unmount()
+
+    // Refreshes within the half hour leave gh pr alone; the issues are still read.
+    await clock.advance(3 * 60_000)
+    await $.turn.complete(TURN)
+    await clock.settle()
+    expect(w.ran.filter(key => key === 'gh pr')).toHaveLength(1)
+    expect(w.ran.filter(key => key === 'gh issue')).toHaveLength(2)
+    expect((await $.prompt.context(firstContext)).blocks.at(-1)?.text ?? '').toContain("PRs: gh token can't read them")
+
+    // Once it has passed, gh pr is asked again.
+    await clock.advance(30 * 60_000)
+    await $.turn.complete(TURN)
+    await clock.settle()
+    expect(w.ran.filter(key => key === 'gh pr')).toHaveLength(2)
+  },
+)
+
+test('/brief asks gh again, hold or not', async ($, on) => {
+  mock.clock(on, { now: 0 })
+  const w = world(on, { ...REPLIES, 'gh pr': CHECKS_DENIED })
+  const held = await $.command.run(typed('brief', ''))
+  expect(held.text).toContain("PRs: gh token can't read them")
+  expect(held.text).toContain('Open issues: 3')
+
+  w.replies['gh pr'] = GH_PRS
+  const again = await $.command.run(typed('brief', ''))
+  expect(again.text).toContain('#123 ✗ CI failing: Fix login redirect (fix/login)')
+  expect(again.text).not.toContain("can't read them")
+  expect(w.ran.filter(key => key === 'gh pr')).toHaveLength(2)
+})
+
+test('the default branch comes from one for-each-ref read: origin/HEAD, else origin/main and kin, else the current branch', async ($, on) => {
+  mock.clock(on, { now: 0 })
+  // A clone made without origin/HEAD, as the 3-day logs showed: origin/main stands in.
+  const w = world(on, { ...REPLIES, 'git for-each-ref': 'refs/remotes/origin/main\t\nrefs/heads/main\t\n' })
+  const first = await $.command.run(typed('brief', ''))
+  expect(first.text).toContain('merged into origin/main')
+  expect(w.argvs).toContain('git branch --merged origin/main')
+  expect(w.ran).not.toContain('git symbolic-ref')
+  expect(w.ran).not.toContain('git rev-parse')
+  expect(w.ran.filter(key => key === 'git for-each-ref')).toHaveLength(1)
+
+  // Neither main nor master anywhere: the branch checked out now.
+  w.replies['git for-each-ref'] = ''
+  w.replies['git status'] = '## trunk...origin/trunk\n'
+  const second = await $.command.run(typed('brief', ''))
+  expect(second.text).toContain('merged into trunk')
+  expect(w.argvs).toContain('git branch --merged trunk')
 })
