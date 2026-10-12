@@ -1,5 +1,8 @@
-/** The PR's checks as a whole: any failure fails it, then anything still running keeps it pending. */
-export type Ci = 'pending' | 'pass' | 'fail' | 'none'
+/**
+ * The PR's checks as a whole: any failure fails it, then anything still running keeps it pending;
+ * `unknown` when gh's token could not read the checks (the PR was read without them).
+ */
+export type Ci = 'pending' | 'pass' | 'fail' | 'none' | 'unknown'
 
 export type PrState = 'open' | 'merged' | 'closed'
 
@@ -24,8 +27,14 @@ export type WatchedPr = {
   addedAt: number
 }
 
+/** What Claude passes the prs_status tool: one watched PR by number, or nothing for every watched PR. */
+export type PrsStatusInput = { number?: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'pr-autopilot': { prs: WatchedPr[] }
+  }
+  interface McpToolInputs {
+    'mcp__pr-autopilot__prs_status': PrsStatusInput
   }
 }

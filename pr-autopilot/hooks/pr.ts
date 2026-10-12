@@ -94,6 +94,9 @@ export const summarizeRollup = (rollup: unknown): Rollup => {
   return { ci, failing, runIds }
 }
 
+/** What a view read without its checks says of them: a token lacking "Checks: read" may still read the rest. */
+const unknownChecks = (): Rollup => ({ ci: 'unknown', failing: [], runIds: [] })
+
 export type PrView = {
   number: number | null
   url: string
@@ -105,7 +108,10 @@ export type PrView = {
   rollup: Rollup
 }
 
-/** One PR as `gh pr view --json …` (or one entry of `gh pr list --json …`) prints it; null when it is not one. */
+/**
+ * One PR as `gh pr view --json …` (or one entry of `gh pr list --json …`) prints it; null when it is
+ * not one. Read without the `statusCheckRollup` field, its CI is unknown (not none).
+ */
 export const parseView = (json: unknown): PrView | null => {
   if (!json || typeof json !== 'object' || Array.isArray(json)) {
     return null
@@ -122,7 +128,7 @@ export const parseView = (json: unknown): PrView | null => {
     title: text(v.title),
     branch: text(v.headRefName),
     headSha: text(v.headRefOid),
-    rollup: summarizeRollup(v.statusCheckRollup),
+    rollup: v.statusCheckRollup === undefined ? unknownChecks() : summarizeRollup(v.statusCheckRollup),
   }
 }
 
@@ -145,7 +151,7 @@ export const watchedFrom = (ref: PrRef, view: PrView | null, now: number): Watch
   addedAt: now,
 })
 
-const MARK: Record<Ci, string> = { pass: '✓', fail: '✗', pending: 'CI…', none: '' }
+const MARK: Record<Ci, string> = { pass: '✓', fail: '✗', pending: 'CI…', none: '', unknown: 'CI?' }
 
 /** `PRs: #219 ✓ · #220 CI… · #221 ✗` over the open PRs; undefined when none is open. */
 export const statusLine = (prs: readonly WatchedPr[]): string | undefined => {
@@ -153,29 +159,126 @@ export const statusLine = (prs: readonly WatchedPr[]): string | undefined => {
   return open.length > 0 ? `PRs: ${open.map(pr => `#${pr.number} ${MARK[pr.ci]}`.trim()).join(' · ')}` : undefined
 }
 
+const NONE_WATCHED = 'No PRs are watched. A PR opened with `gh pr create` is picked up by itself; /prs watch <n> adds one.'
+
+/** The watched PR's state in words. */
+const stateWord = (pr: WatchedPr): string =>
+  pr.state === 'merged' ? (pr.cleaned ? 'merged, cleaned up' : 'merged, cleanup pending') : pr.state
+
+/** The PR's CI in words; '' for a PR no longer open. */
+const ciWord = (pr: WatchedPr): string => {
+  if (pr.state !== 'open') {
+    return ''
+  }
+  switch (pr.ci) {
+    case 'fail':
+      return `CI failing: ${pr.failing.join(', ') || 'unknown check'}`
+    case 'pass':
+      return 'CI passed'
+    case 'pending':
+      return 'CI running'
+    case 'unknown':
+      return "CI unknown — gh token can't read checks"
+    default:
+      return 'no CI checks'
+  }
+}
+
 /** What `/prs` prints: one line per watched PR. */
 export const describePrs = (prs: readonly WatchedPr[]): string => {
   if (prs.length === 0) {
-    return 'No PRs are watched. A PR opened with `gh pr create` is picked up by itself; /prs watch <n> adds one.'
+    return NONE_WATCHED
   }
   return prs
     .map(pr => {
-      const state =
-        pr.state === 'merged' ? (pr.cleaned ? 'merged, cleaned up' : 'merged, cleanup pending') : pr.state
-      const ci =
-        pr.state !== 'open'
-          ? ''
-          : pr.ci === 'fail'
-            ? `CI failing: ${pr.failing.join(', ') || 'unknown check'}`
-            : pr.ci === 'pass'
-              ? 'CI passed'
-              : pr.ci === 'pending'
-                ? 'CI running'
-                : 'no CI checks'
-      const facts = [state, ci, pr.branch].filter(Boolean).join(' · ')
+      const facts = [stateWord(pr), ciWord(pr), pr.branch].filter(Boolean).join(' · ')
       return `#${pr.number} ${pr.repo} · ${facts}${pr.title ? ` · ${pr.title}` : ''}`
     })
     .join('\n')
+}
+
+/** "just now", "30s ago" or "3m ago". */
+const ago = (ms: number): string => {
+  const seconds = Math.round(ms / 1000)
+  return seconds < 1 ? 'just now' : seconds < 120 ? `${seconds}s ago` : `${Math.round(seconds / 60)}m ago`
+}
+
+const toolLine = (pr: WatchedPr): string =>
+  [`#${pr.number} ${pr.title || '(no title)'}`, stateWord(pr), pr.branch, ciWord(pr), pr.url].filter(Boolean).join(' · ')
+
+/**
+ * What the prs_status tool answers: one line per watched PR (or the one asked for by number), when
+ * gh last answered for them (`ageMs`; null before it has), and the note on a hold when there is one.
+ */
+export const toolReport = (
+  prs: readonly WatchedPr[],
+  number: number | null,
+  ageMs: number | null,
+  note: string | null,
+): string => {
+  const chosen = number === null ? prs : prs.filter(pr => pr.number === number)
+  const lines: string[] = []
+  if (prs.length === 0) {
+    lines.push(NONE_WATCHED)
+  } else if (chosen.length === 0) {
+    lines.push(`#${number} is not watched (watched: ${prs.map(pr => `#${pr.number}`).join(', ')}); /prs watch ${number} adds it.`)
+  } else {
+    lines.push(...chosen.map(toolLine))
+  }
+  lines.push(ageMs === null ? 'Not refreshed yet: gh has not answered.' : `Refreshed ${ago(ageMs)}.`)
+  if (note) {
+    lines.push(note)
+  }
+  return lines.join('\n')
+}
+
+export type GhFailure = 'auth' | 'rate' | 'other'
+
+const AUTH_FAILURE =
+  /Resource not accessible by (?:personal access token|integration)|Requires authentication|HTTP 40[13]\b|not logged into|gh auth login|Bad credentials/i
+const RATE_FAILURE = /rate limit/i
+
+/**
+ * Why a gh run failed, from what it printed: `rate` when GitHub's rate limit refused it (an HTTP 403
+ * too, so it is read first), `auth` when the login or the token's permissions did (a fine-grained PAT
+ * lacking "Checks: read" cannot read statusCheckRollup), `other` for the rest (no such PR, a timeout).
+ */
+export const ghFailure = (stdout: string, stderr: string): GhFailure => {
+  const said = `${stderr}\n${stdout}`
+  return RATE_FAILURE.test(said) ? 'rate' : AUTH_FAILURE.test(said) ? 'auth' : 'other'
+}
+
+/** True when gh was refused by the token's permissions (not by a missing or rejected login). */
+export const isPermissionFailure = (detail: string): boolean => /Resource not accessible/i.test(detail)
+
+/** The status line while gh cannot read the PRs themselves. */
+export const AUTH_STATUS = "PRs: gh can't read them"
+
+/** The one toast a session gets when gh's auth stands in the way: the cause, the fix, and when it tries again. */
+export const authToast = (isAboutChecks: boolean, retryMinutes: number): string =>
+  isAboutChecks
+    ? 'pr-autopilot: gh can\'t read PR checks — its token lacks "Checks: read" (a fine-grained PAT). ' +
+      `Fix: gh auth login --web, or grant the token "Checks: read". CI shows as unknown; it retries in ${retryMinutes} min, or now with /prs.`
+    : `pr-autopilot: gh can't read PRs — not logged in, or its token was rejected. Fix: gh auth login --web. It retries in ${retryMinutes} min, or now with /prs.`
+
+/** Minutes until `until`, at least one. */
+const minutesUntil = (until: number, now: number): number => Math.max(1, Math.ceil((until - now) / 60_000))
+
+/** The line /prs and the tool add while polls are held back; null when they are not. */
+export const holdNote = (hold: GhFailure | null, isPlainBlocked: boolean, holdUntil: number, now: number): string | null => {
+  if (hold === null) {
+    return null
+  }
+  const left = minutesUntil(holdUntil, now)
+  if (hold === 'rate') {
+    return `gh is rate limited: polling resumes in ${left} min.`
+  }
+  if (hold === 'other') {
+    return `gh failed; polling again in ${left} min.`
+  }
+  return isPlainBlocked
+    ? `gh can't read PRs (not logged in, or its token was rejected): what is shown may be stale. Fix gh auth; /prs retries now, else in ${left} min.`
+    : `gh can't read checks (its token lacks "Checks: read"): CI is unknown. Fix gh auth; /prs retries now, else in ${left} min.`
 }
 
 const CI_WORD = /\b(?:fail(?:s|ed|ing|ures?)?|checks|ci|lint(?:s|ing|er)?)\b/i

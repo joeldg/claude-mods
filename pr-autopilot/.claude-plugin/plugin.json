@@ -1,7 +1,7 @@
 {
   "name": "pr-autopilot",
-  "version": "0.1.0",
-  "description": "Watches your open pull requests: CI pass/fail toasts, failing-check logs attached when you mention them, and the post-merge ritual (fetch --prune, switch, ff-only pull, delete the branch) done for you with no model calls.",
+  "version": "0.2.0",
+  "description": "Watches your open pull requests: CI pass/fail toasts, failing-check logs attached when you mention them, a prs_status tool so Claude reads them without gh, and the post-merge ritual (fetch --prune, switch, ff-only pull, delete the branch) done for you with no model calls. Tells you once when gh's token cannot read checks.",
   "author": {
     "name": "joeldg"
   },
@@ -12,6 +12,12 @@
       "title": "Check PRs every (seconds)",
       "description": "How often each watched open PR's state and CI checks are read with gh.",
       "default": 60
+    },
+    "authRetryMinutes": {
+      "type": "number",
+      "title": "Retry gh after an auth error (minutes)",
+      "description": "When gh cannot read the checks (a fine-grained token without \"Checks: read\") or the PRs (not logged in), how long before the full read is tried again. The PRs are still polled without their checks meanwhile, and /prs retries at once.",
+      "default": 30
     },
     "deleteRemoteBranch": {
       "type": "boolean",

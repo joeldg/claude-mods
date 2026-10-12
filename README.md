@@ -132,11 +132,14 @@ Does the "merged #219, clean up branches and start #214" round trip for you, and
   - Deletes the local branch only if it points at exactly the commit GitHub merged, so nothing local is lost. It also leaves a branch checked out in another worktree alone.
   - A merge seen mid-turn is cleaned up when the turn ends, so git never races Claude.
 - **When you mention failing CI** ("#258 is failing", "CI failed, fix it"), your message goes to Claude with `gh pr checks` and the tail of the failed log attached, so you don't paste it.
-- `/prs` lists watched PRs. `/prs watch <n|url>` and `/prs forget <n|all>` add and remove them.
+- **Claude reads the watched PRs with a tool**, `prs_status` (number, title, state, branch, CI, URL, and how old the data is), instead of running `gh pr view` or `gh pr checks` itself: no API call, and it refreshes first when the data is older than a poll.
+- **When gh can't read the checks** (a fine-grained token without "Checks: read" — the cause of `Resource not accessible by personal access token`), it tells you once with the fix (`gh auth login --web`, or grant the token "Checks: read"), keeps polling the PRs *without* their checks so merges are still handled, shows them as `#219 CI?`, and tries the checks again after 30 minutes or when you run `/prs`. If gh can't read PRs at all (not logged in), the status line says `PRs: gh can't read them` and nothing is polled until then. A GitHub rate limit pauses polling for 5 minutes; any other failure doubles the wait up to 10 minutes, back to normal on the next success. Nothing retries every minute forever; the debug log gets one line per change.
+- `/prs` lists watched PRs and asks gh again at once. `/prs watch <n|url>` and `/prs forget <n|all>` add and remove them.
 - Makes no model calls: only `gh` and `git`, at about one GitHub API call per open PR per minute.
 
 Settings:
 - `pollSeconds` (60)
+- `authRetryMinutes` (30): how long before the checks are tried again after gh refused them over auth.
 - `attachCiLogs` (on)
 - `logLines` (120)
 - `deleteRemoteBranch` (off): deletes the branch on GitHub too, only while it still points at the merged commit. GitHub's own "Automatically delete head branches" setting does the same job.

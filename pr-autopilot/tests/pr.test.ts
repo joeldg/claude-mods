@@ -2,10 +2,13 @@ import { expect, test } from 'claude-code/testing'
 
 import type { WatchedPr } from '../types'
 import {
+  authToast,
   ciAttachment,
   describePrs,
   failingRunIds,
+  ghFailure,
   gitError,
+  holdNote,
   MAX_ATTACHMENT,
   mentionedPrs,
   nameWithOwner,
@@ -16,6 +19,7 @@ import {
   statusLine,
   summarizeRollup,
   tailLines,
+  toolReport,
   worktreeHolding,
 } from '../hooks/pr'
 
@@ -252,4 +256,84 @@ test('picks the line of git stderr that says what failed', () => {
     'Not possible to fast-forward, aborting.',
   )
   expect(gitError('')).toBe('failed')
+})
+
+test('classifies why gh failed: auth, rate limit or anything else', () => {
+  expect(
+    ghFailure('', 'GraphQL: Resource not accessible by personal access token (repository.pullRequest.statusCheckRollup.contexts.nodes)'),
+  ).toBe('auth')
+  expect(ghFailure('', 'GraphQL: Resource not accessible by integration (repository.pullRequest)')).toBe('auth')
+  expect(ghFailure('', 'HTTP 401: Requires authentication (https://api.github.com/graphql)')).toBe('auth')
+  expect(ghFailure('', 'HTTP 403: Must have admin rights to Repository. (https://api.github.com/repos/acme/widgets)')).toBe('auth')
+  expect(ghFailure('', 'You are not logged into any GitHub hosts. To log in, run:  gh auth login')).toBe('auth')
+  expect(ghFailure('', 'HTTP 401: Bad credentials (https://api.github.com/graphql)')).toBe('auth')
+  // What gh prints on stdout counts too.
+  expect(ghFailure('Requires authentication', '')).toBe('auth')
+  // A rate limit comes as an HTTP 403 as well: it is a rate limit first.
+  expect(ghFailure('', 'HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/graphql)')).toBe('rate')
+  expect(ghFailure('', 'GraphQL: Could not resolve to a PullRequest with the number of 999. (repository.pullRequest)')).toBe('other')
+  expect(ghFailure('', 'HTTP 404: Not Found (https://api.github.com/repos/acme/gone)')).toBe('other')
+  expect(ghFailure('', 'HooksError: aborted: still running after 30000ms')).toBe('other')
+  expect(ghFailure('', '')).toBe('other')
+})
+
+test('a view read without the checks has unknown CI, shown as CI?', () => {
+  const view = parseView({
+    number: 219,
+    url: 'https://github.com/acme/widgets/pull/219',
+    state: 'OPEN',
+    title: 'Faster widgets',
+    headRefName: 'codex/faster',
+    headRefOid: 'b'.repeat(40),
+    mergedAt: null,
+  })
+  expect(view?.rollup).toEqual({ ci: 'unknown', failing: [], runIds: [] })
+  // A rollup read with the checks but empty (or null, a PR with no commits) is none, as before.
+  expect(parseView({ state: 'OPEN', statusCheckRollup: [] })?.rollup.ci).toBe('none')
+  expect(parseView({ state: 'OPEN', statusCheckRollup: null })?.rollup.ci).toBe('none')
+  expect(statusLine([pr(219, { ci: 'unknown' }), pr(220, { ci: 'pass' })])).toBe('PRs: #219 CI? · #220 ✓')
+  expect(describePrs([pr(219, { ci: 'unknown' })])).toBe(
+    "#219 acme/widgets · open · CI unknown — gh token can't read checks · codex/pr-219 · PR 219",
+  )
+})
+
+test('the auth toast and the hold note name the cause and the fix', () => {
+  expect(authToast(true, 30)).toBe(
+    'pr-autopilot: gh can\'t read PR checks — its token lacks "Checks: read" (a fine-grained PAT). ' +
+      'Fix: gh auth login --web, or grant the token "Checks: read". CI shows as unknown; it retries in 30 min, or now with /prs.',
+  )
+  expect(authToast(false, 30)).toBe(
+    "pr-autopilot: gh can't read PRs — not logged in, or its token was rejected. Fix: gh auth login --web. It retries in 30 min, or now with /prs.",
+  )
+  expect(holdNote('auth', false, 1_800_000, 600_000)).toBe(
+    'gh can\'t read checks (its token lacks "Checks: read"): CI is unknown. Fix gh auth; /prs retries now, else in 20 min.',
+  )
+  expect(holdNote('auth', true, 1_800_000, 0)).toBe(
+    "gh can't read PRs (not logged in, or its token was rejected): what is shown may be stale. Fix gh auth; /prs retries now, else in 30 min.",
+  )
+  expect(holdNote('rate', false, 300_000, 0)).toBe('gh is rate limited: polling resumes in 5 min.')
+  expect(holdNote('other', false, 120_000, 0)).toBe('gh failed; polling again in 2 min.')
+  expect(holdNote('other', false, 90_000, 0)).toBe('gh failed; polling again in 2 min.')
+  expect(holdNote(null, false, 0, 0)).toBeNull()
+})
+
+test('reports the watched PRs for the prs_status tool', () => {
+  const list = [pr(219, { ci: 'pass' }), pr(221, { ci: 'unknown' }), pr(200, { state: 'merged', cleaned: true })]
+  expect(toolReport(list, null, 30_000, null).split('\n')).toEqual([
+    '#219 PR 219 · open · codex/pr-219 · CI passed · https://github.com/acme/widgets/pull/219',
+    "#221 PR 221 · open · codex/pr-221 · CI unknown — gh token can't read checks · https://github.com/acme/widgets/pull/221",
+    '#200 PR 200 · merged, cleaned up · codex/pr-200 · https://github.com/acme/widgets/pull/200',
+    'Refreshed 30s ago.',
+  ])
+  expect(toolReport(list, 221, 0, 'gh is rate limited: polling resumes in 5 min.').split('\n')).toEqual([
+    "#221 PR 221 · open · codex/pr-221 · CI unknown — gh token can't read checks · https://github.com/acme/widgets/pull/221",
+    'Refreshed just now.',
+    'gh is rate limited: polling resumes in 5 min.',
+  ])
+  expect(toolReport(list, 300, 180_000, null)).toBe(
+    '#300 is not watched (watched: #219, #221, #200); /prs watch 300 adds it.\nRefreshed 3m ago.',
+  )
+  expect(toolReport([], null, null, null)).toBe(
+    'No PRs are watched. A PR opened with `gh pr create` is picked up by itself; /prs watch <n> adds one.\nNot refreshed yet: gh has not answered.',
+  )
 })

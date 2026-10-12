@@ -6,6 +6,16 @@ const URL_219 = 'https://github.com/acme/widgets/pull/219'
 const HEAD = 'b'.repeat(40)
 const FIELDS = 'number,url,state,title,headRefName,headRefOid,statusCheckRollup,mergedAt'
 const VIEW_219 = `gh pr view 219 --repo acme/widgets --json ${FIELDS}`
+/** The same read without the checks: what a token lacking "Checks: read" may still read. */
+const PLAIN_FIELDS = 'number,url,state,title,headRefName,headRefOid,mergedAt'
+const PLAIN_VIEW_219 = `gh pr view 219 --repo acme/widgets --json ${PLAIN_FIELDS}`
+const LIST = 'gh pr list --author @me --state open --json number,url,state,title,headRefName,headRefOid,statusCheckRollup --limit 20'
+const PLAIN_LIST = 'gh pr list --author @me --state open --json number,url,state,title,headRefName,headRefOid --limit 20'
+const CHECKS_DENIED =
+  'GraphQL: Resource not accessible by personal access token (repository.pullRequest.statusCheckRollup.contexts.nodes)'
+const NOT_LOGGED_IN = 'HTTP 401: Requires authentication (https://api.github.com/graphql)'
+const TOOL = 'mcp__pr-autopilot__prs_status'
+const SESSION = { cwd: CWD, surface: 'terminal' as const, isInteractive: true }
 
 type Answer = { code?: number; out?: string; err?: string }
 type Ran = { argv: string; cwd: string | undefined }
@@ -17,6 +27,8 @@ type World = {
   statuses: (string | undefined)[]
   suggested: string[]
   bash: string[]
+  logs: string[]
+  tools: { name: string; description: string; isDeferred?: boolean }[]
 }
 
 /** A GitHub Actions check run as `statusCheckRollup` lists it. */
@@ -41,6 +53,13 @@ const view219 = (state: string, rollup: unknown[] = []) =>
     mergedAt: state === 'MERGED' ? '2026-10-07T10:00:00Z' : null,
   })
 
+/** The same, read without the checks. */
+const plain219 = (state: string) => {
+  const full = JSON.parse(view219(state)) as Record<string, unknown>
+  delete full.statusCheckRollup
+  return JSON.stringify(full)
+}
+
 /** The git a clean checkout of acme/widgets on the PR's branch answers. */
 const CLEAN_ON_PR_BRANCH: Record<string, Answer> = {
   'git remote get-url origin': { out: 'git@github.com:acme/widgets.git\n' },
@@ -57,7 +76,7 @@ const CLEAN_ON_PR_BRANCH: Record<string, Answer> = {
 
 /** Answers the host beneath the plugin: commands by argv, toasts, the status line, the prompt box. */
 const world = (on: On): World => {
-  const w: World = { answers: new Map(), ran: [], toasts: [], statuses: [], suggested: [], bash: [] }
+  const w: World = { answers: new Map(), ran: [], toasts: [], statuses: [], suggested: [], bash: [], logs: [], tools: [] }
   on('process.run', (_$, e) => {
     const argv = e.argv.join(' ')
     w.ran.push({ argv, cwd: e.init?.cwd })
@@ -84,7 +103,14 @@ const world = (on: On): World => {
     w.statuses.push(e.text)
     return { value: undefined }
   })
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', (_$, e) => {
+    w.logs.push(e.text)
+    return { value: undefined }
+  })
+  on('tool.register', (_$, e) => {
+    w.tools.push({ name: e.name, description: e.description, isDeferred: e.isDeferred })
+    return { value: { tool: `mcp__pr-autopilot__${e.name}` } }
+  })
   on('prompt.suggest', (_$, e) => {
     w.suggested.push(e.text)
     return { isShown: true }
@@ -104,6 +130,12 @@ const world = (on: On): World => {
 
 /** The git commands the plugin ran, in order. */
 const gitRan = (w: World): string[] => w.ran.filter(one => one.argv.startsWith('git ')).map(one => one.argv)
+
+/** Every command the plugin ran, in order. */
+const argvs = (w: World): string[] => w.ran.map(one => one.argv)
+
+/** How many times one command ran. */
+const count = (w: World, argv: string): number => argvs(w).filter(one => one === argv).length
 
 /** A slash command as the person types it. */
 const typed = (command: string, args: string) => ({
@@ -457,3 +489,256 @@ test('with attachCiLogs off, a prompt about failing CI gets nothing', { options:
   expect(entered.context).toBeUndefined()
   expect(w.ran).toEqual([])
 })
+
+test(
+  'a token that cannot read checks holds them for authRetryMinutes, toasts once and shows CI as unknown',
+  { timeoutMs: 30_000 },
+  async ($, on) => {
+    const clock = mock.clock(on, { now: 0 })
+    const w = world(on)
+    w.answers.set(VIEW_219, { code: 1, err: CHECKS_DENIED })
+    w.answers.set(PLAIN_VIEW_219, () => ({ out: plain219('OPEN') }))
+
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(argvs(w)).toEqual([VIEW_219, PLAIN_VIEW_219])
+    expect(w.statuses.at(-1)).toBe('PRs: #219 CI?')
+    expect(w.toasts).toHaveLength(1)
+    expect(w.toasts[0]).toMatch(/can't read PR checks/)
+    expect(w.toasts[0]).toMatch(/"Checks: read"/)
+    expect(w.toasts[0]).toMatch(/gh auth login --web/)
+    expect(w.logs).toHaveLength(1)
+    expect(w.logs[0]).toMatch(/^pr-autopilot: gh can't read checks/)
+
+    // The polls go on without the checks until the window ends; nothing toasts or logs again.
+    await clock.advance(29 * 60_000)
+    expect(count(w, VIEW_219)).toBe(1)
+    expect(count(w, PLAIN_VIEW_219)).toBe(30)
+    expect(w.toasts).toHaveLength(1)
+    expect(w.logs).toHaveLength(1)
+    expect(w.statuses.at(-1)).toBe('PRs: #219 CI?')
+
+    // At the window's end the checks are tried once more; refused again, they wait another window, quietly.
+    await clock.advance(60_000)
+    expect(count(w, VIEW_219)).toBe(2)
+    expect(count(w, PLAIN_VIEW_219)).toBe(31)
+    expect(w.toasts).toHaveLength(1)
+    expect(w.logs).toHaveLength(2)
+
+    // The tool says so too, without asking gh again: the data is fresh.
+    const told = String((await $.tool.call({ tool: TOOL })).result)
+    expect(told.split('\n')).toEqual([
+      "#219 Faster widgets · open · codex/faster · CI unknown — gh token can't read checks · https://github.com/acme/widgets/pull/219",
+      'Refreshed just now.',
+      'gh can\'t read checks (its token lacks "Checks: read"): CI is unknown. Fix gh auth; /prs retries now, else in 30 min.',
+    ])
+    expect(count(w, VIEW_219)).toBe(2)
+  },
+)
+
+test(
+  'when gh cannot read PRs at all the status line says so and nothing is polled until the window ends',
+  { timeoutMs: 30_000 },
+  async ($, on) => {
+    const clock = mock.clock(on, { now: 0 })
+    const w = world(on)
+    w.answers.set(VIEW_219, { code: 1, err: NOT_LOGGED_IN })
+    w.answers.set(PLAIN_VIEW_219, { code: 1, err: NOT_LOGGED_IN })
+
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(argvs(w)).toEqual([VIEW_219, PLAIN_VIEW_219])
+    expect(w.statuses.at(-1)).toBe("PRs: gh can't read them")
+    expect(w.toasts).toHaveLength(1)
+    expect(w.toasts[0]).toMatch(/^pr-autopilot: gh can't read PRs/)
+    expect(w.toasts[0]).toMatch(/gh auth login --web/)
+
+    await clock.advance(29 * 60_000)
+    expect(w.ran).toHaveLength(2)
+    await clock.advance(60_000)
+    expect(argvs(w)).toEqual([VIEW_219, PLAIN_VIEW_219, VIEW_219, PLAIN_VIEW_219])
+    expect(w.toasts).toHaveLength(1)
+    expect(w.statuses.at(-1)).toBe("PRs: gh can't read them")
+
+    // Logged in again: the next window's retry reads the PR and the status line is back.
+    w.answers.set(VIEW_219, { out: view219('OPEN', [run('lint', 'COMPLETED', 'SUCCESS')]) })
+    await clock.advance(30 * 60_000)
+    expect(w.statuses.at(-1)).toBe('PRs: #219 ✓')
+    expect(w.toasts.filter(text => text.startsWith('pr-autopilot:'))).toHaveLength(1)
+  },
+)
+
+test('/prs retries at once, and a read that works again clears the hold', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  w.answers.set(VIEW_219, { code: 1, err: CHECKS_DENIED })
+  w.answers.set(PLAIN_VIEW_219, () => ({ out: plain219('OPEN') }))
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await clock.advance(60_000)
+  expect(count(w, VIEW_219)).toBe(1)
+
+  // Still refused: /prs says why, and the window starts over.
+  const held = await $.command.run(typed('prs', ''))
+  expect(held.text).toBe(
+    "#219 acme/widgets · open · CI unknown — gh token can't read checks · codex/faster · Faster widgets\n" +
+      'gh can\'t read checks (its token lacks "Checks: read"): CI is unknown. Fix gh auth; /prs retries now, else in 30 min.',
+  )
+  expect(count(w, VIEW_219)).toBe(2)
+  expect(count(w, PLAIN_VIEW_219)).toBe(3)
+
+  // "Checks: read" granted: /prs reads the checks, polls go on with them, and nothing toasts for what was merely unknown.
+  w.answers.set(VIEW_219, { out: view219('OPEN', [run('lint', 'COMPLETED', 'SUCCESS')]) })
+  const fixed = await $.command.run(typed('prs', ''))
+  expect(fixed.text).toBe('#219 acme/widgets · open · CI passed · codex/faster · Faster widgets')
+  expect(w.statuses.at(-1)).toBe('PRs: #219 ✓')
+  await clock.advance(60_000)
+  expect(count(w, VIEW_219)).toBe(4)
+  expect(count(w, PLAIN_VIEW_219)).toBe(3)
+  expect(w.toasts).toHaveLength(1)
+})
+
+test('a rate limit holds polling for five minutes', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  let answer: Answer = { out: view219('OPEN', [run('lint', 'IN_PROGRESS', '')]) }
+  w.answers.set(VIEW_219, () => answer)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  expect(w.statuses.at(-1)).toBe('PRs: #219 CI…')
+
+  answer = { code: 1, err: 'HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/graphql)' }
+  await clock.advance(60_000)
+  expect(w.ran).toHaveLength(2)
+  await clock.advance(4 * 60_000)
+  expect(w.ran).toHaveLength(2)
+  // The status line keeps what was last known; no toast, one debug line.
+  expect(w.statuses.at(-1)).toBe('PRs: #219 CI…')
+  expect(w.toasts).toEqual([])
+  expect(w.logs).toHaveLength(1)
+  expect(w.logs[0]).toMatch(/rate limit/)
+
+  answer = { out: view219('OPEN', [run('lint', 'COMPLETED', 'SUCCESS')]) }
+  await clock.advance(60_000)
+  expect(w.ran).toHaveLength(3)
+  expect(w.statuses.at(-1)).toBe('PRs: #219 ✓')
+  await clock.advance(60_000)
+  expect(w.ran).toHaveLength(4)
+})
+
+test(
+  'other failures double the wait between polls up to ten minutes, and a success resets it',
+  { timeoutMs: 30_000 },
+  async ($, on) => {
+    const clock = mock.clock(on, { now: 0 })
+    const w = world(on)
+    let answer: Answer = { out: view219('OPEN', [run('lint', 'IN_PROGRESS', '')]) }
+    w.answers.set(VIEW_219, () => answer)
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    answer = { code: 1, err: 'GraphQL: Something went wrong while executing your query. This may be the result of a timeout.' }
+
+    // The seconds at which a poll ran: at 60s, then 120s later, 240s later, 480s later, then every 600s.
+    const polledAt: number[] = []
+    let seen = w.ran.length
+    for (let tick = 1; tick <= 50; tick++) {
+      await clock.advance(60_000)
+      if (w.ran.length > seen) {
+        polledAt.push(tick * 60)
+        seen = w.ran.length
+      }
+    }
+    expect(polledAt).toEqual([60, 180, 420, 900, 1500, 2100, 2700])
+    expect(w.toasts).toEqual([])
+    expect(w.logs).toHaveLength(7)
+
+    answer = { out: view219('OPEN', [run('lint', 'IN_PROGRESS', '')]) }
+    const resumedAt: number[] = []
+    for (let tick = 51; tick <= 60; tick++) {
+      await clock.advance(60_000)
+      if (w.ran.length > seen) {
+        resumedAt.push(tick * 60)
+        seen = w.ran.length
+      }
+    }
+    expect(resumedAt).toEqual([3300, 3360, 3420, 3480, 3540, 3600])
+    expect(w.logs).toHaveLength(8)
+  },
+)
+
+test(
+  'the prs_status tool is registered for Claude and lists the watched PRs, refreshing stale data first',
+  { timeoutMs: 30_000 },
+  async ($, on) => {
+    const clock = mock.clock(on, { now: 0 })
+    const w = world(on)
+    await $.session.start(SESSION)
+    await clock.settle()
+    expect(w.tools.map(tool => tool.name)).toEqual(['prs_status'])
+    expect(w.tools[0]?.isDeferred).toBe(false)
+    expect(w.tools[0]?.description).toMatch(/gh pr view/)
+    expect(w.tools[0]?.description).toMatch(/gh pr checks/)
+
+    let answer: Answer = { out: view219('OPEN', [run('lint', 'IN_PROGRESS', '')]) }
+    w.answers.set(VIEW_219, () => answer)
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    const ghCalls = () => argvs(w).filter(argv => argv.startsWith('gh ')).length
+    expect(ghCalls()).toBe(1)
+
+    await clock.advance(30_000)
+    const fresh = await $.tool.call({ tool: TOOL })
+    expect(String(fresh.result)).toBe(
+      '#219 Faster widgets · open · codex/faster · CI running · https://github.com/acme/widgets/pull/219\nRefreshed 30s ago.',
+    )
+    expect(ghCalls()).toBe(1)
+    expect(String((await $.tool.call({ tool: TOOL, number: 300 })).result)).toBe(
+      '#300 is not watched (watched: #219); /prs watch 300 adds it.\nRefreshed 30s ago.',
+    )
+
+    // Data older than pollSeconds is read again first (here a failure had held the polls back).
+    answer = { code: 1, err: 'GraphQL: Something went wrong while executing your query.' }
+    await clock.advance(30_000)
+    expect(ghCalls()).toBe(2)
+    answer = { out: view219('OPEN', [run('lint', 'COMPLETED', 'FAILURE', 5)]) }
+    await clock.advance(60_000)
+    expect(ghCalls()).toBe(2)
+    const stale = await $.tool.call({ tool: TOOL, number: 219 })
+    expect(ghCalls()).toBe(3)
+    expect(String(stale.result)).toBe(
+      '#219 Faster widgets · open · codex/faster · CI failing: lint · https://github.com/acme/widgets/pull/219\nRefreshed just now.',
+    )
+    expect(w.toasts).toEqual(['CI failed on #219: lint'])
+  },
+)
+
+test(
+  'adopting falls back to listing without the checks when the token cannot read them',
+  { timeoutMs: 30_000 },
+  async ($, on) => {
+    const clock = mock.clock(on, { now: 0 })
+    const w = world(on)
+    w.answers.set('git rev-parse --is-inside-work-tree', { out: 'true\n' })
+    w.answers.set('gh repo view --json nameWithOwner', { out: '{"nameWithOwner":"acme/widgets"}\n' })
+    w.answers.set(LIST, { code: 1, err: CHECKS_DENIED })
+    w.answers.set(PLAIN_LIST, {
+      out: JSON.stringify([
+        JSON.parse(plain219('OPEN')),
+        {
+          number: 221,
+          url: 'https://github.com/acme/widgets/pull/221',
+          state: 'OPEN',
+          title: 'Lint fixes',
+          headRefName: 'codex/lint',
+          headRefOid: 'd'.repeat(40),
+        },
+      ]),
+    })
+
+    await $.session.start(SESSION)
+    await clock.settle()
+    expect(argvs(w).filter(argv => argv.startsWith('gh '))).toEqual(['gh repo view --json nameWithOwner', LIST, PLAIN_LIST])
+    expect(w.statuses.at(-1)).toBe('PRs: #219 CI? · #221 CI?')
+    expect(w.toasts).toHaveLength(1)
+    expect(w.toasts[0]).toMatch(/"Checks: read"/)
+
+    // The polls that follow read without the checks too.
+    await clock.advance(60_000)
+    expect(count(w, PLAIN_VIEW_219)).toBe(1)
+    expect(count(w, VIEW_219)).toBe(0)
+  },
+)

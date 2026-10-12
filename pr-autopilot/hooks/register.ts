@@ -1,14 +1,19 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ProcessRunInit, Register } from 'claude-code'
+import type { EngineInterface, ProcessRunInit, Register, ToolSpec } from 'claude-code'
 
 import type { WatchedPr } from '../types'
 import {
+  AUTH_STATUS,
+  authToast,
   ciAttachment,
   clip,
   defaultBranchOf,
   describePrs,
   failingRunIds,
+  ghFailure,
   gitError,
+  holdNote,
+  isPermissionFailure,
   mentionedPrs,
   nameWithOwner,
   parsePrUrls,
@@ -16,10 +21,11 @@ import {
   repoFromRemote,
   shortSha,
   statusLine,
+  toolReport,
   watchedFrom,
   worktreeHolding,
 } from './pr'
-import type { PrRef, PrView } from './pr'
+import type { GhFailure, PrRef, PrView } from './pr'
 
 type Engine = EngineInterface
 
@@ -27,22 +33,85 @@ const prs = atom({ plugin: 'pr-autopilot', key: 'prs' } as const, [])
 
 const VIEW_FIELDS = 'number,url,state,title,headRefName,headRefOid,statusCheckRollup,mergedAt'
 const LIST_FIELDS = 'number,url,state,title,headRefName,headRefOid,statusCheckRollup'
+/** The checks field, left out of a read while gh's token cannot read it: the rest of a PR it still may. */
+const CHECKS_FIELD = 'statusCheckRollup'
 const CREATE = /\bgh\s+pr\s+create\b/
 /** Prompts the person wrote (typed, through Remote Control, or an SDK host's own turn). */
 const PERSONAL = new Set(['composer', 'bridge', 'sdk'])
 /** How many PRs are kept: merged ones beyond this are dropped first. */
 const KEEP = 30
+/** The tool Claude reads the watched PRs with, as the engine names it, and what `$.tool.register` is handed. */
+const TOOL = 'mcp__pr-autopilot__prs_status'
+const PRS_STATUS_TOOL: ToolSpec = {
+  name: 'prs_status',
+  description:
+    'The pull requests pr-autopilot watches (opened with `gh pr create` in this session, adopted from this repository at start, or added with /prs watch), as last read: number, title, state, head branch, CI summary and URL. ' +
+    "Prefer this over `gh pr view` or `gh pr checks` for a watched PR: it costs no GitHub API call, is at most one poll old, and still answers when gh's token cannot read checks (CI then reads as unknown). " +
+    'Pass `number` for one PR.',
+  inputSchema: {
+    type: 'object',
+    properties: { number: { type: 'number', description: 'One watched PR, by number; left out, every watched PR.' } },
+    additionalProperties: false,
+  },
+  isDeferred: false,
+}
+/** How long polls wait after GitHub's rate limit refused one. */
+const RATE_HOLD_MS = 5 * 60_000
+/** The longest wait between polls after other failures, each doubling the last. */
+const MAX_BACKOFF_MS = 10 * 60_000
 
 type Ran = { ok: boolean; out: string; err: string }
 type Outcome = { steps: string[]; issues: string[] }
-type Config = { pollMs: number; deleteRemoteBranch: boolean; attachCiLogs: boolean; logLines: number }
+type Config = { pollMs: number; authRetryMs: number; deleteRemoteBranch: boolean; attachCiLogs: boolean; logLines: number }
 
-let config: Config = { pollMs: 60_000, deleteRemoteBranch: false, attachCiLogs: true, logLines: 120 }
+/** Why a gh run failed, and the line that says so. */
+type GhFailed = { kind: GhFailure; detail: string }
+/** What a gh command that prints JSON answered: the value, or why it did not. */
+type GhJson = { json: unknown; failure: null } | { json: null; failure: GhFailed }
+/** One read of a PR: what gh said of it, or why it said nothing. */
+type Viewed = { view: PrView | null; failure: GhFailed | null }
+/** What one round of reads came to: what gh refused, and how many reads it answered. */
+type Reads = { failures: GhFailed[]; answered: number }
+
+/**
+ * How gh stands with the polls. `hold` says why they are held back (an auth failure, GitHub's rate
+ * limit, another failure backing off) until `holdUntil`. An auth hold still reads the PRs every poll,
+ * without their checks, unless `isPlainBlocked`: gh could not read the PRs themselves.
+ */
+type GhStanding = {
+  hold: GhFailure | null
+  holdUntil: number
+  isPlainBlocked: boolean
+  /** The wait after `other` failures: doubled each time up to MAX_BACKOFF_MS, back to pollMs on a success. */
+  backoffMs: number
+  /** True once this session's one auth toast was shown. */
+  hasToasted: boolean
+  /** The hold a poll just let go of to try gh again, so a success can say it answers again; null otherwise. */
+  released: GhFailure | null
+  /** When gh last answered for the watched PRs; null before it has. */
+  refreshedAt: number | null
+}
+
+let config: Config = { pollMs: 60_000, authRetryMs: 30 * 60_000, deleteRemoteBranch: false, attachCiLogs: true, logLines: 120 }
+
+const standing = (): GhStanding => ({
+  hold: null,
+  holdUntil: 0,
+  isPlainBlocked: false,
+  backoffMs: config.pollMs,
+  hasToasted: false,
+  released: null,
+  refreshedAt: null,
+})
+
+let gh: GhStanding = standing()
 let timer: { cancel: () => void } | null = null
 let polling: Promise<void> | null = null
 let isTurnRunning = false
 /** The status line last shown; null before the first. */
 let shownStatus: string | undefined | null = null
+/** The session's folder, to adopt its PRs again when a hold ends with none watched. */
+let sessionCwd: string | null = null
 
 const isSame = (a: Pick<WatchedPr, 'repo' | 'number'>, b: Pick<WatchedPr, 'repo' | 'number'>): boolean =>
   a.number === b.number && a.repo.toLowerCase() === b.repo.toLowerCase()
@@ -75,37 +144,137 @@ async function git($: Engine, cwd: string, args: readonly string[], timeoutMs = 
   return exec($, ['git', ...args], cwd, timeoutMs)
 }
 
-async function ghJson($: Engine, args: readonly string[], cwd?: string): Promise<unknown> {
-  const ran = await exec($, ['gh', ...args], cwd)
-  if (!ran.ok) {
-    return null
-  }
-  try {
-    return JSON.parse(ran.out) as unknown
-  } catch {
-    return null
-  }
-}
-
-async function viewPr($: Engine, ref: string, repo: string | null): Promise<PrView | null> {
-  return parseView(await ghJson($, ['pr', 'view', ref, ...(repo ? ['--repo', repo] : []), '--json', VIEW_FIELDS]))
-}
-
 async function debug($: Engine, line: string) {
   await $.ui.log(`pr-autopilot: ${line}`, { to: 'debug' })
 }
 
+/** gh's own line about what went wrong, short. */
+const ghDetail = (ran: Ran): string => gitError(ran.err || ran.out)
+
+/** Holds the polls back until `until`, for `kind`. */
+function hold(kind: GhFailure, until: number) {
+  gh.hold = kind
+  gh.holdUntil = until
+  gh.released = null
+}
+
+/**
+ * gh refused a read over its login or its token's permissions: full reads stop for authRetryMinutes.
+ * A read that asked for the checks was refused the checks, which the PRs are still read without; one
+ * that did not was refused the PRs themselves, and nothing is read. Said once in the debug log per
+ * hold, and once per session to the person, with the fix.
+ */
+async function holdAuth($: Engine, hadChecks: boolean, detail: string) {
+  const now = await $.clock.now()
+  const isNew = gh.hold !== 'auth'
+  const wasPlainBlocked = gh.isPlainBlocked
+  hold('auth', now + config.authRetryMs)
+  if (!hadChecks) {
+    gh.isPlainBlocked = true
+  }
+  if (isNew || (!hadChecks && !wasPlainBlocked)) {
+    const what = hadChecks ? "can't read checks; the PRs are polled without them" : "can't read PRs; polling held"
+    await debug($, `gh ${what} for ${config.authRetryMs / 60_000} min: ${detail}`)
+  }
+  if (!gh.hasToasted) {
+    gh.hasToasted = true
+    $.ui.toast(authToast(hadChecks && isPermissionFailure(detail), config.authRetryMs / 60_000), { timeoutMs: 15_000 })
+  }
+}
+
+/** GitHub's rate limit refused a read: the polls wait RATE_HOLD_MS. */
+async function holdRate($: Engine, detail: string) {
+  const now = await $.clock.now()
+  hold('rate', now + RATE_HOLD_MS)
+  await debug($, `gh hit GitHub's rate limit; polling held for ${RATE_HOLD_MS / 60_000} min: ${detail}`)
+}
+
+/** A poll failed for another reason: the next waits twice as long as the last, up to MAX_BACKOFF_MS. */
+async function holdOther($: Engine, now: number, detail: string) {
+  gh.backoffMs = Math.min(gh.backoffMs * 2, MAX_BACKOFF_MS)
+  hold('other', now + gh.backoffMs)
+  await debug($, `gh failed; polling again in ${gh.backoffMs / 1000}s: ${detail}`)
+}
+
+/** Lets the hold go, so the next read is tried in full. */
+function release() {
+  gh.released = gh.hold
+  gh.hold = null
+  gh.holdUntil = 0
+  gh.isPlainBlocked = false
+}
+
+/** gh answered a full read: the polls go back to the configured pace, said once when they had left it. */
+async function recover($: Engine) {
+  const was = gh.released
+  gh.released = null
+  if (was !== null || gh.backoffMs !== config.pollMs) {
+    gh.backoffMs = config.pollMs
+    await debug($, `gh answers again; polling every ${config.pollMs / 1000}s`)
+  }
+}
+
+/** Runs a gh command that prints JSON; what it refused over auth or the rate limit holds the polls. */
+async function ghJson($: Engine, args: readonly string[], cwd?: string): Promise<GhJson> {
+  const ran = await exec($, ['gh', ...args], cwd)
+  if (!ran.ok) {
+    const failure: GhFailed = { kind: ghFailure(ran.out, ran.err), detail: ghDetail(ran) }
+    if (failure.kind === 'auth') {
+      await holdAuth($, args.some(arg => arg.includes(CHECKS_FIELD)), failure.detail)
+    } else if (failure.kind === 'rate') {
+      await holdRate($, failure.detail)
+    }
+    return { json: null, failure }
+  }
+  try {
+    return { json: JSON.parse(ran.out) as unknown, failure: null }
+  } catch {
+    return { json: null, failure: { kind: 'other', detail: 'gh printed no JSON' } }
+  }
+}
+
+/**
+ * `gh pr view|list … --json <fields>`: read without the checks while gh's token cannot read them, and
+ * read again without them the first time it says so.
+ */
+async function ghPr($: Engine, argvFor: (fields: string) => string[], fields: string, cwd?: string): Promise<GhJson> {
+  const plain = fields
+    .split(',')
+    .filter(field => field !== CHECKS_FIELD)
+    .join(',')
+  if (gh.hold === 'auth') {
+    return ghJson($, argvFor(plain), cwd)
+  }
+  const got = await ghJson($, argvFor(fields), cwd)
+  return got.failure?.kind === 'auth' ? ghJson($, argvFor(plain), cwd) : got
+}
+
+async function viewPr($: Engine, ref: string, repo: string | null): Promise<Viewed> {
+  const got = await ghPr($, fields => ['pr', 'view', ref, ...(repo ? ['--repo', repo] : []), '--json', fields], VIEW_FIELDS)
+  const view = parseView(got.json)
+  return { view, failure: got.failure ?? (view ? null : { kind: 'other', detail: 'gh printed no PR' }) }
+}
+
 async function showStatus($: Engine) {
-  const line = statusLine(await read($, prs))
+  const line = gh.isPlainBlocked ? AUTH_STATUS : statusLine(await read($, prs))
   if (line !== shownStatus) {
     shownStatus = line
     $.ui.status(line)
   }
 }
 
+/** Whether a tick may poll now: not under a hold, except an auth hold that still reads the PRs without their checks. */
+const isDue = (now: number): boolean => gh.hold === null || now >= gh.holdUntil || (gh.hold === 'auth' && !gh.isPlainBlocked)
+
+async function tick($: Engine) {
+  if (isDue(await $.clock.now())) {
+    await poll($)
+  }
+}
+
 function ensureTimer($: Engine) {
   if (!timer) {
-    timer = $.clock.every(config.pollMs, () => void poll($))
+    timer = $.clock.every(config.pollMs, () => void tick($))
   }
 }
 
@@ -125,31 +294,41 @@ async function remember($: Engine, ref: PrRef, view: PrView | null) {
     const facts = view ? { title: fresh.title, branch: fresh.branch, headSha: fresh.headSha, url: fresh.url } : {}
     return list.map(one => (one === known ? { ...one, ...facts } : one))
   })
+  if (view) {
+    gh.refreshedAt = now
+  }
   ensureTimer($)
 }
 
-/** Adopts the person's open PRs in the session's repository, when it is a GitHub repository. */
-async function adopt($: Engine, cwd: string) {
+/** Adopts the person's open PRs in the session's repository, when it is a GitHub repository; what gh refused, if anything. */
+async function adopt($: Engine, cwd: string): Promise<GhFailed | null> {
   try {
     const inside = await git($, cwd, ['rev-parse', '--is-inside-work-tree'])
     if (!inside.ok) {
-      return
+      return null
     }
-    const repo = nameWithOwner(await ghJson($, ['repo', 'view', '--json', 'nameWithOwner'], cwd))
+    const named = await ghJson($, ['repo', 'view', '--json', 'nameWithOwner'], cwd)
+    const repo = nameWithOwner(named.json)
     if (!repo) {
-      return
+      return named.failure ?? { kind: 'other', detail: 'gh named no GitHub repository' }
     }
-    const listed = await ghJson(
+    const listed = await ghPr(
       $,
-      ['pr', 'list', '--author', '@me', '--state', 'open', '--json', LIST_FIELDS, '--limit', '20'],
+      fields => ['pr', 'list', '--author', '@me', '--state', 'open', '--json', fields, '--limit', '20'],
+      LIST_FIELDS,
       cwd,
     )
-    for (const item of Array.isArray(listed) ? listed : []) {
+    if (listed.failure) {
+      return listed.failure
+    }
+    for (const item of Array.isArray(listed.json) ? listed.json : []) {
       const view = parseView(item)
       if (view?.number) {
         await remember($, { repo, number: view.number, url: view.url }, view)
       }
     }
+    gh.refreshedAt = await $.clock.now()
+    return null
   } finally {
     await showStatus($)
   }
@@ -161,7 +340,7 @@ async function defaultBranch($: Engine, cwd: string, repo: string): Promise<stri
   if (ref.ok && name) {
     return name
   }
-  return defaultBranchOf(await ghJson($, ['repo', 'view', repo, '--json', 'defaultBranchRef'], cwd))
+  return defaultBranchOf((await ghJson($, ['repo', 'view', repo, '--json', 'defaultBranchRef'], cwd)).json)
 }
 
 /** Deletes the merged PR's local branch, only when it points at the PR's head and no worktree has it checked out. */
@@ -300,45 +479,86 @@ async function finishMerged($: Engine, pr: WatchedPr) {
   await $.prompt.suggest({ text }).catch(() => undefined)
 }
 
-/** Reads one open PR's state and checks, and says when CI flips or the PR is merged or closed. */
-async function refresh($: Engine, pr: WatchedPr) {
-  const view = await viewPr($, String(pr.number), pr.repo)
+/** Reads one open PR's state and checks, and says when CI flips or the PR is merged or closed; what gh refused, if anything. */
+async function refresh($: Engine, pr: WatchedPr): Promise<GhFailed | null> {
+  const { view, failure } = await viewPr($, String(pr.number), pr.repo)
   if (!view) {
-    return
+    return failure
   }
   const facts = { title: view.title || pr.title, branch: view.branch || pr.branch, headSha: view.headSha || pr.headSha }
   if (view.state === 'MERGED') {
     await patch($, pr, { ...facts, state: 'merged', cleaned: false })
-    return
+    return null
   }
   if (view.state === 'CLOSED') {
     await update($, prs, list => list.filter(one => !isSame(one, pr)))
     $.ui.toast(`#${pr.number} was closed without merging; no longer watched`)
-    return
+    return null
   }
   const { ci, failing, runIds } = view.rollup
   await patch($, pr, { ...facts, ci, failing, runIds })
-  if (ci !== pr.ci && ci === 'fail') {
+  // CI that was merely unknown (its checks unreadable) has not flipped: no toast for reading it at last.
+  if (pr.ci !== 'unknown' && ci !== pr.ci && ci === 'fail') {
     $.ui.toast(`CI failed on #${pr.number}: ${clip(failing.join(', '), 100)}`, { timeoutMs: 10_000 })
-  } else if (ci !== pr.ci && ci === 'pass') {
+  } else if (pr.ci !== 'unknown' && ci !== pr.ci && ci === 'pass') {
     $.ui.toast(`CI passed on #${pr.number}`)
+  }
+  return null
+}
+
+/** Reads the poll's outcome into gh's standing: a hold for what failed, or the way back after a success. */
+async function settle($: Engine, now: number, failures: readonly GhFailed[], answered: number) {
+  if (gh.hold === 'auth' || gh.hold === 'rate') {
+    return // held already, by the read that was refused
+  }
+  const other = failures.find(failure => failure.kind === 'other')
+  if (other) {
+    await holdOther($, now, other.detail)
+  } else if (answered > 0) {
+    await recover($)
+  }
+}
+
+/**
+ * Reads every open PR once. With none watched after a hold was let go, the session's PRs are adopted
+ * again instead: the hold began there.
+ */
+async function readOpen($: Engine): Promise<Reads> {
+  const open = (await read($, prs)).filter(pr => pr.state === 'open')
+  const outcomes: (GhFailed | null)[] = []
+  if (gh.released !== null && open.length === 0 && sessionCwd !== null) {
+    outcomes.push(await adopt($, sessionCwd))
+  }
+  for (const pr of open) {
+    outcomes.push(await refresh($, pr).catch((error: unknown): GhFailed => ({ kind: 'other', detail: String(error) })))
+  }
+  const failures = outcomes.filter((outcome): outcome is GhFailed => outcome !== null)
+  return { failures, answered: outcomes.length - failures.length }
+}
+
+/** Cleans up after each merged PR not yet cleaned up; a merge seen mid-turn waits for the turn's end, so git never races the model's own commands. */
+async function cleanUpMerged($: Engine) {
+  if (isTurnRunning) {
+    return
+  }
+  for (const pr of await read($, prs)) {
+    if (pr.state === 'merged' && !pr.cleaned) {
+      await finishMerged($, pr)
+    }
   }
 }
 
 async function pollOnce($: Engine) {
-  for (const pr of await read($, prs)) {
-    if (pr.state === 'open') {
-      await refresh($, pr).catch((error: unknown) => debug($, `could not read #${pr.number}: ${String(error)}`))
-    }
+  const now = await $.clock.now()
+  if (gh.hold !== null && now >= gh.holdUntil) {
+    release() // the window is over: read in full again
   }
-  // A merge seen mid-turn is cleaned up once the turn ends, so git never races the model's own commands.
-  if (!isTurnRunning) {
-    for (const pr of await read($, prs)) {
-      if (pr.state === 'merged' && !pr.cleaned) {
-        await finishMerged($, pr)
-      }
-    }
+  const reads = await readOpen($)
+  await cleanUpMerged($)
+  if (reads.answered > 0) {
+    gh.refreshedAt = now
   }
+  await settle($, now, reads.failures, reads.answered)
   await showStatus($)
 }
 
@@ -352,6 +572,14 @@ function poll($: Engine): Promise<void> {
       })
   }
   return polling
+}
+
+/** A poll the person or Claude asked for: a hold is let go of first, so gh is tried again now. */
+async function forcePoll($: Engine): Promise<void> {
+  if (gh.hold !== null) {
+    release()
+  }
+  await poll($)
 }
 
 /** The context block for one PR the prompt says is failing: its checks and its failed log's tail. */
@@ -372,27 +600,92 @@ async function ciContext($: Engine, number: number, pr: WatchedPr | null): Promi
   })
 }
 
+/** The PR number the tool was asked about: a positive integer (or "#219"), else null for every watched PR. */
+const numberArg = (value: unknown): number | null => {
+  const number = typeof value === 'string' ? Number(value.replace(/^#/, '')) : value
+  return typeof number === 'number' && Number.isInteger(number) && number > 0 ? number : null
+}
+
+/** Answers the prs_status tool: the watched PRs as last read, read again first when older than a poll. */
+async function prsStatus($: Engine, number: number | null): Promise<string> {
+  const now = await $.clock.now()
+  if (gh.refreshedAt === null || now - gh.refreshedAt >= config.pollMs) {
+    ensureTimer($)
+    await forcePoll($)
+  }
+  const after = await $.clock.now()
+  const age = gh.refreshedAt === null ? null : after - gh.refreshedAt
+  return toolReport(await read($, prs), number, age, holdNote(gh.hold, gh.isPlainBlocked, gh.holdUntil, after))
+}
+
 const USAGE = 'Usage: /prs (list and refresh) · /prs watch <n|url> [owner/repo] · /prs forget <n|all>'
+
+/** Answers /prs: `watch <n|url> [owner/repo]`, `forget <n|all>`, or the listing, gh asked again first. */
+async function runPrs($: Engine, args: string): Promise<string> {
+  const [verb = '', target = '', repoArg = ''] = args.trim().split(/\s+/)
+  if (verb === 'watch') {
+    const fromUrl = parsePrUrls(target)[0]
+    const number = fromUrl?.number ?? Number(target.replace(/^#/, ''))
+    if (!Number.isInteger(number) || number <= 0) {
+      return USAGE
+    }
+    const repo = fromUrl?.repo ?? (repoArg || null)
+    const { view } = await viewPr($, String(number), repo)
+    const resolved = repo ?? (view ? parsePrUrls(view.url)[0]?.repo : undefined)
+    if (!view || !resolved) {
+      return `pr-autopilot: gh found no PR #${number} in ${repo ?? "this folder's repository"}.`
+    }
+    await remember($, { repo: resolved, number, url: view.url }, view)
+    await poll($)
+    const watched = (await read($, prs)).find(pr => isSame(pr, { repo: resolved, number }))
+    return watched ? `Watching ${describePrs([watched])}` : `Watching #${number}.`
+  }
+  if (verb === 'forget') {
+    if (!target) {
+      return USAGE
+    }
+    const before = await read($, prs)
+    const number = Number(target.replace(/^#/, ''))
+    const keep = target === 'all' ? [] : before.filter(pr => pr.number !== number)
+    await update($, prs, list => list.filter(pr => keep.some(one => isSame(one, pr))))
+    await showStatus($)
+    const removed = before.length - keep.length
+    return removed > 0 ? `Stopped watching ${removed} PR(s).` : `#${target} is not watched.`
+  }
+  if (verb !== '') {
+    return USAGE
+  }
+  ensureTimer($)
+  await forcePoll($)
+  const listed = describePrs(await read($, prs))
+  const note = holdNote(gh.hold, gh.isPlainBlocked, gh.holdUntil, await $.clock.now())
+  return note ? `${listed}\n${note}` : listed
+}
 
 export const register: Register = (on, options) => {
   config = {
     pollMs: Math.max(10, Number(options.pollSeconds ?? 60)) * 1000,
+    authRetryMs: Math.max(1, Number(options.authRetryMinutes ?? 30)) * 60_000,
     deleteRemoteBranch: options.deleteRemoteBranch === true,
     attachCiLogs: options.attachCiLogs !== false,
     logLines: Math.max(10, Math.min(2000, Number(options.logLines ?? 120))),
   }
+  gh = standing()
   timer = null
   polling = null
   isTurnRunning = false
   shownStatus = null
+  sessionCwd = null
 
   on('session.start', async ($, e, next) => {
+    sessionCwd = e.cwd
     await $.command.register({
       name: 'prs',
       description: 'Watched pull requests: CI state, and the cleanup after a merge',
       argumentHint: '[watch <n> [owner/repo] | forget <n|all>]',
       immediate: true,
     })
+    await $.tool.register(PRS_STATUS_TOOL).catch((error: unknown) => debug($, `the prs_status tool did not register: ${String(error)}`))
     ensureTimer($)
     void adopt($, e.cwd).catch((error: unknown) => debug($, `could not adopt open PRs: ${String(error)}`))
     return next(e)
@@ -423,7 +716,7 @@ export const register: Register = (on, options) => {
     }
     try {
       for (const ref of parsePrUrls(ran.text)) {
-        await remember($, ref, await viewPr($, String(ref.number), ref.repo))
+        await remember($, ref, (await viewPr($, String(ref.number), ref.repo)).view)
       }
       await showStatus($)
     } catch (error) {
@@ -431,6 +724,9 @@ export const register: Register = (on, options) => {
     }
     return ran
   })
+
+  // Claude reads the watched PRs here rather than with gh.
+  on('tool.call', { tool: TOOL }, async ($, e) => ({ result: await prsStatus($, numberArg(e.number)) }))
 
   // Hands the model the failing checks and the failed log's tail when the person mentions a failing PR.
   on('prompt.submit', async ($, e, next) => {
@@ -454,42 +750,5 @@ export const register: Register = (on, options) => {
     return blocks.length > 0 ? next({ ...e, context: [...(e.context ?? []), ...blocks] }) : next(e)
   })
 
-  on('command.run', { command: 'prs' }, async ($, e) => {
-    const [verb = '', target = '', repoArg = ''] = e.args.trim().split(/\s+/)
-    if (verb === 'watch') {
-      const fromUrl = parsePrUrls(target)[0]
-      const number = fromUrl?.number ?? Number(target.replace(/^#/, ''))
-      if (!Number.isInteger(number) || number <= 0) {
-        return { text: USAGE }
-      }
-      const repo = fromUrl?.repo ?? (repoArg || null)
-      const view = await viewPr($, String(number), repo)
-      const resolved = repo ?? (view ? parsePrUrls(view.url)[0]?.repo : undefined)
-      if (!view || !resolved) {
-        return { text: `pr-autopilot: gh found no PR #${number} in ${repo ?? "this folder's repository"}.` }
-      }
-      await remember($, { repo: resolved, number, url: view.url }, view)
-      await poll($)
-      const watched = (await read($, prs)).find(pr => isSame(pr, { repo: resolved, number }))
-      return { text: watched ? `Watching ${describePrs([watched])}` : `Watching #${number}.` }
-    }
-    if (verb === 'forget') {
-      if (!target) {
-        return { text: USAGE }
-      }
-      const before = await read($, prs)
-      const number = Number(target.replace(/^#/, ''))
-      const keep = target === 'all' ? [] : before.filter(pr => pr.number !== number)
-      await update($, prs, list => list.filter(pr => keep.some(one => isSame(one, pr))))
-      await showStatus($)
-      const removed = before.length - keep.length
-      return { text: removed > 0 ? `Stopped watching ${removed} PR(s).` : `#${target} is not watched.` }
-    }
-    if (verb !== '') {
-      return { text: USAGE }
-    }
-    ensureTimer($)
-    await poll($)
-    return { text: describePrs(await read($, prs)) }
-  })
+  on('command.run', { command: 'prs' }, async ($, e) => ({ text: await runPrs($, e.args) }))
 }
