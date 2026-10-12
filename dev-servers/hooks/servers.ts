@@ -1,7 +1,7 @@
-import type { Holder, KnownEntry, Listener, Manager, Server } from '../types'
+import type { CachedListener, Holder, KnownEntry, Listener, Manager, ScanCache, ScanLock, Server, Snapshot } from '../types'
 
 // ---------------------------------------------------------------------------
-// lsof and ps output
+// lsof and ps output (the listen scan itself is netstat or ss: below)
 // ---------------------------------------------------------------------------
 
 /** The port of an lsof address: `*:4000`, `127.0.0.1:5173`, `[::1]:3000`; null for anything else. */
@@ -593,7 +593,249 @@ export function describe(snapshot: {
   if (snapshot.stopped.length > 0) {
     lines.push(`Not running: ${snapshot.stopped.map(entry => `${entry.name} (${entry.command})`).join(', ')}`)
   }
-  lines.push(`${snapshot.others} other listener${snapshot.others === 1 ? '' : 's'} on this Mac.`)
+  lines.push(`${snapshot.others} other listener${snapshot.others === 1 ? '' : 's'} on this machine.`)
   return lines.join('\n')
 }
 
+
+// ---------------------------------------------------------------------------
+// The listen scan without lsof: netstat (macOS) and ss (Linux)
+// ---------------------------------------------------------------------------
+
+/** The port ending an address, after its last `separator`: `*.4000`, `::1.5173` (netstat); `[::1]:5432`, `*:8080` (ss). */
+function portAtEnd(address: string, separator: string): number | null {
+  const cut = address.lastIndexOf(separator)
+  const port = cut < 0 ? NaN : Number(address.slice(cut + 1))
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : null
+}
+
+/** Adds one listening socket to its pid's Listener, naming the process when the table does. */
+function addSocket(byPid: Map<number, Listener>, pid: number, command: string, port: number) {
+  const listener = byPid.get(pid) ?? { pid, command, ports: [] }
+  if (listener.command === '' && command !== '') {
+    listener.command = command
+  }
+  if (!listener.ports.includes(port)) {
+    listener.ports.push(port)
+  }
+  byPid.set(pid, listener)
+}
+
+function withSortedPorts(byPid: Map<number, Listener>): Listener[] {
+  return [...byPid.values()].map(listener => ({ ...listener, ports: [...listener.ports].sort((a, b) => a - b) }))
+}
+
+/**
+ * `netstat -anv -p tcp` on macOS: the LISTEN rows, one Listener per pid. The columns after `(state)` name
+ * the pid: `process:pid` on current systems (the process name may hold spaces), a bare `pid` before `epid`
+ * on older ones, where the command is left ''. Null when the text is not this table (GNU netstat's, say).
+ */
+export function parseNetstat(text: string): Listener[] | null {
+  const lines = text.split('\n').map(line => line.replace(/\r$/, ''))
+  const header = lines.find(line => line.startsWith('Proto') && line.includes('(state)'))
+  const column = header === undefined ? null : netstatPidColumn(header)
+  if (column === null) {
+    return null
+  }
+  const byPid = new Map<number, Listener>()
+  for (const line of lines) {
+    const row = /^tcp\d*\s+\d+\s+\d+\s+(\S+)\s+\S+\s+LISTEN\s+(.*)$/.exec(line)
+    const port = row === null ? null : portAtEnd(row[1] ?? '', '.')
+    const rest = row === null ? null : column.pattern.exec(row[2] ?? '')
+    if (port === null || rest === null) {
+      continue
+    }
+    const pid = Number(column.isNamed ? rest[2] : rest[1])
+    if (Number.isInteger(pid) && pid > 0) {
+      addSocket(byPid, pid, column.isNamed ? (rest[1] ?? '').trim() : '', port)
+    }
+  }
+  return withSortedPorts(byPid)
+}
+
+/**
+ * How netstat's header names the pid after `(state)`: a pattern over the rest of a LISTEN row that captures
+ * `process` and `pid` (`isNamed`) or the bare pid alone. Null when neither column is there.
+ */
+function netstatPidColumn(header: string): { pattern: RegExp; isNamed: boolean } | null {
+  const columns = header.slice(header.indexOf('(state)') + '(state)'.length).trim().split(/\s+/)
+  const named = columns.indexOf('process:pid')
+  const skip = named >= 0 ? named : columns.indexOf('pid')
+  if (skip < 0) {
+    return null
+  }
+  const pattern = named >= 0 ? `^(?:\\S+\\s+){${skip}}(.*?):(\\d+)(?:\\s|$)` : `^(?:\\S+\\s+){${skip}}(\\d+)(?:\\s|$)`
+  return { pattern: new RegExp(pattern), isNamed: named >= 0 }
+}
+
+/**
+ * `ss -ltnp` on Linux: the LISTEN rows, a Listener per pid in `users:(("node",pid=123,fd=18),…)`; a row
+ * with no process (another user's) is skipped. Null when the text is not this table.
+ */
+export function parseSs(text: string): Listener[] | null {
+  const lines = text.split('\n').map(line => line.replace(/\r$/, ''))
+  if (!lines.some(line => /^State\s+Recv-Q/.test(line))) {
+    return null
+  }
+  const byPid = new Map<number, Listener>()
+  for (const line of lines) {
+    const row = /^LISTEN\s+\d+\s+\d+\s+(\S+)\s+\S+\s*(.*)$/.exec(line)
+    if (!row) {
+      continue
+    }
+    const port = portAtEnd(row[1] ?? '', ':')
+    if (port === null) {
+      continue
+    }
+    const users = /\("([^"]*)",pid=(\d+),fd=\d+\)/g
+    const rest = row[2] ?? ''
+    for (let match = users.exec(rest); match !== null; match = users.exec(rest)) {
+      const pid = Number(match[2])
+      if (pid > 0) {
+        addSocket(byPid, pid, match[1] ?? '', port)
+      }
+    }
+  }
+  return withSortedPorts(byPid)
+}
+
+/** Folders whose programs are the system's own, never a project's server: their working directory is not asked. */
+const SYSTEM_PREFIXES = ['/System/', '/usr/libexec/', '/Library/', '/Applications/', '/usr/lib/', '/lib/']
+
+/** Whether a command line runs one of the system's own programs. */
+export function isSystemProgram(commandLine: string): boolean {
+  const program = tokenize(commandLine)[0] ?? ''
+  return SYSTEM_PREFIXES.some(prefix => program.startsWith(prefix))
+}
+
+/** The program a command line runs, by name: `node /app/node_modules/.bin/vite` → `node`. */
+export function programOf(commandLine: string): string {
+  return basename(tokenize(commandLine)[0] ?? '')
+}
+
+/** Whole seconds since `startedAt`, as of `now`; null when the start is unknown. */
+export function upSince(startedAt: number | null, now: number): number | null {
+  return startedAt === null ? null : Math.max(0, Math.floor((now - startedAt) / 1000))
+}
+
+// ---------------------------------------------------------------------------
+// Pacing the scan: backoff, and the cache every session shares
+// ---------------------------------------------------------------------------
+
+/** A scan slower than this, or one that timed out, doubles the poll interval… */
+export const SLOW_MS = 2_000
+/** …up to this. */
+export const MAX_POLL_MS = 5 * 60_000
+
+/** The next poll interval: doubled, to the cap, after a slow scan; the configured one again after a fast one. */
+export function nextPollMs(current: number, configured: number, isSlow: boolean): number {
+  return isSlow ? Math.min(Math.max(current, configured) * 2, MAX_POLL_MS) : configured
+}
+
+function parseJson(text: string | null): unknown {
+  if (text === null) {
+    return null
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Whether `value` is a CachedListener as another session wrote it. */
+function isCachedListener(value: unknown): value is CachedListener {
+  if (!isRecord(value) || typeof value.pid !== 'number' || typeof value.command !== 'string' || !Array.isArray(value.ports)) {
+    return false
+  }
+  if (!value.ports.every(port => typeof port === 'number')) {
+    return false
+  }
+  const detail = value.detail
+  return (
+    detail === null ||
+    (isRecord(detail) &&
+      (detail.commandLine === null || typeof detail.commandLine === 'string') &&
+      (detail.startedAt === null || typeof detail.startedAt === 'number') &&
+      (detail.cwd === null || typeof detail.cwd === 'string'))
+  )
+}
+
+/** `scan-cache.json` as a session wrote it; null for a missing, unreadable or misshapen file. Listeners it cannot read are dropped. */
+export function parseScanCache(text: string | null): ScanCache | null {
+  const value = parseJson(text)
+  if (
+    !isRecord(value) ||
+    typeof value.ts !== 'number' ||
+    typeof value.by !== 'string' ||
+    !isRecord(value.data) ||
+    !Array.isArray(value.data.listeners)
+  ) {
+    return null
+  }
+  return { ts: value.ts, by: value.by, data: { listeners: value.data.listeners.filter(isCachedListener) } }
+}
+
+/** `scan-lock.json`; null for a missing, unreadable or misshapen file. */
+export function parseScanLock(text: string | null): ScanLock | null {
+  const value = parseJson(text)
+  return isRecord(value) && typeof value.ts === 'number' && typeof value.by === 'string' ? { ts: value.ts, by: value.by } : null
+}
+
+/** Whether a cache written at `ts` still stands at `now`. */
+export function isFresh(ts: number, now: number, ttlMs: number): boolean {
+  return ts <= now && now - ts < ttlMs
+}
+
+/** Whether `by` may scan now: no lock, its own, or one older than a scan can take (left by one that never finished). */
+export function mayScan(lock: ScanLock | null, now: number, by: string, staleMs: number): boolean {
+  return lock === null || lock.by === by || now - lock.ts >= staleMs
+}
+
+/**
+ * The dev_servers tool's answer: the running servers (with the log of one started from the pane), the
+ * stopped entries and, asked, every other listener on the machine.
+ */
+export function toolText(
+  snapshot: Pick<Snapshot, 'root' | 'servers' | 'stopped' | 'others' | 'otherListeners' | 'scannedAt'>,
+  options: { all: boolean; logs: ReadonlyMap<number, string>; now: number },
+): string {
+  const running = snapshot.servers.map(server => {
+    const log = options.logs.get(server.pid)
+    return `  ${serverLine(server)}${log === undefined ? '' : ` · log ${log}`}`
+  })
+  const lines = [
+    snapshot.servers.length === 0
+      ? `No dev servers are listening in ${snapshot.root}.`
+      : `Running in ${snapshot.root}:\n${running.join('\n')}`,
+  ]
+  if (snapshot.stopped.length > 0) {
+    const stopped = snapshot.stopped.map(entry => `${entry.name} (${entry.command}${entry.port === null ? '' : `, :${entry.port}`})`)
+    lines.push(`Not running: ${stopped.join(', ')}.`)
+  }
+  if (!options.all) {
+    lines.push(`${snapshot.others} other listener${snapshot.others === 1 ? '' : 's'} on this machine (all: true lists them).`)
+  } else if (snapshot.otherListeners.length === 0) {
+    lines.push('No other listeners on this machine.')
+  } else {
+    const others = snapshot.otherListeners.map(listener => {
+      const cwd = listener.detail?.cwd ?? null
+      const parts = [
+        portList(listener.ports),
+        listener.command || programOf(listener.detail?.commandLine ?? '') || 'unknown',
+        `pid ${listener.pid}`,
+        cwd === null ? null : `in ${cwd}`,
+      ]
+      return `  ${parts.filter(Boolean).join(' · ')}`
+    })
+    lines.push(`Other listeners on this machine:\n${others.join('\n')}`)
+  }
+  lines.push(
+    `Scanned ${formatUptime((options.now - snapshot.scannedAt) / 1000)} ago. Starting, stopping and restarting are the Servers pane's buttons (/servers); this tool only lists.`,
+  )
+  return lines.join('\n')
+}

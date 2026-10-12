@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import type { KnownEntry, Server } from '../types'
+import type { CachedListener, KnownEntry, Server } from '../types'
 import {
   commandScore,
   describe as describeSnapshot,
@@ -9,26 +9,39 @@ import {
   findConflict,
   formatUptime,
   holderNote,
+  isFresh,
   isInside,
+  isSystemProgram,
   knownEntries,
   lastLines,
   logPath,
   matchServers,
+  MAX_POLL_MS,
+  mayScan,
+  nextPollMs,
   parseCwds,
   parseEtime,
   parseLaunchJson,
   parseListeners,
+  parseNetstat,
   parsePackageJson,
   parsePortTable,
   parseProcesses,
   parseProcfile,
+  parseScanCache,
+  parseScanLock,
+  parseSs,
   portFromCommand,
   programName,
+  programOf,
   projectKey,
   scriptCalled,
   serverLine,
+  SLOW_MS,
   startScript,
   statusLine,
+  toolText,
+  upSince,
 } from '../hooks/servers'
 
 const LSOF = [
@@ -301,6 +314,173 @@ test('/servers text lists running, stopped and other listeners', () => {
       others: 1,
     }),
   ).toBe(
-    'Running in /Users/me/project:\n  dev · :5173 · pid 4242 · up 2m\nNot running: api (npm run api)\n1 other listener on this Mac.',
+    'Running in /Users/me/project:\n  dev · :5173 · pid 4242 · up 2m\nNot running: api (npm run api)\n1 other listener on this machine.',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// The listen scan without lsof: netstat (macOS) and ss (Linux)
+// ---------------------------------------------------------------------------
+
+const NETSTAT = [
+  'Active Internet connections (including servers)',
+  'Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs',
+  'tcp4       0      0  127.0.0.1.5173         *.*                    LISTEN                 0            0  131072  131072             node:4242   00100 00000006 00000000012be366 00000001 00000800      1      0 000000',
+  'tcp6       0      0  ::1.5173               *.*                    LISTEN                 0            0  131072  131072             node:4242   00100 00000006 00000000012be367 00000001 00000800      1      0 000000',
+  'tcp4       0      0  *.24678                *.*                    LISTEN                 0            0  131072  131072             node:4242   00100 00000006 00000000012be368 00000001 00000800      1      0 000000',
+  'tcp4       0      0  127.0.0.1.54677        *.*                    LISTEN                 0            0  131072  131072     Notes Helper:1024   00100 00000106 00000000012d9e01 00000001 00000800      1      0 000000',
+  'tcp46      0      0  *.5432                 *.*                    LISTEN                 0            0  131072  131072         postgres:986   00100 00000006 00000000012c0001 00000001 00000800      1      0 000000',
+  'tcp4       0      0  10.0.0.5.55135         93.184.216.34.443      ESTABLISHED         2664        25531  131072  131072           node:4242  00102 00000000 00000000012e05f2 00000081 04000900      2      0 000000',
+  'tcp6       0      0  2001:db8:1:2:.55132    2001:db8::10.443       CLOSE_WAIT         13732          932  131072  131768           claude:19207  00122 00000000 00000000012e05c2 00000080 04000900      2      0 000000',
+  '',
+].join('\n')
+
+/** Older macOS: a bare `pid` column (and `epid`), no process name. */
+const NETSTAT_OLD = [
+  'Active Internet connections (including servers)',
+  'Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)     rhiwat  shiwat    pid   epid  state  options           gencnt    flags   flags1 usecnt rtncnt fltrs',
+  'tcp4       0      0  127.0.0.1.5173         *.*                    LISTEN      131072  131072   4242      0 00100 00000006 00000000012be366 00000001 00000800      1      0 000000',
+  'tcp4       0      0  10.0.0.5.55135         93.184.216.34.443      ESTABLISHED 131072  131072   4242      0 00102 00000000 00000000012e05f2 00000081 04000900      2      0 000000',
+].join('\n')
+
+/** GNU netstat: another table altogether, which is how a Linux box is told to try ss. */
+const NETSTAT_LINUX = [
+  'Active Internet connections (servers and established)',
+  'Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name',
+  'tcp        0      0 0.0.0.0:3000            0.0.0.0:*               LISTEN      123/node',
+].join('\n')
+
+test('reads LISTEN rows from netstat -anv -p tcp: the port after the last dot, the pid after the process name', () => {
+  expect(parseNetstat(NETSTAT)).toEqual([
+    { pid: 4242, command: 'node', ports: [5173, 24678] },
+    { pid: 1024, command: 'Notes Helper', ports: [54677] },
+    { pid: 986, command: 'postgres', ports: [5432] },
+  ])
+  expect(parseNetstat(NETSTAT_OLD)).toEqual([{ pid: 4242, command: '', ports: [5173] }])
+  // The header alone is a table with no listeners; anything else is not this table.
+  expect(parseNetstat(NETSTAT.split('\n').slice(0, 2).join('\n'))).toEqual([])
+  expect(parseNetstat(NETSTAT_LINUX)).toBeNull()
+  expect(parseNetstat('')).toBeNull()
+})
+
+const SS = [
+  'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process',
+  'LISTEN 0      511    0.0.0.0:3000        0.0.0.0:*         users:(("node",pid=123,fd=18))',
+  'LISTEN 0      511    [::1]:5173          [::]:*            users:(("node",pid=123,fd=19))',
+  'LISTEN 0      4096   127.0.0.1:5432      0.0.0.0:*         users:(("postgres",pid=456,fd=5))',
+  'LISTEN 0      128    *:8080              *:*               users:(("java",pid=789,fd=100),("java",pid=790,fd=100))',
+  'LISTEN 0      128    127.0.0.1%lo:631    0.0.0.0:*',
+  '',
+].join('\n')
+
+test('reads LISTEN rows from ss -ltnp: every pid of a socket, rows without a process skipped', () => {
+  expect(parseSs(SS)).toEqual([
+    { pid: 123, command: 'node', ports: [3000, 5173] },
+    { pid: 456, command: 'postgres', ports: [5432] },
+    { pid: 789, command: 'java', ports: [8080] },
+    { pid: 790, command: 'java', ports: [8080] },
+  ])
+  expect(parseSs(SS.split('\n')[0] ?? '')).toEqual([])
+  expect(parseSs('')).toBeNull()
+  expect(parseSs(NETSTAT)).toBeNull()
+})
+
+test("tells the system's own programs, whose folder is never asked, from a project's", () => {
+  expect(isSystemProgram('/usr/libexec/rapportd')).toBe(true)
+  expect(isSystemProgram('/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter')).toBe(true)
+  expect(isSystemProgram('/Applications/Notes Helper.app/Contents/MacOS/Notes Helper --type=utility')).toBe(true)
+  expect(isSystemProgram('/usr/lib/systemd/systemd-resolved')).toBe(true)
+  expect(isSystemProgram('node /home/dev/app/node_modules/.bin/vite')).toBe(false)
+  expect(isSystemProgram('/opt/homebrew/bin/postgres -D /opt/homebrew/var/postgresql')).toBe(false)
+  expect(isSystemProgram('/usr/local/bin/node server.js')).toBe(false)
+  expect(isSystemProgram('')).toBe(false)
+  expect(programOf('node /home/dev/app/node_modules/.bin/vite --port 5173')).toBe('node')
+  expect(programOf('/opt/homebrew/bin/postgres -D /x')).toBe('postgres')
+  expect(programOf('')).toBe('')
+  expect(upSince(1_000_000 - 7_800_000, 1_000_000)).toBe(7800)
+  expect(upSince(null, 1_000_000)).toBeNull()
+  expect(upSince(2_000_000, 1_000_000)).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// Pacing: backoff, and the cache every session shares
+// ---------------------------------------------------------------------------
+
+test('a slow scan doubles the poll interval up to five minutes; a fast one resets it', () => {
+  expect(SLOW_MS).toBe(2_000)
+  expect(MAX_POLL_MS).toBe(300_000)
+  expect(nextPollMs(15_000, 15_000, true)).toBe(30_000)
+  expect(nextPollMs(30_000, 15_000, true)).toBe(60_000)
+  expect(nextPollMs(240_000, 15_000, true)).toBe(MAX_POLL_MS)
+  expect(nextPollMs(MAX_POLL_MS, 15_000, true)).toBe(MAX_POLL_MS)
+  expect(nextPollMs(60_000, 15_000, false)).toBe(15_000)
+  expect(nextPollMs(15_000, 15_000, false)).toBe(15_000)
+})
+
+test('reads the shared scan cache and lock, and knows when to use one and when to take the other', () => {
+  const listener: CachedListener = {
+    pid: 4242,
+    command: 'node',
+    ports: [5173],
+    detail: { commandLine: 'node server.js', startedAt: 900_000, cwd: '/home/dev/app' },
+  }
+  const unknown: CachedListener = { pid: 986, command: 'postgres', ports: [5432], detail: null }
+  const cache = parseScanCache(
+    JSON.stringify({ ts: 990_000, by: 'session-b', data: { listeners: [listener, unknown, { bogus: true }, { pid: 'x', ports: [] }] } }),
+  )
+  expect(cache).toEqual({ ts: 990_000, by: 'session-b', data: { listeners: [listener, unknown] } })
+  expect(parseScanCache(null)).toBeNull()
+  expect(parseScanCache('{ not json')).toBeNull()
+  expect(parseScanCache('{"ts":"soon","by":"x","data":{"listeners":[]}}')).toBeNull()
+  expect(parseScanCache('{"ts":1,"by":"x","data":{}}')).toBeNull()
+  expect(parseScanLock('{"ts":995000,"by":"session-b"}')).toEqual({ ts: 995_000, by: 'session-b' })
+  expect(parseScanLock('[]')).toBeNull()
+  expect(parseScanLock(null)).toBeNull()
+  expect(isFresh(990_000, 1_000_000, 13_000)).toBe(true)
+  expect(isFresh(985_000, 1_000_000, 13_000)).toBe(false)
+  expect(isFresh(2_000_000, 1_000_000, 13_000)).toBe(false)
+  // No lock, our own, or one older than a scan can take: scan. Another session's recent one: wait for it.
+  expect(mayScan(null, 1_000_000, 'session-a', 19_000)).toBe(true)
+  expect(mayScan({ ts: 999_000, by: 'session-a' }, 1_000_000, 'session-a', 19_000)).toBe(true)
+  expect(mayScan({ ts: 999_000, by: 'session-b' }, 1_000_000, 'session-a', 19_000)).toBe(false)
+  expect(mayScan({ ts: 980_000, by: 'session-b' }, 1_000_000, 'session-a', 19_000)).toBe(true)
+})
+
+test('the dev_servers tool text: running servers with their pane logs, stopped entries, the other listeners on request', () => {
+  const snapshot = {
+    root: '/home/dev/app',
+    servers: [
+      server({ pid: 4242, name: 'dev', entryId: 'dev', ports: [5173], upSeconds: 120 }),
+      server({ pid: 7001, ports: [9229], upSeconds: 300, commandLine: 'node --inspect tools/mock.js' }),
+    ],
+    stopped: [entry({ id: 'api', port: 4000 }), entry({ id: 'preview' })],
+    others: 2,
+    otherListeners: [
+      {
+        pid: 986,
+        command: 'postgres',
+        ports: [5432],
+        detail: { commandLine: '/opt/homebrew/bin/postgres -D /opt/homebrew/var/postgresql', startedAt: null, cwd: '/opt/homebrew/var/postgresql' },
+      },
+      { pid: 646, command: 'rapportd', ports: [53480], detail: null },
+    ],
+    scannedAt: 1_000_000 - 12_000,
+  }
+  const logs = new Map([[4242, '/home/dev/.claude/dev-servers/app-1x2y3z/dev.log']])
+  expect(toolText(snapshot, { all: false, logs, now: 1_000_000 })).toBe(
+    [
+      'Running in /home/dev/app:',
+      '  dev · :5173 · pid 4242 · up 2m · log /home/dev/.claude/dev-servers/app-1x2y3z/dev.log',
+      '  node · :9229 · pid 7001 · up 5m',
+      'Not running: api (npm run api, :4000), preview (npm run preview).',
+      '2 other listeners on this machine (all: true lists them).',
+      "Scanned 12s ago. Starting, stopping and restarting are the Servers pane's buttons (/servers); this tool only lists.",
+    ].join('\n'),
+  )
+  expect(toolText(snapshot, { all: true, logs: new Map(), now: 1_000_000 })).toContain(
+    ['Other listeners on this machine:', '  :5432 · postgres · pid 986 · in /opt/homebrew/var/postgresql', '  :53480 · rapportd · pid 646'].join('\n'),
+  )
+  expect(toolText({ ...snapshot, servers: [], stopped: [], others: 0, otherListeners: [] }, { all: true, logs: new Map(), now: 1_000_000 })).toContain(
+    'No dev servers are listening in /home/dev/app.\nNo other listeners on this machine.',
   )
 })

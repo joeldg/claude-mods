@@ -10,20 +10,21 @@ git clone https://github.com/joeldg/claude-mods ~/Projects/claude-mods
 
 ## dev-servers
 
-A pane of your project's running dev servers, so you don't have to ask Claude to restart them.
+A pane of your project's running dev servers, so you don't have to ask Claude to restart them — and a tool so Claude doesn't have to run `lsof` to find out what's listening.
 
 - `/servers` opens the **Servers** pane:
   - running servers whose working folder is in this repo: name, port, pid and uptime, with **Restart**, **Stop** and **Log**
   - known start commands that aren't running, with **Start**: `package.json` `dev`/`start`/`serve`/`preview` scripts (run with your lockfile's package manager), `.claude/launch.json` and `Procfile`
-  - a count of other listeners on the Mac
+  - a count of other listeners on the machine
 - Only button presses start or stop anything:
   - **Start** runs the command detached, logging to `~/.claude/dev-servers/<project>/`.
   - **Stop** sends SIGTERM. If the server ignores it, pressing again within 10s force-stops it.
   - **Restart** stops the server, waits for the port to free up, then starts it.
   - Before any signal, it checks the pid still runs the same command.
+- Claude gets a read-only `dev_servers` tool: this project's running servers (name, port, pid, uptime, and the log when it was started from the pane), the start commands that aren't running, and with `all: true` every other listener on the machine (port, process). Its description tells Claude to use it instead of `lsof`/`netstat`/`ps`. It never starts or stops anything.
 - When a command fails with "address already in use", Claude gets a note (and you a toast) naming the holder, e.g. `Port 4000 is held by node (pid 123, up 2h, in /Users/me/other)`.
 - Status line: `servers: :4000 :5173`.
-- Makes no model calls: `lsof` and `ps` every 15s.
+- Makes no model calls. The port scan is `netstat -anv -p tcp` (macOS) or `ss -ltnp` (Linux), never a bare `lsof`; `ps` and `lsof -d cwd` run once per new pid, one pid at a time. One open session scans per interval (15s by default) and writes `~/.claude/dev-servers/scan-cache.json` for the others; a slow scan doubles the interval, up to 5 minutes.
 
 ## downloads-drop
 

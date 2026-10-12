@@ -18,8 +18,30 @@ export type KnownEntry = {
   matchText: string
 }
 
-/** One process listening on TCP, from `lsof -F pcn`. */
+/**
+ * One process listening on TCP, from `netstat -anv -p tcp` (macOS), `ss -ltnp` (Linux) or, failing both,
+ * `lsof -F pcn`; `command` as that table names the process, '' when it has no name column.
+ */
 export type Listener = { pid: number; command: string; ports: number[] }
+
+/** What `ps` and `lsof -d cwd` say about one listening pid, asked once and kept while it listens. */
+export type ProcessDetail = {
+  /** Its command line as `ps` prints it; null when ps found no such process. */
+  commandLine: string | null
+  /** When it started, in `$.clock.now()` milliseconds; null when ps did not say. */
+  startedAt: number | null
+  /** Its working directory; null when lsof could not say, or was not asked (a system program). */
+  cwd: string | null
+}
+
+/** A listener as the shared scan cache keeps it: `detail` is null until its pid has been looked up. */
+export type CachedListener = Listener & { detail: ProcessDetail | null }
+
+/** `~/.claude/dev-servers/scan-cache.json`: the last scan any session made, for every session to read. */
+export type ScanCache = { ts: number; by: string; data: { listeners: CachedListener[] } }
+
+/** `~/.claude/dev-servers/scan-lock.json`: the session scanning now, and since when. */
+export type ScanLock = { ts: number; by: string }
 
 /** A listening process whose working directory is inside the project. */
 export type Server = {
@@ -44,6 +66,11 @@ export type Snapshot = {
   stopped: KnownEntry[]
   /** Listening processes outside the project. */
   others: number
+  /** Those processes, for the dev_servers tool's `all`. */
+  otherListeners: CachedListener[]
+  /** When the listeners were scanned, by whichever session did. */
+  scannedAt: number
+  /** When this snapshot was made. */
   at: number
 }
 

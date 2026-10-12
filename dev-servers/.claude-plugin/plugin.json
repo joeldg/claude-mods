@@ -1,7 +1,7 @@
 {
   "name": "dev-servers",
-  "version": "0.1.0",
-  "description": "A Servers pane for this project's dev servers: what is listening, on which port, since when, with Start, Stop, Restart and Log buttons; names the process holding a port when a command fails with EADDRINUSE. No model calls.",
+  "version": "0.2.0",
+  "description": "A Servers pane for this project's dev servers: what is listening, on which port, since when, with Start, Stop, Restart and Log buttons; names the process holding a port when a command fails with EADDRINUSE; a read-only dev_servers tool for Claude. Scans with netstat (never lsof), one session for all; no model calls.",
   "author": {
     "name": "joeldg"
   },
@@ -10,7 +10,7 @@
     "pollSeconds": {
       "type": "number",
       "title": "Refresh every (seconds)",
-      "description": "How often listening ports and their processes are re-read (lsof and ps only; nothing is started or stopped on a timer).",
+      "description": "How often listening ports are re-read (netstat; ps and lsof once per new pid). One open session scans for all of them, a slow scan doubles the interval up to 5 minutes, and nothing is started or stopped on a timer.",
       "default": 15
     },
     "logDir": {
