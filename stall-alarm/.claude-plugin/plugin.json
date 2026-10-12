@@ -1,0 +1,47 @@
+{
+  "name": "stall-alarm",
+  "version": "0.1.0",
+  "description": "Raises the alarm when a long-running session stalls while you are away: a permission dialog or a question that has waited for you past a threshold (toast, Mac notification, optional phone push, repeated while it stays open), and a turn that stopped on a login, usage-limit or billing error, with the fix. Leaves scheduled routines to routine-watch. No model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "stallMinutes": {
+      "type": "number",
+      "title": "Minutes before a wait is a stall",
+      "description": "How long a permission dialog or an AskUserQuestion may wait for you before the alarm fires. The status line shows the wait from then on.",
+      "default": 5
+    },
+    "repeatMinutes": {
+      "type": "number",
+      "title": "Minutes between repeat alarms",
+      "description": "While the same dialog or question stays open, alarm again this often. 0: alarm once per wait.",
+      "default": 30
+    },
+    "notifyMac": {
+      "type": "boolean",
+      "title": "Mac notification",
+      "description": "Post a macOS notification (osascript, with a sound) on each alarm, beside the toast.",
+      "default": true
+    },
+    "notifyCommand": {
+      "type": "string",
+      "title": "Phone push command",
+      "description": "Also run this command on each alarm, e.g. curl -s -d {message} ntfy.sh/my-topic. It is split on spaces and {title} and {message} are filled into single arguments; no shell is involved. Empty: no push.",
+      "default": ""
+    },
+    "alarmOnAnyError": {
+      "type": "boolean",
+      "title": "Alarm on any error",
+      "description": "Alarm when a turn ends on any error. Off: only login, usage-limit, rate-limit, billing and overload errors alarm.",
+      "default": false
+    },
+    "skipRoutines": {
+      "type": "boolean",
+      "title": "Leave routines to routine-watch",
+      "description": "Stay quiet in scheduled-task (routine) sessions, which routine-watch already watches, so one stall does not alarm twice.",
+      "default": true
+    }
+  }
+}

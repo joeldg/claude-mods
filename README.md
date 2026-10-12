@@ -259,6 +259,20 @@ Settings:
 
 The quit request goes out when Claude issues the command, before any permission prompt for it.
 
+## stall-alarm
+
+Raises the alarm when a session you walked away from has stalled: a dialog waiting on you, or a turn that died on a login or usage-limit error.
+
+- When a permission prompt or an `AskUserQuestion` has waited for you for 5 minutes (`stallMinutes`), you get a toast and a Mac notification, `Claude has been waiting 5m for your OK: Bash git push origin main`, titled with the project folder so you know which session. While it stays open, it alarms again every 30 minutes (`repeatMinutes`; 0 = once).
+- When a turn ends on an error that needs you (OAuth / `/login`, not logged in, usage or rate limit, credit balance, billing, overloaded) you get `Claude stopped: <the error> · run /login` at once. Other errors alarm only with `alarmOnAnyError`.
+- Status line while a wait is past the threshold: `waiting on you 7m`; cleared when the call runs, is refused, or the turn ends.
+- Leaves scheduled routines to routine-watch (`skipRoutines`), so one stall never alarms twice.
+- **Phone push (optional):** `notifyCommand` runs a command on each alarm, e.g. `curl -s -d {message} ntfy.sh/your-topic`. `{title}` and `{message}` are filled in as single arguments, never through a shell.
+- `/stalls` shows the open waits with their ages, the last alarms and the settings; `/stalls off` and `/stalls on` toggle it for the session.
+- Makes no model calls, and runs no process but the notifications.
+
+Settings: `stallMinutes` (5), `repeatMinutes` (30), `notifyMac` (on), `notifyCommand` (empty), `alarmOnAnyError` (off), `skipRoutines` (on).
+
 ## Loading
 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
