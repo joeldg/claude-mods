@@ -2,8 +2,10 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   etaFrom,
+  exitCodeOf,
   formatDuration,
   isAlive,
+  isPidAlive,
   launchFromCommand,
   matchToken,
   outputFileFromText,
@@ -81,6 +83,29 @@ test('tells a running process from our own probes', () => {
   const ps = 'ps -axo command=\n/bin/bash ./scripts/run.sh\npython -m train\n'
   expect(isAlive(ps, 'scripts/run.sh')).toBe(true)
   expect(isAlive('ps -axo command= scripts/run.sh\n', 'scripts/run.sh')).toBe(false)
+  // With a pid column in front, our own probe is still told apart.
+  expect(isAlive('  512 ps -axo pid=,command= scripts/run.sh\n', 'scripts/run.sh')).toBe(false)
+  expect(isAlive('  512 ps -axo pid=,command=\n 4242 /bin/bash ./scripts/run.sh\n', 'scripts/run.sh')).toBe(true)
+})
+
+test('tells a process by its pid, from a listing or a per-pid lookup', () => {
+  const listing = '  512 ps -axo pid=,command=\n 4242 python train.py\n14242 node server.js\n'
+  expect(isPidAlive(listing, 4242)).toBe(true)
+  expect(isPidAlive(listing, 424)).toBe(false)
+  expect(isPidAlive(listing, 1424)).toBe(false)
+  expect(isPidAlive(' 4242\n  777\n', 777)).toBe(true)
+  expect(isPidAlive('', 777)).toBe(false)
+})
+
+test('reads the exit code a background task leaves at the end of its output', () => {
+  expect(exitCodeOf('step 100/100\n\n[exited with code 0]\n')).toBe(0)
+  expect(exitCodeOf('Traceback …\n[exited with code 1]')).toBe(1)
+  expect(exitCodeOf('[exited with code 0]\nstill writing\n')).toBeNull()
+  expect(exitCodeOf('step 99/100\n')).toBeNull()
+  // The marker is not a log line: progress and the last line come from what the job wrote.
+  const reading = parseProgress('step 100/100 loss 0.1\n\n[exited with code 0]\n')
+  expect(reading.progress).toEqual({ done: 100, total: 100, pct: 100 })
+  expect(reading.lastLine).toBe('step 100/100 loss 0.1')
 })
 
 test('reads free space for / and /Volumes, skipping Time Machine', () => {

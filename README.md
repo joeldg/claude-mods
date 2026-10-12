@@ -55,15 +55,16 @@ Settings: `routineEffort` (low), `deepEffort` (max), `routinePattern`, `deepPatt
 
 ## job-watch
 
-A **Jobs** pane for long-running work: training runs, downloads, extractions.
+A **Jobs** pane for long-running work: training runs, downloads, extractions — and three tools so Claude follows them instead of polling.
 
 - Picks up background Bash tasks and detached `nohup … > log &` launches by itself.
 - `/watch <log> [label]` adds any other log file.
-- Shows progress, ETA and the last log line, and flags a job as stalled when its log goes quiet.
+- Shows progress, ETA and the last log line, and flags a job as stalled when its log goes quiet; a background task's exit code is read from the end of its output.
 - Shows free space on `/` and `/Volumes/*` (the NAS).
 - Toasts when a job finishes or stalls. The status line shows `jobs: 2 running · 1 stalled`.
-- `/jobs` opens the pane, `/unwatch <label|done|all>` removes jobs.
-- Makes no model calls: it reads logs with `tail`, checks processes with `ps`, and runs `df`.
+- `/jobs` opens the pane, `/unwatch <label|id|done|all>` removes jobs.
+- Tools for Claude: `jobs_list` (every watched job's state, pid, progress, ETA, last-output age, exit code and log path), `jobs_watch` (`{ pid?, log?, name?, quietMinutes? }`: follow a process or log started elsewhere; it never starts commands) and `jobs_unwatch` (`{ name }`). The first message of each conversation says jobs are watched and names them, so Claude stops writing `until … sleep` loops and running `ps`. They need no permission prompt: they only read the mod's own list.
+- Makes no model calls: it reads logs with `tail`, checks processes with `ps` (one listing, or a per-pid lookup when only pids are watched), and runs `df`. A probe that times out or takes over 2 s is retried at a doubling interval, up to 5 minutes, until it is fast again.
 
 Settings (in `/config`): stall minutes (10), refresh seconds (10), how long finished jobs stay (120 min), auto-open (on), which disks to show.
 

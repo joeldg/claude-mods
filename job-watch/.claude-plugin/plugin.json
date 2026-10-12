@@ -1,7 +1,7 @@
 {
   "name": "job-watch",
-  "version": "0.1.0",
-  "description": "Live pane of long-running jobs (training, downloads, extractions): progress, ETA, stalls and finishes, read from their logs with no model calls.",
+  "version": "0.2.0",
+  "description": "Live pane of long-running jobs (training, downloads, extractions): progress, ETA, stalls and finishes, read from their logs with no model calls; jobs_list / jobs_watch / jobs_unwatch tools so Claude follows jobs instead of polling them.",
   "author": {
     "name": "joeldg"
   },

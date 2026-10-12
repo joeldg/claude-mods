@@ -1,6 +1,8 @@
 import type { Disk, Progress } from '../types'
 
 const ANSI = /\u001b\[[0-9;?]*[A-Za-z]/g
+/** The line Claude Code's task runner appends to a background task's .output file when it ends. */
+const EXITED = /^\[exited with code (\d+)\]$/
 
 /** The .output file a background Bash task writes to, read from the text the model got back. */
 export const outputFileFromText = (text: string | undefined): string | null =>
@@ -138,7 +140,7 @@ export const parseProgress = (tail: string): Reading => {
     .replace(ANSI, '')
     .split(/\r\n|\r|\n/)
     .map(line => line.trim())
-    .filter(line => line.length > 0)
+    .filter(line => line.length > 0 && !EXITED.test(line))
   const lastLine = (lines[lines.length - 1] ?? '').slice(0, 200)
 
   for (const line of lines.slice(-60).reverse()) {
@@ -172,6 +174,18 @@ export const parseProgress = (tail: string): Reading => {
   return { progress: null, etaSeconds: null, lastLine }
 }
 
+/** The exit code a background task's .output file ends with, read from its tail; null while it still runs. */
+export const exitCodeOf = (tail: string): number | null => {
+  const last = tail
+    .replace(ANSI, '')
+    .split(/\r\n|\r|\n/)
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+    .pop()
+  const found = last?.match(EXITED)
+  return found ? Number(found[1]) : null
+}
+
 /** How far along, in the reading's own unit: its count, or its percentage when it has no count. */
 export const doneOf = (progress: Progress): number => (progress.total > 0 ? progress.done : progress.pct)
 
@@ -190,11 +204,15 @@ export const etaFrom = (
   return perMs > 0 ? Math.round((totalOf(progress) - doneOf(progress)) / perMs / 1000) : null
 }
 
-/** Whether `ps -axo command=` output shows the job, ignoring our own probes. */
+/** Whether a `ps` listing of command lines (with or without a pid column) shows the job, ignoring our own probes. */
 export const isAlive = (psOutput: string, match: string): boolean =>
   psOutput
     .split('\n')
-    .some(line => line.includes(match) && !/^\s*(ps|pgrep|tail -c)\b/.test(line))
+    .some(line => line.includes(match) && !/^\s*(?:\d+\s+)?(ps|pgrep|tail -c)\b/.test(line))
+
+/** Whether a `ps` listing led by a pid column (`pid=,command=`, or `pid=` alone) shows the pid. */
+export const isPidAlive = (psOutput: string, pid: number): boolean =>
+  psOutput.split('\n').some(line => /^\s*(\d+)\b/.exec(line)?.[1] === String(pid))
 
 /** `df -k` rows for `/` and `/Volumes/*` (or the listed mounts), skipping Time Machine volumes. */
 export const parseDf = (output: string, wanted: readonly string[]): Disk[] => {
