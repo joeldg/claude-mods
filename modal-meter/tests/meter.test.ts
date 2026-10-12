@@ -9,9 +9,19 @@ import {
   firstLine,
   formatDuration,
   isAuthProblem,
+  isCacheEntry,
+  isDependencyFile,
+  isEnoent,
+  isLock,
   isMissingModule,
+  isModalCommand,
+  isProjectRecord,
+  isTimeout,
   kindOf,
   lacksBilling,
+  namesModal,
+  nextInterval,
+  paneNotice,
   parseAppList,
   parseSpend,
   parseTimestamp,
@@ -236,6 +246,10 @@ test('spend from billing report JSON, and the failures told apart', () => {
   const noBilling =
     "Usage: python -m modal [OPTIONS] COMMAND [ARGS]...\nTry 'python -m modal -h' for help.\n╭─ Error ──────╮\n│ No such command 'billing'. │\n╰──────────────╯"
   expect(lacksBilling(noBilling)).toBe(true)
+  // The usage error for an unknown command, as its first line reaches a log; not one for billing's own options.
+  expect(lacksBilling("Usage: modal [OPTIONS] COMMAND [ARGS]...\nTry 'modal -h' for help.")).toBe(true)
+  expect(lacksBilling('Usage: modal billing report [OPTIONS]\nNo such option: --for')).toBe(false)
+  expect(lacksBilling("Usage: modal billing [OPTIONS] COMMAND [ARGS]...\nNo such command 'report'.")).toBe(false)
   expect(firstLine(noBilling)).toBe("No such command 'billing'.")
   expect(isAuthProblem('Token missing. Could not authenticate client.')).toBe(true)
   expect(isAuthProblem('Connection refused')).toBe(false)
@@ -269,4 +283,66 @@ test('the /modal summary', () => {
   expect(summaryText({ ...meter, apps: [], problem: 'no Modal CLI found' }, {}, NOW, 0)).toBe(
     'modal-meter is silent: no Modal CLI found.',
   )
+
+  // The pane's notice: the problem, the wait, the reason it is not watching, or no rows.
+  expect(paneNotice({ ...meter, apps: [], problem: 'no Modal CLI found' }, true)).toBe('modal-meter is silent: no Modal CLI found.')
+  expect(paneNotice({ ...meter, polledAt: null }, true)).toBe('Reading Modal…')
+  expect(paneNotice({ ...meter, polledAt: null }, false)).toMatch(/^Not watching Modal: this project does not use it\. \/modal starts watching/)
+  expect(paneNotice({ ...meter, apps: [] }, true)).toBe('No Modal apps running or deployed.')
+  expect(paneNotice(meter, true)).toBeNull()
+})
+
+test('a Bash command that runs modal, and project files that name it', () => {
+  expect(isModalCommand('modal run train.py')).toBe(true)
+  expect(isModalCommand('cd /home/dev/app && python3 -m modal deploy app.py')).toBe(true)
+  expect(isModalCommand('MODAL_PROFILE=work uv run modal app list')).toBe(true)
+  expect(isModalCommand('./.venv/bin/modal token new')).toBe(true)
+  expect(isModalCommand('ls | grep modal')).toBe(false)
+  expect(isModalCommand('rg -n modal README.md')).toBe(false)
+  expect(isModalCommand('echo "modal is down"')).toBe(false)
+  expect(isModalCommand('pip install modal')).toBe(false)
+  expect(isModalCommand('')).toBe(false)
+
+  expect(namesModal('pyproject.toml', '[project]\ndependencies = ["numpy", "modal>=1.0"]\n')).toBe(true)
+  expect(namesModal('pyproject.toml', '[tool.poetry.dependencies]\nmodal = "^1.0"\n')).toBe(true)
+  expect(namesModal('pyproject.toml', '[project]\ndescription = "a modal dialog"\n')).toBe(false)
+  expect(namesModal('requirements.txt', 'numpy\nmodal==1.2.6\n')).toBe(true)
+  expect(namesModal('requirements-dev.txt', '# modal\nruff\n')).toBe(false)
+  expect(namesModal('uv.lock', '[[package]]\nname = "modal"\nversion = "1.2.6"\n')).toBe(true)
+  expect(namesModal('poetry.lock', 'name = "modal-dialog"\n')).toBe(false)
+  expect(namesModal('package.json', '"modal": "1.0"')).toBe(false)
+  expect(['pyproject.toml', 'requirements.txt', 'requirements-dev.txt', 'uv.lock', 'poetry.lock'].every(isDependencyFile)).toBe(true)
+  expect(isDependencyFile('requirements.in')).toBe(false)
+})
+
+test('the poll interval doubles after a slow or timed-out probe, and comes back after a fast one', () => {
+  expect(nextInterval(MIN, MIN, 500, false, true)).toBe(MIN)
+  expect(nextInterval(MIN, MIN, 2_500, false, true)).toBe(2 * MIN)
+  expect(nextInterval(2 * MIN, MIN, 60_000, true, false)).toBe(4 * MIN)
+  expect(nextInterval(8 * MIN, MIN, 60_000, true, false)).toBe(10 * MIN)
+  expect(nextInterval(10 * MIN, MIN, 60_000, true, false)).toBe(10 * MIN)
+  expect(nextInterval(4 * MIN, MIN, 800, false, true)).toBe(MIN)
+  // A fast failure (no profile, say) changes nothing.
+  expect(nextInterval(4 * MIN, MIN, 800, false, false)).toBe(4 * MIN)
+  // Never below the option.
+  expect(nextInterval(15 * MIN, 15 * MIN, 5_000, false, true)).toBe(15 * MIN)
+
+  expect(isTimeout('HooksError: modal-meter: $.process.run(modal) aborted: still running after 60000ms')).toBe(true)
+  expect(isTimeout('ENOENT: Executable not found in $PATH: "modal"')).toBe(false)
+  expect(isEnoent('HooksError: modal-meter: $.process.run(modal) failed to start: ENOENT: Executable not found in $PATH: "modal"')).toBe(true)
+  expect(isEnoent('Token missing.')).toBe(false)
+})
+
+test('the shared cache, lock and project records are read defensively', () => {
+  const shared = { cli: ['modal'], problem: null, apps: [], spendToday: null, spendNote: null, spendAskedAt: null, spendWaitMs: 300_000, billingUnsupportedAt: null }
+  expect(isCacheEntry({ ts: NOW, by: 'sess-b', intervalMs: MIN, data: shared })).toBe(true)
+  expect(isCacheEntry({ ts: NOW, by: 'sess-b', intervalMs: MIN, data: { ...shared, apps: 'nope' } })).toBe(false)
+  expect(isCacheEntry({ ts: 'yesterday', by: 'sess-b', intervalMs: MIN, data: shared })).toBe(false)
+  expect(isCacheEntry(null)).toBe(false)
+  expect(isLock({ ts: NOW, by: 'sess-b' })).toBe(true)
+  expect(isLock({ ts: NOW })).toBe(false)
+  expect(isLock('lock')).toBe(false)
+  expect(isProjectRecord({ usesModal: true, checkedAt: NOW })).toBe(true)
+  expect(isProjectRecord({ usesModal: 'yes', checkedAt: NOW })).toBe(false)
+  expect(isProjectRecord(undefined)).toBe(false)
 })

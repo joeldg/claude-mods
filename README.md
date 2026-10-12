@@ -106,14 +106,17 @@ Settings: `alerts` (on), `slowMs` (1500), `watchRender` (on), `watchCommands` (o
 
 ## modal-meter
 
-Keeps an eye on Modal so idle GPU containers don't burn credits.
+Keeps an eye on Modal so idle GPU containers don't burn credits — in the projects that use Modal, with one CLI run per minute for the whole machine.
 
+- Watches a project only when it uses Modal: a `.py` file with `import modal` / `from modal import …` (one `rg` run, 5 s at most), or `modal` named in `pyproject.toml`, `requirements*.txt`, `uv.lock` or `poetry.lock`. The answer is remembered per project for a day. Running `/modal`, or any `modal …` command in Bash, switches it on for the session; `alwaysPoll` (off) watches every project.
+- One session polls for all of them: whoever holds `~/.claude/modal-meter/lock.json` runs `modal app list --json` every `pollSeconds` (60) and writes `cache.json`; the other open sessions read the cache and refresh their own status line and pane from it. Once one session learns the CLI has no `billing report`, none tries it again for a day.
+- Backs off while Modal is slow: an `app list` over 2 s or a timeout doubles the interval (up to 10 minutes); a fast answer brings it back.
 - Status line while containers run: `Modal: 1 running (2 containers)`. Deployed apps with no containers cost nothing, so they stay off it.
 - A toast when an app has had containers up longer than `alertMinutes` (30), repeated at most every 30 minutes.
 - `/modal` opens a pane of apps with state, containers and uptime. **Stop** asks for Confirm, then runs `modal app stop`. Nothing is stopped any other way.
 - Shows today's spend and alerts on a `budgetToday` where the Modal CLI supports `billing report` (1.3.3+, Team/Enterprise workspaces). Otherwise `/modal` says why spend isn't shown.
-- Finds the CLI as `modal` or `python3 -m modal`. It checks `PATH` first rather than running a command that can only fail, and stays silent when Modal isn't set up.
-- Makes no model calls: only the Modal CLI, every 60s.
+- Finds the CLI as `modal` or `python3 -m modal`. It checks `PATH` first rather than running a command that can only fail, never retries one that isn't there, and stays silent when Modal isn't set up.
+- Makes no model calls: only the Modal CLI, never at session start — the first read runs in the background.
 
 ## pr-autopilot
 

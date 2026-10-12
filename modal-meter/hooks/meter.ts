@@ -1,4 +1,4 @@
-import type { ModalApp, ModalAppKind, ModalMeter, ModalTracked } from '../types'
+import type { ModalApp, ModalAppKind, ModalCache, ModalLock, ModalMeter, ModalProject, ModalTracked } from '../types'
 
 const ANSI = /\u001b\[[0-9;?]*[A-Za-z]/g
 
@@ -274,8 +274,21 @@ export const parseSpend = (text: string): number | null => {
   return Math.round(total * 1e6) / 1e6
 }
 
-/** The CLI said it has no `billing` command (Modal before 1.3.3). */
-export const lacksBilling = (output: string): boolean => /no such command\W+billing/i.test(output)
+/**
+ * The CLI said it has no `billing` command (Modal before 1.3.3): the "No such command" line of
+ * its error box, or the root command's usage line (`Usage: modal [OPTIONS] COMMAND [ARGS]...`),
+ * which a usage error of `billing report` itself never prints.
+ */
+export const lacksBilling = (output: string): boolean => {
+  const plain = output.replace(ANSI, '')
+  return /no such command\W+billing/i.test(plain) || /^\s*usage:(?!.*\bbilling\b).*\[OPTIONS\] COMMAND \[ARGS\]/im.test(plain)
+}
+
+/** `$.process.run` gave the command up: "aborted: still running after Nms". */
+export const isTimeout = (output: string): boolean => /still running after/i.test(output)
+
+/** The command could not start: the executable is not there. */
+export const isEnoent = (output: string): boolean => /\bENOENT\b|not found in \$?PATH/i.test(output)
 
 /** The CLI could not authenticate: no profile or token set up on this machine. */
 export const isAuthProblem = (output: string): boolean =>
@@ -298,6 +311,20 @@ export const firstLine = (output: string): string =>
 
 /** The UTC day of `ms`, `2026-10-07`: the day Modal's `--for today` reports. */
 export const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10)
+
+export const NOT_WATCHING =
+  'Not watching Modal: this project does not use it. /modal starts watching for this session; the alwaysPoll option watches every project.'
+
+/** The pane's one-line notice: why there are no rows, or that they are on their way; null when there are rows to show. */
+export const paneNotice = (meter: ModalMeter, isWatching: boolean): string | null => {
+  if (meter.problem !== null) {
+    return `modal-meter is silent: ${meter.problem}.`
+  }
+  if (meter.polledAt === null) {
+    return isWatching ? 'Reading Modal…' : NOT_WATCHING
+  }
+  return activeApps(meter.apps).length === 0 ? 'No Modal apps running or deployed.' : null
+}
 
 /** The meter's state in words: what `/modal` answers. */
 export const summaryText = (
@@ -324,3 +351,94 @@ export const summaryText = (
   )
   return lines.join('\n')
 }
+
+/** A probe slower than this doubles the poll interval. */
+export const SLOW_MS = 2_000
+/** The poll interval backs off no further than this. */
+export const MAX_INTERVAL_MS = 10 * 60_000
+
+/**
+ * The next poll interval: doubled (never past `MAX_INTERVAL_MS`, never below the option) after a
+ * probe that timed out or took longer than `SLOW_MS`; the option again after a fast success; else
+ * as it was (a fast failure says nothing about Modal's speed).
+ */
+export const nextInterval = (current: number, configured: number, elapsedMs: number, isTimedOut: boolean, isOk: boolean): number => {
+  if (isTimedOut || elapsedMs > SLOW_MS) {
+    return Math.max(configured, Math.min(current * 2, MAX_INTERVAL_MS))
+  }
+  return isOk ? configured : current
+}
+
+/** Words that run the word after them, so `python3 -m modal`, `uv run modal` and `sudo modal` count as modal. */
+const RUNNERS = new Set([
+  'sudo', 'env', 'time', 'nohup', 'exec', 'command', 'nice', 'caffeinate', 'watch',
+  'uv', 'uvx', 'poetry', 'pipx', 'pdm', 'hatch', 'run', 'python', 'python3', 'py',
+])
+
+/**
+ * Whether a shell command runs the Modal CLI: `modal …` (or `…/modal …`) as the command of any
+ * simple command in it, after any `VAR=value` prefix and runners (`uv run`, `python3 -m`, `sudo`).
+ * Mentions as an argument (`grep modal`, `pip install modal`) do not count.
+ */
+export const isModalCommand = (command: string): boolean =>
+  command.split(/\n|;|&&|\|\||\||\$\(|`|[(){}]/).some(part => {
+    const words = part.trim().split(/\s+/)
+    let i = 0
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i] ?? '')) {
+      i++
+    }
+    while (i < words.length && (RUNNERS.has(words[i] ?? '') || (words[i] ?? '').startsWith('-'))) {
+      i++
+    }
+    return /(^|\/)modal$/.test(words[i] ?? '')
+  })
+
+/** A dependency file worth reading for a `modal` requirement: `pyproject.toml`, `requirements*.txt`, `uv.lock`, `poetry.lock`. */
+export const isDependencyFile = (name: string): boolean => /^(pyproject\.toml|requirements[^/]*\.txt|uv\.lock|poetry\.lock)$/.test(name)
+
+/**
+ * Whether a dependency file names the `modal` package: a requirement line in `requirements*.txt`;
+ * a `"modal…"` requirement string or a `modal = …` key in `pyproject.toml`; a `name = "modal"`
+ * package in `uv.lock` or `poetry.lock`.
+ */
+export const namesModal = (file: string, text: string): boolean => {
+  const name = file.slice(file.lastIndexOf('/') + 1)
+  if (/^requirements[^/]*\.txt$/.test(name)) {
+    return /^\s*modal\b/im.test(text)
+  }
+  if (name === 'pyproject.toml') {
+    return /["']modal(?=\s*["'[<>=!~;@])/i.test(text) || /^\s*modal\s*=/m.test(text)
+  }
+  if (name === 'uv.lock' || name === 'poetry.lock') {
+    return /^\s*name\s*=\s*"modal"\s*$/m.test(text)
+  }
+  return false
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+
+const isNumberOrNull = (value: unknown): boolean => value === null || typeof value === 'number'
+const isStringOrNull = (value: unknown): boolean => value === null || typeof value === 'string'
+
+/** The shared cache file read back: `{ ts, by, intervalMs, data }` in the shapes the meter writes. */
+export const isCacheEntry = (value: unknown): value is ModalCache =>
+  isRecord(value) &&
+  typeof value.ts === 'number' &&
+  typeof value.by === 'string' &&
+  typeof value.intervalMs === 'number' &&
+  isRecord(value.data) &&
+  (value.data.cli === null || Array.isArray(value.data.cli)) &&
+  isStringOrNull(value.data.problem) &&
+  Array.isArray(value.data.apps) &&
+  isNumberOrNull(value.data.spendToday) &&
+  isStringOrNull(value.data.spendNote) &&
+  isNumberOrNull(value.data.spendAskedAt) &&
+  typeof value.data.spendWaitMs === 'number' &&
+  isNumberOrNull(value.data.billingUnsupportedAt)
+
+/** The shared lock file read back: `{ ts, by }`. */
+export const isLock = (value: unknown): value is ModalLock => isRecord(value) && typeof value.ts === 'number' && typeof value.by === 'string'
+
+/** A project's record in the store: `{ usesModal, checkedAt }`. */
+export const isProjectRecord = (value: unknown): value is ModalProject =>
+  isRecord(value) && typeof value.usesModal === 'boolean' && typeof value.checkedAt === 'number'

@@ -1,7 +1,7 @@
 {
   "name": "modal-meter",
-  "version": "0.1.0",
-  "description": "Watches your Modal apps from the CLI: running apps and containers on the status line, a toast when one has been up too long, today's spend where the CLI reports it, and a pane to stop an app (after you confirm). No model calls.",
+  "version": "0.2.0",
+  "description": "Watches your Modal apps from the CLI, in projects that use Modal: running apps and containers on the status line, a toast when one has been up too long, today's spend where the CLI reports it, and a pane to stop an app (after you confirm). One session polls for all the open ones. No model calls.",
   "author": {
     "name": "joeldg"
   },
@@ -16,7 +16,7 @@
     "pollSeconds": {
       "type": "number",
       "title": "Check every (seconds)",
-      "description": "How often `modal app list --json` is run.",
+      "description": "How often Modal is read. One session on this machine runs `modal app list --json` this often and the others share its answer; the interval doubles (up to 10 minutes) while the CLI is slow or times out.",
       "default": 60
     },
     "alertMinutes": {
@@ -30,6 +30,12 @@
       "title": "Daily budget (USD)",
       "description": "Toast once when today's Modal spend passes this many dollars. Needs a Modal CLI with `modal billing report`; 0 turns it off.",
       "default": 0
+    },
+    "alwaysPoll": {
+      "type": "boolean",
+      "title": "Watch every project",
+      "description": "Read Modal in every project. Off, modal-meter watches only projects whose Python imports modal or whose dependency files name it, and any session once you run /modal or a modal command in it.",
+      "default": false
     }
   }
 }
