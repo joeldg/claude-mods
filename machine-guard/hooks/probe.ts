@@ -1,22 +1,78 @@
-import type { AppMemory, Pressure, Reservation, Snapshot } from '../types'
+import type { AppMemory, Pressure, Reservation, SampleLock, SharedSample, Snapshot } from '../types'
 
-/** `sysctl -n kern.memorystatus_vm_pressure_level vm.swapusage`: the level, then the swap line. */
-export const parseSysctl = (output: string): { level: number | null; swapUsedGB: number; swapTotalGB: number } => {
-  const [levelLine = '', ...rest] = output.trim().split('\n')
-  const swap = rest.join(' ')
+/** Unused memory below this share is tight; below CRITICAL_BELOW_PCT with the swap this full, critical. */
+export const TIGHT_BELOW_PCT = 20
+export const CRITICAL_BELOW_PCT = 10
+export const SWAP_FULL_RATIO = 0.95
+/** How long one probe may run. */
+export const PROBE_TIMEOUT_MS = 10_000
+/** A process table this old still describes the machine; one is taken at most this often. */
+export const TOP_FRESH_MS = 5 * 60_000
+export const TOP_GAP_MS = 60_000
+
+const GIB = 1024 ** 3
+const round1 = (value: number): number => Math.round(value * 10) / 10
+const numberOrNull = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+
+/**
+ * `sysctl -n hw.memsize vm.swapusage kern.memorystatus_vm_pressure_level`: one line each, told apart by their
+ * shape (the memory size has ten digits or more, the level one or two, the swap line its `total = `).
+ */
+export const parseSysctl = (output: string): { level: number | null; totalGB: number | null; swapUsedGB: number; swapTotalGB: number } => {
+  let level: number | null = null
+  let totalGB: number | null = null
+  let swap = ''
+  for (const raw of output.split('\n')) {
+    const line = raw.trim()
+    if (/^\d{10,}$/.test(line)) {
+      totalGB = round1(Number(line) / GIB)
+    } else if (/^\d{1,2}$/.test(line)) {
+      level = Number(line)
+    } else if (line.includes('total = ')) {
+      swap = line
+    }
+  }
   const megabytes = (name: string) => Number(swap.match(new RegExp(`${name} = ([\\d.]+)M`))?.[1] ?? 0)
-  const level = /^\d+$/.test(levelLine.trim()) ? Number(levelLine.trim()) : null
+  return { level, totalGB, swapUsedGB: round1(megabytes('used') / 1024), swapTotalGB: round1(megabytes('total') / 1024) }
+}
+
+export type VmStat = { pageSize: number; free: number; inactive: number; speculative: number; compressorPages: number; compressedPages: number }
+
+/** `vm_stat`: the page size from its header, and the page counts that matter. */
+export const parseVmStat = (output: string): VmStat | null => {
+  const pageSize = Number(output.match(/page size of (\d+) bytes/)?.[1] ?? 0)
+  if (pageSize <= 0) {
+    return null
+  }
+  const pages = (name: string) => Number(output.match(new RegExp(`^${name}:\\s+(\\d+)\\.`, 'm'))?.[1] ?? 0)
   return {
-    level,
-    swapUsedGB: Math.round((megabytes('used') / 1024) * 10) / 10,
-    swapTotalGB: Math.round((megabytes('total') / 1024) * 10) / 10,
+    pageSize,
+    free: pages('Pages free'),
+    inactive: pages('Pages inactive'),
+    speculative: pages('Pages speculative'),
+    compressorPages: pages('Pages occupied by compressor'),
+    compressedPages: pages('Pages stored in compressor'),
   }
 }
 
-/** `memory_pressure -Q`: "System-wide memory free percentage: 37%". */
-export const parseFreePct = (output: string): number | null => {
-  const found = output.match(/free percentage:\s*(\d+)%/)
-  return found ? Number(found[1]) : null
+/**
+ * What a new job can take without pushing anyone out (free + inactive + speculative pages), as a share of the
+ * memory and in GB, and the compressor: what it occupies and how much it stands for.
+ */
+export const memoryOf = (
+  vm: VmStat | null,
+  totalGB: number | null,
+): { freePct: number | null; unusedGB: number | null; compressorGB: number | null; compressedGB: number | null } => {
+  if (!vm) {
+    return { freePct: null, unusedGB: null, compressorGB: null, compressedGB: null }
+  }
+  const unused = (vm.free + vm.inactive + vm.speculative) * vm.pageSize
+  return {
+    freePct: totalGB === null || totalGB <= 0 ? null : Math.round((unused / (totalGB * GIB)) * 100),
+    unusedGB: round1(unused / GIB),
+    compressorGB: round1((vm.compressorPages * vm.pageSize) / GIB),
+    compressedGB: round1((vm.compressedPages * vm.pageSize) / GIB),
+  }
 }
 
 /** `ioreg -r -d 1 -w 0 -c IOAccelerator`: the GPU's "Device Utilization %". */
@@ -52,18 +108,74 @@ export const parseTopApps = (output: string, count = 3): AppMemory[] => {
 }
 
 /**
- * macOS's level (1 normal, 2 warn, 4 critical), raised one step when free memory and
+ * macOS's level (1 normal, 2 warn, 4 critical), raised one step when unused memory and
  * swap say worse than the kernel's level does.
  */
 export const pressureOf = (level: number | null, freePct: number | null, swapUsedGB: number, swapTotalGB: number): Pressure => {
-  const isSwapFull = swapTotalGB > 0 && swapUsedGB / swapTotalGB >= 0.95
-  if (level === 4 || (freePct !== null && freePct < 10 && isSwapFull)) {
+  const isSwapFull = swapTotalGB > 0 && swapUsedGB / swapTotalGB >= SWAP_FULL_RATIO
+  if (level === 4 || (freePct !== null && freePct < CRITICAL_BELOW_PCT && isSwapFull)) {
     return 'critical'
   }
-  if (level === 2 || (freePct !== null && freePct < 20)) {
+  if (level === 2 || (freePct !== null && freePct < TIGHT_BELOW_PCT)) {
     return 'warn'
   }
   return 'normal'
+}
+
+const isAppMemory = (value: unknown): value is AppMemory =>
+  typeof value === 'object' && value !== null && typeof (value as AppMemory).name === 'string' && typeof (value as AppMemory).gb === 'number'
+
+/** The shared sample as its file holds it, fields an older build left out filled in; null when absent or malformed. */
+export const parseShared = (text: string | null): SharedSample | null => {
+  if (!text) {
+    return null
+  }
+  try {
+    const value = JSON.parse(text) as Partial<SharedSample>
+    const data = value.data as Partial<Snapshot> | undefined
+    if (typeof value.ts !== 'number' || typeof value.ttlMs !== 'number' || !data || typeof data.at !== 'number') {
+      return null
+    }
+    return {
+      ts: value.ts,
+      by: String(value.by ?? ''),
+      ttlMs: value.ttlMs,
+      probeMs: Number(value.probeMs ?? 0),
+      n: Number(value.n ?? 0),
+      data: {
+        at: data.at,
+        pressure: data.pressure === 'warn' || data.pressure === 'critical' ? data.pressure : 'normal',
+        level: numberOrNull(data.level),
+        freePct: numberOrNull(data.freePct),
+        unusedGB: numberOrNull(data.unusedGB),
+        totalGB: numberOrNull(data.totalGB),
+        compressorGB: numberOrNull(data.compressorGB),
+        compressedGB: numberOrNull(data.compressedGB),
+        swapUsedGB: Number(data.swapUsedGB ?? 0),
+        swapTotalGB: Number(data.swapTotalGB ?? 0),
+        gpuPct: numberOrNull(data.gpuPct),
+        gpuAt: numberOrNull(data.gpuAt),
+        top: Array.isArray(data.top) ? data.top.filter(isAppMemory) : [],
+        topAt: numberOrNull(data.topAt),
+        topTriedAt: numberOrNull(data.topTriedAt),
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
+/** The lock as its file holds it; null when absent or malformed. */
+export const parseLock = (text: string | null): SampleLock | null => {
+  if (!text) {
+    return null
+  }
+  try {
+    const value = JSON.parse(text) as Partial<SampleLock>
+    return typeof value.ts === 'number' ? { ts: value.ts, by: String(value.by ?? '') } : null
+  } catch {
+    return null
+  }
 }
 
 const LAUNCHERS = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+|nohup\s+|nice\s+(?:-n\s*\d+\s+)?|caffeinate\s+(?:-\S+\s+)*|time\s+|exec\s+)*/
@@ -138,6 +250,11 @@ export const formatLeft = (ms: number): string => {
   return minutes < 90 ? `${minutes}m` : `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`
 }
 
+/** "just now", "12 s ago", "5m ago". */
+export const agoText = (ms: number): string => (ms < 1000 ? 'just now' : ms < 60_000 ? `${Math.round(ms / 1000)} s ago` : `${formatLeft(ms)} ago`)
+
+const seconds = (ms: number): string => `${Math.round(ms / 1000)} s`
+
 /** A reservation read from its file, or null when there is none, it is malformed, or it ran out. */
 export const parseReservation = (text: string | null, now: number): Reservation | null => {
   if (!text) {
@@ -153,8 +270,18 @@ export const parseReservation = (text: string | null, now: number): Reservation 
   }
 }
 
-const biggest = (snapshot: Snapshot): string =>
-  snapshot.top.map(app => `${app.name} ${app.gb} GB`).join(', ')
+export const biggestApps = (snapshot: Snapshot): string => snapshot.top.map(app => `${app.name} ${app.gb} GB`).join(', ')
+
+/** Whether the snapshot's process table is recent enough to name the biggest apps. */
+export const hasFreshTop = (snapshot: Snapshot, now: number): boolean =>
+  snapshot.topAt !== null && snapshot.top.length > 0 && now - snapshot.topAt <= TOP_FRESH_MS
+
+/** Why there is no process table to show, and how to get one. */
+export const noTableText = (snapshot: Snapshot, now: number): string =>
+  snapshot.topTriedAt !== null && now - snapshot.topTriedAt < TOP_GAP_MS
+    ? `no process table — ps did not answer within ${seconds(PROBE_TIMEOUT_MS)} (tried ${agoText(now - snapshot.topTriedAt)}; the Mac is that loaded). ` +
+      'machine_status and /guard try again at most once a minute, or run `ps -axo rss=,comm= | sort -rn | head -5` yourself.'
+    : 'no process table from the last 5 min; machine_status or /guard takes one (ps, at most once a minute).'
 
 /** The status line: memory first, GPU, and the reservation or pause when there is one. */
 export const statusLine = (snapshot: Snapshot | null, reservation: Reservation | null, pausedLeftMs: number): string => {
@@ -184,13 +311,72 @@ export const statusLine = (snapshot: Snapshot | null, reservation: Reservation |
   return parts.join(' · ')
 }
 
+export type Cadence = { sampleMs: number; intervalMs: number; blockOnCritical: boolean }
+
+const RULES =
+  `Rules: blocked when memory is critical (kernel level 4, or under ${CRITICAL_BELOW_PCT}% free with swap ${Math.round(SWAP_FULL_RATIO * 100)}% full) or while /busy reserves the Mac; ` +
+  `when memory is tight (under ${TIGHT_BELOW_PCT}% free, or kernel level 2) the job runs with a note to run one at a time.`
+
+/** The guard's verdict, in the order the Bash hook decides: a pause first, then the reservation, then memory. */
+const verdict = (snapshot: Snapshot | null, reservation: Reservation | null, pausedLeftMs: number, now: number, cadence: Cadence): string => {
+  if (pausedLeftMs > 0) {
+    return `Verdict: ok — the guard is paused for ${formatLeft(pausedLeftMs)} in this session: heavy jobs run even while memory is critical.`
+  }
+  if (reservation) {
+    return `Verdict: busy — the Mac is reserved for "${reservation.reason}" for ${formatLeft(reservation.until - now)} more: heavy local jobs are blocked (/busy off lifts it).`
+  }
+  if (snapshot?.pressure === 'critical') {
+    return cadence.blockOnCritical
+      ? 'Verdict: busy — memory is critical: heavy local jobs are blocked (the user can lift this with /guard pause 15m).'
+      : 'Verdict: ok — memory is critical but blocking is off: start nothing heavy unless the user asks for it.'
+  }
+  if (snapshot?.pressure === 'warn') {
+    return 'Verdict: ok — memory is tight: run one heavy job at a time.'
+  }
+  return 'Verdict: ok — heavy local jobs may start.'
+}
+
+/** What the machine_status tool tells the model: the sample and its age, the figures, the biggest apps, the verdict and the rules. */
+export const statusReport = (snapshot: Snapshot | null, reservation: Reservation | null, pausedLeftMs: number, now: number, cadence: Cadence): string => {
+  if (!snapshot) {
+    return ['machine-guard · no sample yet: the Mac’s memory counters could not be read.', verdict(null, reservation, pausedLeftMs, now, cadence)].join('\n')
+  }
+  const pace = `every ${seconds(cadence.intervalMs)}${cadence.intervalMs > cadence.sampleMs ? ' (backed off: probes were slow)' : ''}`
+  const ram =
+    snapshot.unusedGB === null
+      ? `RAM: free memory unknown (vm_stat did not answer)${snapshot.totalGB === null ? '' : ` · ${snapshot.totalGB} GB in all`}`
+      : `RAM: ${snapshot.freePct ?? '?'}% free · ${snapshot.unusedGB} of ${snapshot.totalGB ?? '?'} GB unused (free + inactive + speculative pages)` +
+        ` · compressor holds ${snapshot.compressedGB} GB in ${snapshot.compressorGB} GB`
+  const gpu =
+    snapshot.gpuPct === null
+      ? 'GPU: n/a'
+      : `GPU: ${snapshot.gpuPct}%${snapshot.gpuAt !== null && now - snapshot.gpuAt >= 1000 ? ` (read ${agoText(now - snapshot.gpuAt)})` : ''}`
+  const top = hasFreshTop(snapshot, now)
+    ? `Biggest apps (ps ${agoText(now - (snapshot.topAt ?? now))}): ${biggestApps(snapshot)}`
+    : `Biggest apps: ${noTableText(snapshot, now)}`
+  return [
+    `machine-guard · sampled ${agoText(now - snapshot.at)} · ${pace}, one sample shared by all sessions`,
+    ram,
+    `Swap: ${snapshot.swapUsedGB} of ${snapshot.swapTotalGB} GB used`,
+    gpu,
+    `Pressure: ${snapshot.pressure} (kernel level ${snapshot.level ?? 'unknown'})`,
+    top,
+    verdict(snapshot, reservation, pausedLeftMs, now, cadence),
+    RULES,
+  ].join('\n')
+}
+
 const quoted = (command: string): string => {
   const line = command.replace(/\s+/g, ' ').trim()
   return `\`${line.length > 120 ? `${line.slice(0, 119)}…` : line}\``
 }
 
+/** "6% free, swap 7.9 of 8 GB; biggest: python 31 GB": the biggest apps only when a table was taken. */
+const figures = (snapshot: Snapshot): string =>
+  `${snapshot.freePct ?? '?'}% free, swap ${snapshot.swapUsedGB} of ${snapshot.swapTotalGB} GB${snapshot.top.length > 0 ? `; biggest: ${biggestApps(snapshot)}` : ''}`
+
 export const criticalDenial = (snapshot: Snapshot, command: string): string =>
-  `machine-guard: memory pressure is critical on this Mac (${snapshot.freePct ?? '?'}% free, swap ${snapshot.swapUsedGB} of ${snapshot.swapTotalGB} GB; biggest: ${biggest(snapshot)}), so this heavy job was not started: ${quoted(command)}. ` +
+  `machine-guard: memory pressure is critical on this Mac (${figures(snapshot)}), so this heavy job was not started: ${quoted(command)}. ` +
   'Wait for a running job to finish or free memory and retry, run it remotely (e.g. Modal), or ask the user, who can override with /guard pause 15m.'
 
 export const reservationDenial = (reservation: Reservation, command: string, now: number): string =>
@@ -198,4 +384,4 @@ export const reservationDenial = (reservation: Reservation, command: string, now
   'Do other work meanwhile, run it remotely (e.g. Modal), or ask the user, who can lift the reservation with /busy off.'
 
 export const warnContext = (snapshot: Snapshot): string =>
-  `machine-guard: memory is tight on this Mac (${snapshot.freePct ?? '?'}% free, swap ${snapshot.swapUsedGB} of ${snapshot.swapTotalGB} GB; biggest: ${biggest(snapshot)}). Avoid starting more heavy jobs in parallel; prefer running one at a time.`
+  `machine-guard: memory is tight on this Mac (${figures(snapshot)}). Avoid starting more heavy jobs in parallel; prefer running one at a time.`

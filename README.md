@@ -2,7 +2,7 @@
 
 Claude Code mods (function-hook plugins) I find helpful. Each folder is one plugin.
 
-Requires a Claude Code build with function-hook plugins (2.1.289 or newer). machine-guard reads macOS tools (`sysctl`, `memory_pressure`, `ioreg`).
+Requires a Claude Code build with function-hook plugins (2.1.289 or newer). machine-guard reads macOS tools (`sysctl`, `vm_stat`, `ioreg`, `ps`).
 
 ```bash
 git clone https://github.com/joeldg/claude-mods ~/Projects/claude-mods
@@ -69,19 +69,22 @@ Settings (in `/config`): stall minutes (10), refresh seconds (10), how long fini
 
 ## machine-guard
 
-Memory, swap and GPU on the status line. It refuses heavy local jobs when the Mac can't take them.
+Memory, swap and GPU on the status line, a `machine_status` tool for Claude, and a guard that refuses heavy local jobs when the Mac can't take them.
 
-- Status line: `RAM tight 12% free · swap 7.9/8G · top python 31G · GPU 87%`.
+- Status line: `RAM tight 12% free · swap 7.9/8G · top python 31G · GPU 87%`. "Free" is unused memory (vm_stat's free + inactive + speculative pages): what a new job can take without pushing anyone out. macOS's own "memory free percentage" counts active pages too, which is how a Mac can be "55% free" with the swap nearly full.
+- It reads the kernel's counters only (`sysctl`, `vm_stat`), every 15 s by default; the GPU (`ioreg`) on every third sample, never right after a slow one. One session samples and writes `~/.claude/machine-guard/sample.json` (with a `lock.json` while it probes); every other session shows the same numbers instead of probing too. When probes are slow or time out (10–40 s while the Mac swaps), the interval doubles up to 2 min and resets once they are fast again.
+- The process table (`ps`, the slowest probe) is taken only on demand (`/guard`, `machine_status`) or when a sample shows pressure, at most once a minute; "biggest" means the apps from a table taken in the last 5 minutes.
 - It refuses heavy jobs (training, inference, rendering, extraction, Blender, Docker, ffmpeg) when:
-  - macOS reports **critical** memory pressure, or
+  - macOS reports **critical** memory pressure (kernel level 4, or under 10% free with the swap 95% full), or
   - the Mac is **reserved** with `/busy`.
 
-  When memory is only tight, the job runs and Claude gets a note to start one heavy job at a time.
+  When memory is only tight (under 20% free, or kernel level 2), the job runs and Claude gets a note to start one heavy job at a time.
+- `machine_status` is a tool Claude can call (no input, allowed without asking): the sample's age, RAM free, swap, GPU, the pressure level, the biggest apps (or how to get a table), the guard's verdict and its rules. Claude is told to use it instead of `ps`, `top`, `vm_stat`, `memory_pressure` or project scripts before launching heavy work.
 - `/busy 3h training a vision model` reserves the Mac in **every** Claude session. `/busy off` lifts it. The reservation lives in `~/.claude/machine-guard.json`, so a training script can write it too:
   ```bash
   echo '{"reason":"overnight training","until":'$(( ($(date +%s) + 8*3600) * 1000 ))'}' > ~/.claude/machine-guard.json
   ```
-- `/guard` shows what it sees. `/guard pause 15m` lets heavy jobs through in this session; `/guard on` resumes the guard.
+- `/guard` shows what it sees (and takes a process table when one is due). `/guard pause 15m` lets heavy jobs through in this session; `/guard on` resumes the guard.
 - Remote runs (`modal run`, `ssh`), tests (`pytest`) and installs are never treated as heavy.
 - Add your own heavy commands with the "Also heavy" setting (a regex), e.g. `overnight_|nightly_run\.sh`.
 

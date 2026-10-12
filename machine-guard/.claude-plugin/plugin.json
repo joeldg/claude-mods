@@ -1,7 +1,7 @@
 {
   "name": "machine-guard",
-  "version": "0.1.0",
-  "description": "Memory, swap and GPU on the status line; refuses heavy local jobs (training, inference, rendering, Docker) while memory is critical or the Mac is reserved with /busy.",
+  "version": "0.2.0",
+  "description": "Memory, swap and GPU on the status line and a machine_status tool for Claude; refuses heavy local jobs (training, inference, rendering, Docker) while memory is critical or the Mac is reserved with /busy.",
   "author": {
     "name": "joeldg"
   },
@@ -10,7 +10,7 @@
     "sampleSeconds": {
       "type": "number",
       "title": "Sample every (seconds)",
-      "description": "How often memory pressure, swap, GPU and the biggest apps are read.",
+      "description": "How often memory and swap are read from the kernel's counters; the GPU every third time, and less often while the Mac is slow. One session samples and the others share it.",
       "default": 15
     },
     "blockOnCritical": {
