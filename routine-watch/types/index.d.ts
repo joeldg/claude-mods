@@ -4,6 +4,14 @@ export type RoutineWait = {
   since: number
   /** What it waits on, e.g. `WebFetch example.com`. */
   label: string
+  /** What the person is told when the wait counts, e.g. `Waiting for your OK: WebFetch example.com`. */
+  message: string
+  /**
+   * Whether the person has been told, and the wait counted: at once for a
+   * question, after `waitToastAfterSeconds` for a permission ask, which the
+   * engine may still decide by itself before then.
+   */
+  isTold: boolean
 }
 
 /** A scheduled-task run in progress in this session. */
@@ -12,9 +20,9 @@ export type RoutineRun = {
   name: string
   /** When the routine's first prompt arrived. */
   startedAt: number
-  /** How many times it has stopped to wait on the person. */
+  /** How many times it has stopped to wait on the person: the waits told of. */
   waits: number
-  /** The waits still open, by tool_use_id. */
+  /** The waits still open, by tool_use_id, told of or not yet. */
   waiting: Record<string, RoutineWait>
 }
 
@@ -30,6 +38,8 @@ export type RoutineSettings = {
   allowWebReads: boolean
   notifyCommand: string
   notifyOnFinish: boolean
+  /** How long a permission ask stands before the person is told, in seconds; 0 tells at once. */
+  waitToastAfterSeconds: number
 }
 
 declare module 'claude-code' {

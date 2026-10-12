@@ -1,4 +1,4 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { RoutineRun, RoutineSession, RoutineSettings } from '../types'
 import {
@@ -8,6 +8,7 @@ import {
   detectRoutine,
   finishMessage,
   firstQuestion,
+  oldestWait,
   osascriptArgv,
   statusLine,
 } from './routine'
@@ -25,8 +26,16 @@ const NOT_FIRST = new Set(['plugin', 'task-notification', 'observer', 'observer-
 const TICK_MS = 15_000
 /** How long a notification command may take. */
 const NOTIFY_TIMEOUT_MS = 15_000
+/** How long a permission ask stands before the person is told, in seconds, when the option is unset or invalid. */
+const WAIT_TOAST_AFTER_S = 20
 
-let config: RoutineSettings = { notifyMac: true, allowWebReads: false, notifyCommand: '', notifyOnFinish: true }
+let config: RoutineSettings = {
+  notifyMac: true,
+  allowWebReads: false,
+  notifyCommand: '',
+  notifyOnFinish: true,
+  waitToastAfterSeconds: WAIT_TOAST_AFTER_S,
+}
 /**
  * What the session is, kept here and changed synchronously so concurrent hooks
  * never race; mirrored to `$.state` only so a hot reload can pick it up again.
@@ -36,6 +45,8 @@ let config: RoutineSettings = { notifyMac: true, allowWebReads: false, notifyCom
 let memory: RoutineSession = UNDECIDED
 let restoring: Promise<void> | null = null
 let ticker: { cancel: () => void } | null = null
+/** The timers that will tell the person of a wait still open when its time comes, by tool_use_id. */
+let pending = new Map<string, Timer>()
 /** The status line last shown, so an unchanged line is not set again. */
 let shownStatus: string | undefined = undefined
 
@@ -52,9 +63,26 @@ async function restore($: Engine) {
     const { value } = await $.state.get(SESSION)
     if (value && !memory.isDecided) {
       memory = value
+      if (value.run) {
+        await rearm($, value.run)
+      }
     }
   } catch (error) {
     await debug($, `could not restore the session: ${String(error)}`)
+  }
+}
+
+/** A reload drops a run's timers: arms them again, for the waits not told of yet and for the status line. */
+async function rearm($: Engine, run: RoutineRun) {
+  const now = await $.clock.now()
+  for (const [id, wait] of Object.entries(run.waiting)) {
+    // Strict: a wait kept by an older version, with no flag, was told of at once.
+    if (wait.isTold === false) {
+      tellLater($, id, wait.since + config.waitToastAfterSeconds * 1000 - now)
+    }
+  }
+  if (oldestWait(run)) {
+    ensureTicker($)
   }
 }
 
@@ -96,7 +124,7 @@ function stopTicker() {
 async function tick($: Engine) {
   await showStatus($)
   const run = await currentRun($)
-  if (!run || Object.keys(run.waiting).length === 0) {
+  if (!run || !oldestWait(run)) {
     stopTicker()
   }
 }
@@ -142,24 +170,61 @@ function notify($: Engine, run: RoutineRun, message: string) {
   void sendOut($, run, message)
 }
 
-/** Opens a wait for one tool call and tells the person, once per call. */
-async function beginWait($: Engine, id: string, label: string, message: string) {
+/** Tells the person of a wait still open, once, and counts it; from then on the status line shows it. */
+async function tell($: Engine, id: string) {
+  pending.delete(id)
+  const { run } = await load($)
+  const wait = run?.waiting[id]
+  if (!run || !wait || wait.isTold) {
+    return
+  }
+  const told: RoutineRun = { ...run, waits: run.waits + 1, waiting: { ...run.waiting, [id]: { ...wait, isTold: true } } }
+  await save($, { ...memory, run: told })
+  ensureTicker($)
+  await showStatus($)
+  notify($, told, wait.message)
+}
+
+/** Tells the person of the wait in `inMs` milliseconds, unless it closes first. */
+function tellLater($: Engine, id: string, inMs: number) {
+  pending.get(id)?.cancel()
+  pending.set(id, $.clock.after(Math.max(0, inMs), () => void tell($, id)))
+}
+
+/** Stops the timers of the waits named (every one when none are named), so a closed wait is never told of. */
+function forget(ids?: readonly string[]) {
+  for (const [id, timer] of pending) {
+    if (!ids || ids.includes(id)) {
+      timer.cancel()
+      pending.delete(id)
+    }
+  }
+}
+
+/**
+ * Opens a wait for one tool call. A question is told of at once; a permission
+ * ask only once it has stood `afterMs`, since in auto mode the engine decides
+ * most asks by itself within seconds, and those are no wait on the person.
+ */
+async function beginWait($: Engine, id: string, label: string, message: string, afterMs: number) {
   const now = await $.clock.now()
   const { run } = await load($)
   if (!run || run.waiting[id] !== undefined) {
     return
   }
-  const waiting = { ...run.waiting, [id]: { since: now, label } }
-  const opened: RoutineRun = { ...run, waits: run.waits + 1, waiting }
-  await save($, { ...memory, run: opened })
-  ensureTicker($)
-  await showStatus($)
-  notify($, opened, message)
+  const waiting = { ...run.waiting, [id]: { since: now, label, message, isTold: false } }
+  await save($, { ...memory, run: { ...run, waiting } })
+  if (afterMs > 0) {
+    tellLater($, id, afterMs)
+  } else {
+    await tell($, id)
+  }
 }
 
 /** Closes the waits named (every open one when none are named). */
 async function endWaits($: Engine, ids?: readonly string[]) {
   const { run } = await load($)
+  forget(ids)
   const open = run ? Object.keys(run.waiting) : []
   const closing = ids ? open.filter(id => ids.includes(id)) : open
   if (!run || closing.length === 0) {
@@ -174,18 +239,23 @@ async function endWaits($: Engine, ids?: readonly string[]) {
 }
 
 export const register: Register = (on, options) => {
+  const seconds = options.waitToastAfterSeconds
   config = {
     notifyMac: options.notifyMac !== false,
     allowWebReads: options.allowWebReads === true,
     notifyCommand: typeof options.notifyCommand === 'string' ? options.notifyCommand : '',
     notifyOnFinish: options.notifyOnFinish !== false,
+    waitToastAfterSeconds: typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0 ? seconds : WAIT_TOAST_AFTER_S,
   }
   memory = UNDECIDED
   restoring = null
   ticker = null
+  pending = new Map()
   shownStatus = undefined
 
   on('session.start', async ($, e, next) => {
+    // Not awaited: a run a reload interrupted gets its timers back without holding the start up.
+    void load($)
     await $.command.register({
       name: 'routine',
       description: 'This routine run: its name, when it started, how often it waited on you, the settings',
@@ -230,7 +300,7 @@ export const register: Register = (on, options) => {
     // A query (`$.tool.check`) carries no call id: nothing waits on it.
     if (e.tool_use_id !== undefined) {
       const label = describeCall(e.tool, e.input)
-      await beginWait($, e.tool_use_id, label, `Waiting for your OK: ${label}`)
+      await beginWait($, e.tool_use_id, label, `Waiting for your OK: ${label}`, config.waitToastAfterSeconds * 1000)
     }
     return verdict
   })
@@ -243,7 +313,7 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     if (e.tool === 'AskUserQuestion') {
-      await beginWait($, id, 'AskUserQuestion', `Question for you: ${firstQuestion(e)}`)
+      await beginWait($, id, 'AskUserQuestion', `Question for you: ${firstQuestion(e)}`, 0)
     }
     try {
       return await next(e)
@@ -270,6 +340,7 @@ export const register: Register = (on, options) => {
     const { isDecided, run } = await load($)
     if (run) {
       stopTicker()
+      forget()
       if (config.notifyOnFinish) {
         const message = finishMessage(run, await $.clock.now())
         $.ui.toast(message)

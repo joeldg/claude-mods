@@ -20,7 +20,13 @@ const PROMPT =
   '<scheduled-task name="daily-report" file="/Users/me/.claude/scheduled-tasks/daily-report/SKILL.md">\n' +
   'Gather the morning headlines and write the digest.\n</scheduled-task>'
 
-const SETTINGS: RoutineSettings = { notifyMac: true, allowWebReads: false, notifyCommand: '', notifyOnFinish: true }
+const SETTINGS: RoutineSettings = {
+  notifyMac: true,
+  allowWebReads: false,
+  notifyCommand: '',
+  notifyOnFinish: true,
+  waitToastAfterSeconds: 20,
+}
 
 const run = (changes: Partial<RoutineRun> = {}): RoutineRun => ({
   name: 'daily-report',
@@ -28,6 +34,14 @@ const run = (changes: Partial<RoutineRun> = {}): RoutineRun => ({
   waits: 0,
   waiting: {},
   ...changes,
+})
+
+/** An open wait on a permission ask, told to the person unless said otherwise. */
+const wait = (since: number, label: string, isTold = true) => ({
+  since,
+  label,
+  message: `Waiting for your OK: ${label}`,
+  isTold,
 })
 
 test('routineName reads the scheduled task tag', () => {
@@ -138,17 +152,20 @@ test('formatDuration says seconds, minutes, then hours', () => {
   expect(formatDuration(-5)).toBe('0s')
 })
 
-test('statusLine names the routine and the oldest open wait', () => {
+test('statusLine names the routine and the oldest open wait the person has been told of', () => {
   expect(statusLine(run(), 1_000)).toBe('routine: daily-report')
   const waiting = run({
     waits: 2,
     waiting: {
-      a: { since: 100_000, label: 'Bash ls' },
-      b: { since: 40_000, label: 'WebFetch example.com' },
+      a: wait(100_000, 'Bash ls'),
+      b: wait(40_000, 'WebFetch example.com'),
+      // Younger than the threshold: the engine may still decide it, so it is not shown.
+      c: wait(10_000, 'Write digest.md', false),
     },
   })
   expect(statusLine(waiting, 60_000)).toBe('routine: daily-report · waiting on you <1m')
   expect(statusLine(waiting, 40_000 + 3 * 60_000 + 10_000)).toBe('routine: daily-report · waiting on you 3m')
+  expect(statusLine(run({ waiting: { c: wait(10_000, 'Write digest.md', false) } }), 15_000)).toBe('routine: daily-report')
 })
 
 test('finishMessage says how long and how often it waited', () => {
@@ -166,18 +183,21 @@ test('describeRun shows the run and the settings, never the push command', () =>
   expect(describeRun(null, settings, 0)).toBe(
     [
       'Not a routine session: routine-watch acts only in scheduled-task runs.',
-      'Settings: Mac notifications on · web reads ask (allowWebReads off) · phone push on · finish notice on',
+      'Settings: Mac notifications on · web reads ask (allowWebReads off) · phone push on · finish notice on · waits notify after 20s',
     ].join('\n'),
   )
-  const busy = run({ waits: 2, waiting: { t1: { since: 5 * 60_000, label: 'WebFetch example.com' } } })
-  expect(describeRun(busy, { ...SETTINGS, allowWebReads: true, notifyMac: false }, 8 * 60_000)).toBe(
+  const busy = run({ waits: 2, waiting: { t1: wait(5 * 60_000, 'WebFetch example.com') } })
+  expect(describeRun(busy, { ...SETTINGS, allowWebReads: true, notifyMac: false, waitToastAfterSeconds: 0 }, 8 * 60_000)).toBe(
     [
       'Routine: daily-report',
       'Started 8m ago',
       'Waited on you 2 times · waiting now for 3m: WebFetch example.com',
-      'Settings: Mac notifications off · web reads allowed (allowWebReads on) · phone push off · finish notice on',
+      'Settings: Mac notifications off · web reads allowed (allowWebReads on) · phone push off · finish notice on · waits notify at once',
     ].join('\n'),
   )
   expect(describeRun(run(), SETTINGS, 0).split('\n')[2]).toBe('Has not waited on you')
+  // A wait the person has not been told of yet is not a wait on them.
+  const young = run({ waiting: { t1: wait(0, 'Bash ls', false) } })
+  expect(describeRun(young, SETTINGS, 5_000).split('\n')[2]).toBe('Has not waited on you')
   expect(describeRun(run(), settings, 0)).not.toContain('secret-topic')
 })

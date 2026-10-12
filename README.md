@@ -185,12 +185,15 @@ Settings: focus labels, refresh minutes, and whether to brief Claude.
 Keeps scheduled routines (daily digests, newsletters) from silently stalling while you're away.
 
 - Knows a session is a routine from its scheduled-task prompt, and does nothing in your other sessions.
-- When a routine stops to wait for your OK on a permission prompt or an `AskUserQuestion`, you get a Mac notification and a toast, and the status line shows `routine: daily-report · waiting on you 3m`.
-- When a turn ends in an error, or the routine finishes, you get a notification: `Routine daily-report finished after 23m · waited on you 2 times`.
+- When a routine stops to wait for your OK on a permission prompt, you get a Mac notification and a toast, and the status line shows `routine: daily-report · waiting on you 3m` — but only once the wait has stood 20 s (`waitToastAfterSeconds`). In auto mode the engine decides most permission asks by itself within a few seconds; those are never reported or counted. The notification, the status line and the wait count all change at that same moment, once per wait.
+- An `AskUserQuestion` is always for you, so it is reported at once.
+- When a turn ends in an error, or the routine finishes, you get a notification: `Routine daily-report finished after 23m · waited on you 2 times` (the waits you were told of).
 - **Phone push (optional):** `notifyCommand` runs a command on the same events, e.g. `curl -s -d {message} ntfy.sh/your-topic`. `{title}` and `{message}` are filled in as single arguments, never through a shell.
 - **`allowWebReads` (off by default):** lets routines use WebFetch and WebSearch without asking. It only replaces a prompt; your deny rules still apply, and nothing else is ever auto-allowed.
 - `/routine` shows the routine's name, how long it has run, its waits, and the settings.
 - Makes no model calls.
+
+Settings: Mac notification (on), phone push command (empty), notify on finish (on), `allowWebReads` (off), `waitToastAfterSeconds` (20; 0 reports every ask at once).
 
 ## second-opinion
 

@@ -1,4 +1,4 @@
-import type { RoutineRun, RoutineSettings } from '../types'
+import type { RoutineRun, RoutineSettings, RoutineWait } from '../types'
 
 /** The name a routine gets when its prompt carries no name of its own. */
 export const UNNAMED = 'scheduled task'
@@ -129,18 +129,18 @@ export const formatDuration = (ms: number): string => {
   return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`
 }
 
-/** The open wait that began first, or null. */
-export const oldestWait = (run: RoutineRun): { since: number; label: string } | null => {
-  let oldest: { since: number; label: string } | null = null
+/** The open wait the person has been told of that began first, or null. */
+export const oldestWait = (run: RoutineRun): RoutineWait | null => {
+  let oldest: RoutineWait | null = null
   for (const wait of Object.values(run.waiting)) {
-    if (!oldest || wait.since < oldest.since) {
+    if (wait.isTold && (!oldest || wait.since < oldest.since)) {
       oldest = wait
     }
   }
   return oldest
 }
 
-/** `routine: <name>`, or `routine: <name> · waiting on you 3m` while a wait is open. */
+/** `routine: <name>`, or `routine: <name> · waiting on you 3m` while a wait the person has been told of is open. */
 export const statusLine = (run: RoutineRun, now: number): string => {
   const wait = oldestWait(run)
   if (!wait) {
@@ -164,6 +164,7 @@ export const describeSettings = (settings: RoutineSettings): string =>
     settings.allowWebReads ? 'web reads allowed (allowWebReads on)' : 'web reads ask (allowWebReads off)',
     `phone push ${settings.notifyCommand.trim() ? 'on' : 'off'}`,
     `finish notice ${settings.notifyOnFinish ? 'on' : 'off'}`,
+    settings.waitToastAfterSeconds > 0 ? `waits notify after ${settings.waitToastAfterSeconds}s` : 'waits notify at once',
   ].join(' · ')
 
 /** What /routine prints. */

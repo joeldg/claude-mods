@@ -80,7 +80,7 @@ const typed = (command: string, args = '') => ({
 
 const endSession = { reason: 'other' as const, sessionId: 's1', resume: { id: 's1' } }
 
-test('outside a routine an ask is left alone: no notification, toast or status', async ($, on) => {
+test('outside a routine an ask is left alone: no notification, toast or status', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   await $.prompt.submit({ text: 'Fix the flaky test', wait: false, origin: { kind: 'composer' } })
@@ -98,7 +98,7 @@ test('outside a routine an ask is left alone: no notification, toast or status',
   expect((await $.command.run(typed('routine'))).text).toMatch(/^Not a routine session/)
 })
 
-test('a later prompt with the tag does not make a session a routine', async ($, on) => {
+test('a later prompt with the tag does not make a session a routine', { timeoutMs: 30_000 }, async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on)
   await $.prompt.submit({ text: 'hello', wait: false, origin: { kind: 'composer' } })
@@ -107,7 +107,7 @@ test('a later prompt with the tag does not make a session a routine', async ($, 
   expect(w.toasts).toEqual([])
 })
 
-test('in a routine an ask notifies once: osascript, a toast and the status line', async ($, on) => {
+test('in a routine an ask that stands 20 s notifies once: osascript, a toast and the status line', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on)
   await startRoutine($)
@@ -116,17 +116,23 @@ test('in a routine an ask notifies once: osascript, a toast and the status line'
   const verdict = await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_1' })
   expect(verdict.decision).toBe('ask')
   await clock.settle()
+  // Not yet: in auto mode the engine decides most asks by itself within seconds.
+  expect(w.argv).toEqual([])
+  expect(w.toasts).toEqual([])
+  expect(w.statuses).toEqual(['routine: daily-report'])
+
+  await clock.advance(25_000)
   expect(w.argv).toEqual([osascript('Waiting for your OK: WebFetch example.com')])
   expect(w.toasts).toEqual(['Waiting for your OK: WebFetch example.com'])
   expect(w.statuses.at(-1)).toBe('routine: daily-report · waiting on you <1m')
 
-  // The same call checked again is not a second wait.
+  // The same call checked again is not a second wait, and later ticks never tell again.
   await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_1' })
-  await clock.settle()
+  await clock.advance(60_000)
   expect(w.argv).toHaveLength(1)
   expect(w.toasts).toHaveLength(1)
 
-  await clock.advance(3 * 60_000)
+  await clock.advance(2 * 60_000)
   expect(w.statuses.at(-1)).toBe('routine: daily-report · waiting on you 3m')
   const shown = await $.command.run(typed('routine'))
   expect(shown.text).toBe(
@@ -134,43 +140,135 @@ test('in a routine an ask notifies once: osascript, a toast and the status line'
       'Routine: daily-report',
       'Started 3m ago',
       'Waited on you 1 time · waiting now for 3m: WebFetch example.com',
-      'Settings: Mac notifications on · web reads ask (allowWebReads off) · phone push off · finish notice on',
+      'Settings: Mac notifications on · web reads ask (allowWebReads off) · phone push off · finish notice on · waits notify after 20s',
     ].join('\n'),
   )
 })
 
-test('the wait ends when the tool call it held up finishes', async ($, on) => {
+test('a wait closed within 3 s by the call it held up finishing notifies nobody and is not counted', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   let check: Promise<unknown> = Promise.resolve()
-  // The engine's own order: the call's permission check runs inside it.
+  // The engine's own order: the call's permission check runs inside it, then the tool.
   on('tool.call', { tool: 'Bash' }, async () => {
     await check
+    await clock.sleep(3_000)
     return { result: { stdout: 'ok', stderr: '', interrupted: false }, text: 'ok' }
   })
   await startRoutine($)
 
   check = $.tool.check({ tool: 'Bash', input: { command: 'git push' }, tool_use_id: 'toolu_b' })
-  await $.tool.call({ tool: 'Bash', command: 'git push', tool_use_id: 'toolu_b' })
-  await clock.settle()
-  expect(w.toasts).toEqual(['Waiting for your OK: Bash git push'])
-  expect(w.statuses).toEqual(['routine: daily-report', 'routine: daily-report · waiting on you <1m', 'routine: daily-report'])
-  expect((await $.command.run(typed('routine'))).text).toContain('Waited on you 1 time\n')
+  const call = $.tool.call({ tool: 'Bash', command: 'git push', tool_use_id: 'toolu_b' })
+  await clock.advance(3_000)
+  await call
+  await clock.advance(60_000)
+  expect(w.toasts).toEqual([])
+  expect(w.argv).toEqual([])
+  expect(w.statuses).toEqual(['routine: daily-report'])
+  expect((await $.command.run(typed('routine'))).text).toContain('\nHas not waited on you\n')
 })
 
-test('a query with no call id, and a call the engine allows, notify nobody', async ($, on) => {
+test('a wait the turn moves on from within 3 s notifies nobody', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  await startRoutine($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_1' })
+  await clock.advance(3_000)
+  await $.turn.complete({ answer: 'done', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.advance(60_000)
+  expect(w.toasts).toEqual([])
+  expect(w.argv).toEqual([])
+  expect(w.statuses).toEqual(['routine: daily-report'])
+})
+
+test('three waits open at once are each told once, in the order they began', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  await startRoutine($)
+  await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_1' })
+  await clock.advance(5_000)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_2' })
+  await clock.advance(5_000)
+  await $.tool.check({ tool: 'Write', input: { file_path: '/home/dev/app/digest.md', content: '' }, tool_use_id: 'toolu_3' })
+
+  await clock.advance(12_000)
+  expect(w.toasts).toEqual(['Waiting for your OK: WebFetch example.com'])
+  await clock.advance(10_000)
+  const told = ['Waiting for your OK: WebFetch example.com', 'Waiting for your OK: Bash ls', 'Waiting for your OK: Write digest.md']
+  expect(w.toasts).toEqual(told)
+  expect(w.argv).toEqual(told.map(message => osascript(message)))
+  expect(w.statuses.at(-1)).toBe('routine: daily-report · waiting on you <1m')
+
+  await clock.advance(60_000)
+  expect(w.toasts).toHaveLength(3)
+  expect(w.argv).toHaveLength(3)
+  expect((await $.command.run(typed('routine'))).text).toContain('\nWaited on you 3 times · waiting now for 1m: WebFetch example.com\n')
+})
+
+test('waitToastAfterSeconds sets how long an ask may stand before you are told', { options: { waitToastAfterSeconds: 5 }, timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  await startRoutine($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_1' })
+  await clock.advance(4_000)
+  expect(w.toasts).toEqual([])
+  expect(w.statuses).toEqual(['routine: daily-report'])
+  await clock.advance(2_000)
+  expect(w.toasts).toEqual(['Waiting for your OK: Bash ls'])
+  expect(w.argv).toEqual([osascript('Waiting for your OK: Bash ls')])
+  expect(w.statuses.at(-1)).toBe('routine: daily-report · waiting on you <1m')
+  expect((await $.command.run(typed('routine'))).text).toContain('waits notify after 5s')
+})
+
+test('waitToastAfterSeconds 0 tells you of every ask at once', { options: { waitToastAfterSeconds: 0 }, timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  await startRoutine($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_1' })
+  await clock.settle()
+  expect(w.toasts).toEqual(['Waiting for your OK: Bash ls'])
+  expect(w.argv).toEqual([osascript('Waiting for your OK: Bash ls')])
+  expect(w.statuses.at(-1)).toBe('routine: daily-report · waiting on you <1m')
+  expect((await $.command.run(typed('routine'))).text).toContain('waits notify at once')
+})
+
+test('after a reload a wait left open, not yet told, is still told when its time comes', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 5_000 })
+  const w = world(on)
+  // What the session kept before the reload: a routine with an ask 5 s old.
+  const kept = {
+    isDecided: true,
+    run: {
+      name: 'daily-report',
+      startedAt: 0,
+      waits: 0,
+      waiting: { toolu_1: { since: 0, label: 'Bash ls', message: 'Waiting for your OK: Bash ls', isTold: false } },
+    },
+  }
+  on('state.get', () => ({ value: { value: kept, version: 1 } }))
+
+  expect((await $.command.run(typed('routine'))).text).toContain('\nHas not waited on you\n')
+  await clock.advance(10_000)
+  expect(w.toasts).toEqual([])
+  await clock.advance(10_000)
+  expect(w.toasts).toEqual(['Waiting for your OK: Bash ls'])
+  expect(w.argv).toEqual([osascript('Waiting for your OK: Bash ls')])
+  expect(w.statuses.at(-1)).toBe('routine: daily-report · waiting on you <1m')
+})
+
+test('a query with no call id, and a call the engine allows, notify nobody', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   w.verdicts.Read = 'allow'
   await startRoutine($)
   await $.tool.check({ tool: 'WebFetch', input: FETCH })
-  await $.tool.check({ tool: 'Read', input: { file_path: '/Users/me/project/a.md' }, tool_use_id: 'toolu_r' })
-  await clock.settle()
+  await $.tool.check({ tool: 'Read', input: { file_path: '/home/dev/app/a.md' }, tool_use_id: 'toolu_r' })
+  await clock.advance(60_000)
   expect(w.argv).toEqual([])
   expect(w.toasts).toEqual([])
 })
 
-test('with allowWebReads on, WebFetch and WebSearch are allowed quietly and Bash still asks', { options: { allowWebReads: true } }, async ($, on) => {
+test('with allowWebReads on, WebFetch and WebSearch are allowed quietly and Bash still asks', { options: { allowWebReads: true }, timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   await startRoutine($)
@@ -180,17 +278,17 @@ test('with allowWebReads on, WebFetch and WebSearch are allowed quietly and Bash
   expect(fetch.reason).toMatch(/allowWebReads/)
   const search = await $.tool.check({ tool: 'WebSearch', input: { query: 'markets today' }, tool_use_id: 'toolu_s' })
   expect(search.decision).toBe('allow')
-  await clock.settle()
+  await clock.advance(60_000)
   expect(w.argv).toEqual([])
   expect(w.toasts).toEqual([])
 
   const bash = await $.tool.check({ tool: 'Bash', input: { command: 'curl https://example.com' }, tool_use_id: 'toolu_b' })
   expect(bash.decision).toBe('ask')
-  await clock.settle()
+  await clock.advance(25_000)
   expect(w.argv).toEqual([osascript('Waiting for your OK: Bash curl https://example.com')])
 })
 
-test('with allowWebReads on, a rule that denies WebFetch still denies, and outside a routine it asks', { options: { allowWebReads: true } }, async ($, on) => {
+test('with allowWebReads on, a rule that denies WebFetch still denies, and outside a routine it asks', { options: { allowWebReads: true }, timeoutMs: 30_000 }, async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on)
   expect((await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_0' })).decision).toBe('ask')
@@ -200,16 +298,17 @@ test('with allowWebReads on, a rule that denies WebFetch still denies, and outsi
   expect((await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_1' })).decision).toBe('deny')
 })
 
-test('allowWebReads is off by default: WebFetch asks and notifies', async ($, on) => {
+test('allowWebReads is off by default: WebFetch asks and notifies', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   await startRoutine($)
   expect((await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_1' })).decision).toBe('ask')
-  await clock.settle()
+  await clock.advance(25_000)
   expect(w.toasts).toEqual(['Waiting for your OK: WebFetch example.com'])
 })
 
-test('AskUserQuestion notifies once while the question is open', async ($, on) => {
+// A question is always for the person, so it is told at once, however long asks may stand.
+test('AskUserQuestion notifies once, at once, while the question is open', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   let answer = () => {}
@@ -238,7 +337,7 @@ test('AskUserQuestion notifies once while the question is open', async ($, on) =
   expect(w.statuses.at(-1)).toBe('routine: daily-report')
 })
 
-test('a turn that ends on an error notifies', async ($, on) => {
+test('a turn that ends on an error notifies', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   await startRoutine($)
@@ -252,7 +351,7 @@ test('a turn that ends on an error notifies', async ($, on) => {
   expect(w.argv).toEqual([osascript('The run stopped: its turn ended on an error.')])
 })
 
-test('the session end says how long the routine ran and how often it waited', async ($, on) => {
+test('the session end says how long the routine ran and how often it waited', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 5_000 })
   const w = world(on)
   await startRoutine($)
@@ -273,7 +372,7 @@ test('the session end says how long the routine ran and how often it waited', as
   expect(w.statuses).toHaveLength(shown)
 })
 
-test('with notifyOnFinish off the end is quiet', { options: { notifyOnFinish: false } }, async ($, on) => {
+test('with notifyOnFinish off the end is quiet', { options: { notifyOnFinish: false }, timeoutMs: 30_000 }, async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on)
   await startRoutine($)
@@ -282,52 +381,52 @@ test('with notifyOnFinish off the end is quiet', { options: { notifyOnFinish: fa
   expect(w.toasts).toEqual([])
 })
 
-test('notifyCommand runs beside osascript with the title and message as single arguments', { options: { notifyCommand: 'curl -s -H Title:{title} -d {message} ntfy.sh/my-topic' } }, async ($, on) => {
+test('notifyCommand runs beside osascript with the title and message as single arguments', { options: { notifyCommand: 'curl -s -H Title:{title} -d {message} ntfy.sh/my-topic' }, timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   await startRoutine($)
   await $.tool.check({ tool: 'Bash', input: { command: 'echo hi; rm -rf /' }, tool_use_id: 'toolu_1' })
-  await clock.settle()
+  await clock.advance(25_000)
   expect(w.argv).toEqual([
     osascript('Waiting for your OK: Bash echo hi; rm -rf /'),
     ['curl', '-s', '-H', `Title:${TITLE}`, '-d', 'Waiting for your OK: Bash echo hi; rm -rf /', 'ntfy.sh/my-topic'],
   ])
 })
 
-test('with notifyMac off only the push command and the toast are used, and a failing push is harmless', { options: { notifyMac: false, notifyCommand: 'push {message}' } }, async ($, on) => {
+test('with notifyMac off only the push command and the toast are used, and a failing push is harmless', { options: { notifyMac: false, notifyCommand: 'push {message}' }, timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   w.exits.push = 1
   await startRoutine($)
   const verdict = await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_1' })
-  await clock.settle()
+  await clock.advance(25_000)
   expect(verdict.decision).toBe('ask')
   expect(w.argv).toEqual([['push', 'Waiting for your OK: WebFetch example.com']])
   expect(w.toasts).toEqual(['Waiting for your OK: WebFetch example.com'])
 })
 
-test('a first prompt a schedule fired counts as a routine even without the tag', async ($, on) => {
+test('a first prompt a schedule fired counts as a routine even without the tag', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   await $.prompt.submit({ text: 'check the feeds', wait: false, origin: { kind: 'scheduled-trigger' } })
   expect(w.statuses).toEqual(['routine: scheduled task'])
   await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_1' })
-  await clock.settle()
+  await clock.advance(25_000)
   expect(w.argv).toEqual([osascript('Waiting for your OK: WebFetch example.com', 'Claude routine: scheduled task')])
 })
 
-test('a quote in the routine name cannot break out of the AppleScript string', async ($, on) => {
+test('a quote in the routine name cannot break out of the AppleScript string', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   await startRoutine($, '<scheduled-task name="say &quot;hi&quot; \\ bye">go</scheduled-task>')
   await $.tool.check({ tool: 'WebFetch', input: FETCH, tool_use_id: 'toolu_1' })
-  await clock.settle()
+  await clock.advance(25_000)
   expect(w.argv[0]?.[2]).toBe(
     'display notification "Waiting for your OK: WebFetch example.com" with title "Claude routine: say \\"hi\\" \\\\ bye" sound name "Glass"',
   )
 })
 
-test('overlapping waits each notify; the status shows the oldest; the turn end closes any left open', async ($, on) => {
+test('overlapping waits each notify; the status shows the oldest; the turn end closes any left open', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
   await startRoutine($)
@@ -336,6 +435,8 @@ test('overlapping waits each notify; the status shows the oldest; the turn end c
   await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_2' })
   await clock.advance(60_000)
   expect(w.toasts).toEqual(['Waiting for your OK: WebFetch example.com', 'Waiting for your OK: Bash ls'])
+  // The status line is refreshed every 15 s, from the moment the first wait was told of.
+  await clock.advance(15_000)
   expect(w.statuses.at(-1)).toBe('routine: daily-report · waiting on you 3m')
 
   await $.turn.complete({ answer: 'done', durationMs: 10, isAborted: true, turnId: 't1', reason: 'aborted' })
