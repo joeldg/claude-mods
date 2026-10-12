@@ -292,6 +292,16 @@ export function asForgotten(json: Json): { docs: number; sessions: number } {
   return { docs: num(forgotten), sessions: 0 }
 }
 
+/** `last-update.json`, as the engine leaves it beside the index after a complete update; null when the text is not one. */
+export function asLastUpdate(text: string): { ts: number; docs: number; sessions: number; by: number } | null {
+  const json = parseEngineJson(text)
+  if (json === null) {
+    return null
+  }
+  const ts = msOf(json.ts)
+  return ts > 0 ? { ts, docs: num(json.docs), sessions: num(json.sessions), by: num(json.by) } : null
+}
+
 // ---------------------------------------------------------------------------
 // Secrets: the engine masks them as it indexes; this is a second pass over
 // everything shown or handed to the model.

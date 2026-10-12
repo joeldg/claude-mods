@@ -477,6 +477,7 @@ test('/recall timeline and the lists show in the pane; stats, reindex and help a
   const help = await recall($, 'help')
   expect(help).toContain('ask <question>')
   expect(help).toContain('one Haiku call (claude-haiku-4-5-20251001), billed to your usage')
+  expect(help).toContain('  ledger                         what this session has settled so far')
   expect(await recall($, '')).toBe(help)
 
   expect(await recall($, 'reindex')).toBe(

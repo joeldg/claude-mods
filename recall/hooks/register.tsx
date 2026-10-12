@@ -6,12 +6,15 @@ import {
   KINDS,
   LIST_KINDS,
   MAX_LIMIT,
+  NICE,
   configFrom,
+  dirOf,
   engineArgv,
   expandArgs,
   expandHome,
   expandInput,
   forgetArgs,
+  ledgerPath,
   listArgs,
   listInput,
   noteArgs,
@@ -23,6 +26,7 @@ import {
   routinesOf,
   searchArgs,
   searchInput,
+  sidecarPath,
   timelineArgs,
   updateArgs,
 } from './args'
@@ -31,9 +35,11 @@ import {
   ASK_FILL,
   ASK_SYSTEM,
   RECAP_FILL,
+  agoOf,
   answerBlock,
   asExpand,
   asForgotten,
+  asLastUpdate,
   asListItems,
   asNote,
   asProjects,
@@ -72,6 +78,8 @@ import {
   takeLines,
 } from './format'
 import type { ListOutcome, SearchOutcome } from './format'
+import { LEDGER_BLOCK, emptyLedger, emptyPending, hasContent, ingest, ledgerBlock, ledgerText, parseLedger, serializeLedger } from './ledger'
+import type { Ledger, Pending, Row } from './ledger'
 import { askQuery, extractRefs, isStrongHit, relatedQuery, undismissed } from './refs'
 import { isBlankTree, lastBandTree, paneTree, relatedBandTree } from './view'
 import type { PaneActions } from './view'
@@ -113,6 +121,8 @@ const ASK_PROMPT_CHARS = 24_000
 const MAX_ARMED = 6
 /** The same warning toasts again after this long, and a background one never. */
 const WARN_REPEAT_MS = 60_000
+/** The ledger is written this long after a change, once per burst of changes. */
+const LEDGER_WRITE_MS = 2_000
 
 const view = atom({ plugin: 'recall', key: 'view' } as const, null)
 const armed = atom({ plugin: 'recall', key: 'armed' } as const, [])
@@ -137,6 +147,21 @@ let place: { cwd: string; root: string } | null = null
 let warned = new Map<string, number>()
 /** False until this environment has drawn its own status line once: a reload may leave the last one's. */
 let hasOwnStatus = false
+/** Whether /usr/bin/nice exists, read once per process; null until read. */
+let hasNice: boolean | null = null
+/** True once this process said why it skipped an update. */
+let hasSaidFresh = false
+/** What this session has settled so far, fed by every row appended to its conversation. */
+let ledger: Ledger = emptyLedger()
+let pending: Pending = emptyPending()
+let ledgerTimer: { cancel: () => void } | null = null
+let isLedgerDirty = false
+/** The ledger files this process wrote or read: their permissions are set once. */
+let ledgerFiles = new Set<string>()
+/** How often this conversation's context was read: the first time is its start, a later one follows a compaction. */
+let contextReads = 0
+/** True once a compaction row went by in this process. */
+let hasCompacted = false
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
@@ -172,9 +197,22 @@ async function dbFile($: Engine): Promise<string> {
 
 type Reply = { ok: true; json: Json } | { ok: false; error: string }
 
+/** Whether updates can run under nice: /usr/bin/nice exists on this host. */
+async function niceness($: Engine): Promise<boolean> {
+  if (hasNice === null) {
+    hasNice = await $.fs.exists(NICE).catch(() => false)
+  }
+  return hasNice
+}
+
+/** The engine's command line for an update: at the lowest priority when the host has nice. */
+async function updateArgv($: Engine, args: readonly string[]): Promise<string[]> {
+  return engineArgv(config, $.plugin.root, await dbFile($), args, { nice: await niceness($) })
+}
+
 /** Runs one engine command and reads its JSON; a failure is the engine's own words when it gave any. */
-async function engine($: Engine, args: readonly string[], timeoutMs = ENGINE_MS): Promise<Reply> {
-  const argv = engineArgv(config, $.plugin.root, await dbFile($), args)
+async function engine($: Engine, args: readonly string[], timeoutMs = ENGINE_MS, isUpdate = false): Promise<Reply> {
+  const argv = isUpdate ? await updateArgv($, args) : engineArgv(config, $.plugin.root, await dbFile($), args)
   let ran: ProcessRunResult
   try {
     ran = await $.process.run(argv, { timeoutMs })
@@ -223,6 +261,37 @@ async function currentSession($: Engine): Promise<string | null> {
 // ---------------------------------------------------------------------------
 // Indexing: at the start (with progress the first time), every few minutes, and as the session ends.
 
+/** The update another process completed under freshMinutes ago, from the sidecar the engine leaves beside the index. */
+async function freshUpdate($: Engine): Promise<{ ts: number; by: number } | null> {
+  if (config.freshMs <= 0) {
+    return null
+  }
+  const text = await $.fs.read(sidecarPath(await dbFile($))).catch(() => null)
+  const side = typeof text === 'string' ? asLastUpdate(text) : null
+  if (side === null) {
+    return null
+  }
+  return (await $.clock.now()) - side.ts < config.freshMs ? side : null
+}
+
+/** True when an automatic update can stand down behind another process's fresh one; said once per process. */
+async function skipsUpdate($: Engine): Promise<boolean> {
+  const fresh = await freshUpdate($)
+  if (fresh === null) {
+    return false
+  }
+  if (!hasSaidFresh) {
+    hasSaidFresh = true
+    const ago = agoOf(await $.clock.now(), fresh.ts)
+    const minutes = Math.round(config.freshMs / 60_000)
+    $.ui.log(
+      `recall: another process updated the index ${ago} (pid ${fresh.by}): this session skips its own updates while it is under ${minutes} min old`,
+      { to: 'debug' },
+    )
+  }
+  return true
+}
+
 /** A full index build or rebuild through `process.spawn`, its progress on the status line. */
 async function buildIndex($: Engine, rebuild: boolean): Promise<void> {
   if (isUpdating) {
@@ -235,7 +304,7 @@ async function buildIndex($: Engine, rebuild: boolean): Promise<void> {
   let errors = ''
   let pending = ''
   try {
-    const argv = engineArgv(config, $.plugin.root, await dbFile($), updateArgs(config, { progress: true, rebuild }))
+    const argv = await updateArgv($, updateArgs(config, { progress: true, rebuild }))
     const stream = $.process.spawn({ argv })
     for await (const chunk of stream) {
       if (chunk.stream === 'stdout') {
@@ -283,12 +352,12 @@ async function buildIndex($: Engine, rebuild: boolean): Promise<void> {
 
 /** A silent update of what changed, stopping itself after `seconds`. */
 async function quietUpdate($: Engine, seconds: number): Promise<void> {
-  if (isUpdating) {
+  if (isUpdating || (await skipsUpdate($))) {
     return
   }
   isUpdating = true
   try {
-    const reply = await engine($, updateArgs(config, { maxSeconds: seconds }), Math.min(600_000, (seconds + 90) * 1000))
+    const reply = await engine($, updateArgs(config, { maxSeconds: seconds }), Math.min(600_000, (seconds + 90) * 1000), true)
     if (!reply.ok) {
       await warn($, `recall: indexing failed: ${reply.error}`, Infinity)
       return
@@ -303,7 +372,10 @@ async function quietUpdate($: Engine, seconds: number): Promise<void> {
 
 /** At a session's end: an update with a short stop, left running on its own, as the session may not wait. */
 async function leaveUpdate($: Engine): Promise<void> {
-  const argv = engineArgv(config, $.plugin.root, await dbFile($), updateArgs(config, { maxSeconds: END_UPDATE_SECONDS }))
+  if (await skipsUpdate($)) {
+    return
+  }
+  const argv = await updateArgv($, updateArgs(config, { maxSeconds: END_UPDATE_SECONDS }))
   await $.process.run(['/bin/sh', '-c', 'nohup "$@" >/dev/null 2>&1 &', 'recall-update', ...argv], { timeoutMs: 1_000 })
 }
 
@@ -315,6 +387,10 @@ function ensureTimer($: Engine): void {
 
 /** The first index check: a build with progress when the index is empty, else a quiet update. */
 async function indexAtStart($: Engine): Promise<void> {
+  // Another session's recent update serves this one too.
+  if (await skipsUpdate($)) {
+    return
+  }
   const stats = await engine($, ['stats'])
   if (stats.ok && asStats(stats.json).docs > 0) {
     await quietUpdate($, START_UPDATE_SECONDS)
@@ -354,8 +430,92 @@ async function prepareLastBand($: Engine): Promise<void> {
 }
 
 async function startup($: Engine): Promise<void> {
+  await loadLedger($)
   await indexAtStart($)
   await prepareLastBand($)
+}
+
+// ---------------------------------------------------------------------------
+// The ledger: what this session has settled, kept beside the index and given back after a compaction.
+
+/** Where this session's ledger lives, when the id is a plain name. */
+async function ledgerFile($: Engine, session: string | null): Promise<string | null> {
+  return session !== null && /^[\w.-]{1,128}$/.test(session) ? ledgerPath(await dbFile($), session) : null
+}
+
+/** Writes the ledger when it changed; the file and its folder readable only by the user, set once per file. */
+async function persistLedger($: Engine, ending?: string): Promise<void> {
+  if (!isLedgerDirty) {
+    return
+  }
+  const session = ending ?? (await currentSession($))
+  const path = await ledgerFile($, session)
+  if (path === null || session === null) {
+    return
+  }
+  isLedgerDirty = false
+  try {
+    await $.fs.write(path, serializeLedger(ledger, { session, ts: await $.clock.now() }))
+  } catch (error) {
+    isLedgerDirty = true
+    throw error
+  }
+  if (!ledgerFiles.has(path)) {
+    ledgerFiles.add(path)
+    // `$.fs.write` takes no mode: the folder and the file are closed to others once, as the engine does for the index.
+    await $.process
+      .run(['/bin/chmod', 'go-rwx', dirOf(path), path], { timeoutMs: 5_000 })
+      .catch((error: unknown) => $.ui.log(`recall: the ledger's permissions were not set: ${messageOf(error)}`, { to: 'debug' }))
+  }
+}
+
+/** Reads one appended row into the ledger, and has it written soon. */
+function noteRow($: Engine, e: Row): void {
+  if (e.door === 'compaction' && e.agentId === undefined) {
+    hasCompacted = true
+  }
+  if (!ingest(ledger, pending, e)) {
+    return
+  }
+  isLedgerDirty = true
+  if (ledgerTimer === null) {
+    ledgerTimer = $.clock.after(LEDGER_WRITE_MS, () => {
+      ledgerTimer = null
+      settle($, persistLedger($))
+    })
+  }
+}
+
+/** The ledger a fresh process or a reload finds for this session. */
+async function loadLedger($: Engine): Promise<void> {
+  const path = await ledgerFile($, await currentSession($))
+  if (path === null || hasContent(ledger)) {
+    return
+  }
+  const text = await $.fs.read(path).catch(() => null)
+  const saved = typeof text === 'string' ? parseLedger(text) : null
+  if (saved !== null) {
+    ledger = saved
+    ledgerFiles.add(path)
+  }
+}
+
+/** The session's end: a pending write goes now, under the ending session's id. */
+async function flushLedger($: Engine, session: string): Promise<void> {
+  if (ledgerTimer !== null) {
+    ledgerTimer.cancel()
+    ledgerTimer = null
+  }
+  await persistLedger($, session)
+}
+
+/** /clear: the new conversation starts with an empty ledger and counts its context reads afresh. */
+function resetLedger(): void {
+  ledger = emptyLedger()
+  pending = emptyPending()
+  isLedgerDirty = false
+  contextReads = 0
+  hasCompacted = false
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +946,7 @@ function helpText(): string {
   return [
     'Usage: /recall <words>   search past sessions, this project first; the hits open in the Recall pane',
     "  last [n]                       where this project's last session(s) left off, with Send to Claude",
+    '  ledger                         what this session has settled so far: goal, open tasks, questions answered, files, PRs and commits; it comes back after a compaction',
     '  timeline [7d|30d|90d] [all]    sessions by day, in this project or in all of them',
     '  decisions | commands | files | prs | commits | issues | urls | tasks | notes [words]   one kind, newest first',
     `  ask <question>                 an answer from past sessions with citations: one ${label} call (${config.askModel}), billed to your usage`,
@@ -1073,6 +1234,8 @@ async function recallCommand($: Engine, args: string): Promise<string> {
       return statsCommand($)
     case 'reindex':
       return reindexCommand($)
+    case 'ledger':
+      return ledgerText(ledger)
     case 'forget':
       return forgetCommand($, request.target)
   }
@@ -1250,6 +1413,15 @@ export const register: Register = (on, options) => {
   place = null
   warned = new Map()
   hasOwnStatus = false
+  hasNice = null
+  hasSaidFresh = false
+  ledger = emptyLedger()
+  pending = emptyPending()
+  ledgerTimer = null
+  isLedgerDirty = false
+  ledgerFiles = new Set()
+  contextReads = 0
+  hasCompacted = false
 
   on('session.start', async ($, e, next) => {
     await registerTools($)
@@ -1276,10 +1448,12 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', async ($, e, next) => {
+    await flushLedger($, e.sessionId).catch((error: unknown) => $.ui.log(`recall: the ledger was not written: ${messageOf(error)}`, { to: 'debug' }))
     if (!isUpdating) {
       await leaveUpdate($).catch((error: unknown) => $.ui.log(`recall: no update at the end: ${messageOf(error)}`, { to: 'debug' }))
     }
     if (e.reason === 'clear') {
+      resetLedger()
       relatedRun += 1
       await update($, relatedBand, () => null)
       await update($, dismissed, () => [])
@@ -1355,6 +1529,29 @@ export const register: Register = (on, options) => {
       await hideLastBand($).catch((error: unknown) => $.ui.log(`recall: ${messageOf(error)}`, { to: 'debug' }))
     }
     return next(e)
+  })
+
+  // Every row the conversation keeps feeds the ledger; the row itself goes on untouched.
+  on('session.append', async ($, e, next) => {
+    try {
+      noteRow($, e)
+    } catch (error) {
+      $.ui.log(`recall: a row was not noted in the ledger: ${messageOf(error)}`, { to: 'debug' })
+    }
+    return next(e)
+  })
+
+  // The conversation's context is read once at its start (the recap and the band cover that) and again
+  // after each compaction: then the ledger says where things stood.
+  on('prompt.context', async ($, e, next) => {
+    const result = await next(e)
+    const isAfterCompaction = contextReads > 0 || hasCompacted
+    contextReads += 1
+    if (!isAfterCompaction || !hasContent(ledger)) {
+      return result
+    }
+    const others = result.blocks.filter(block => block.name !== LEDGER_BLOCK)
+    return { ...result, blocks: [...others, { name: LEDGER_BLOCK, text: ledgerBlock(ledger) }] }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

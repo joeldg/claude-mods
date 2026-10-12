@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { CWD, DB, PYTHON, SESSION, SOURCES, STATS, callsOf, progress, say, start, world } from './world'
+import { CWD, DB, NICE, NOW, PYTHON, SESSION, SIDECAR, SOURCES, STATS, callsOf, progress, recall, say, sidecar, start, world } from './world'
 
 const SLOW = { timeoutMs: 30_000 }
 
@@ -139,4 +139,71 @@ test('after a reload (no session.start) the next prompt restarts the timer and c
   // Once is enough.
   await say($, 'and again')
   expect(w.statuses).toEqual([undefined])
+})
+
+test('an index another process updated under freshMinutes ago: no update at the start, on the tick or at the end; /recall reindex still runs', SLOW, async ($, on) => {
+  const w = world(on)
+  sidecar(w, NOW - 3 * 60_000)
+  await start($, w)
+  // Neither the stats check nor the update ran; the last-session band was still looked for.
+  expect(w.calls.map(call => call.command)).toEqual(['recap'])
+  expect(w.logs).toEqual(['recall: another process updated the index 3m ago (pid 4242): this session skips its own updates while it is under 10 min old'])
+
+  // Another session refreshed it before the tick: skipped too, and the skip is said once.
+  sidecar(w, NOW + 9 * 60_000)
+  await w.clock.advance(10 * 60_000)
+  expect(callsOf(w, 'update')).toEqual([])
+  expect(w.logs).toHaveLength(1)
+
+  // Past freshMinutes, the next tick updates.
+  await w.clock.advance(10 * 60_000)
+  expect(callsOf(w, 'update')).toEqual([{ command: 'update', args: [...SOURCES, '--max-seconds', '120'] }])
+
+  // The explicit reindex always runs.
+  sidecar(w, NOW + 20 * 60_000)
+  await recall($, 'reindex')
+  await w.clock.settle()
+  expect(w.spawned).toEqual([{ command: 'update', args: [...SOURCES, '--progress', '--rebuild'] }])
+
+  // A fresh index at the session's end: no update left running.
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION, resume: { id: SESSION } })
+  expect(w.shells).toEqual([])
+})
+
+test('a stale or unreadable last-update.json is no reason to skip', SLOW, async ($, on) => {
+  const w = world(on)
+  sidecar(w, NOW - 11 * 60_000)
+  await start($, w)
+  expect(callsOf(w, 'update')).toHaveLength(1)
+  w.files.set(SIDECAR, 'not json')
+  await w.clock.advance(10 * 60_000)
+  expect(callsOf(w, 'update')).toHaveLength(2)
+  expect(w.logs).toEqual([])
+})
+
+test('freshMinutes 0: every automatic update runs', { ...SLOW, options: { freshMinutes: 0 } }, async ($, on) => {
+  const w = world(on)
+  sidecar(w, NOW)
+  await start($, w)
+  expect(callsOf(w, 'update')).toHaveLength(1)
+})
+
+test('with /usr/bin/nice present the updates run under nice -n 19; the stats check and the searches do not', SLOW, async ($, on) => {
+  const w = world(on)
+  w.hasNice = true
+  await start($, w)
+  const update = w.argvs.find(argv => argv.includes('update')) ?? []
+  expect(update.slice(0, 4)).toEqual([...NICE, PYTHON])
+  expect(update[4]).toMatch(/\/engine\/recall\.py$/)
+  expect(update.slice(5, 8)).toEqual(['--db', DB, 'update'])
+  expect(w.argvs.find(argv => argv.includes('stats'))?.[0]).toBe(PYTHON)
+  await $.tool.call({ tool: 'mcp__recall__search', query: 'modal deploy' })
+  expect(w.argvs.at(-1)?.[0]).toBe(PYTHON)
+
+  // A rebuild and the update a session's end leaves running too.
+  await recall($, 'reindex')
+  await w.clock.settle()
+  expect(w.spawnArgvs[0]?.slice(0, 4)).toEqual([...NICE, PYTHON])
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION, resume: { id: SESSION } })
+  expect(w.shells[0]?.slice(0, 8)).toEqual(['/bin/sh', '-c', 'nohup "$@" >/dev/null 2>&1 &', 'recall-update', ...NICE, PYTHON])
 })

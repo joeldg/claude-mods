@@ -4269,6 +4269,26 @@ def cmd_remask(con, args, db_path, home):
         os.close(lock)
 
 
+def write_last_update(db_path: str, st: dict) -> None:
+    """Leaves {ts, docs, sessions, by} beside the index after a complete update (0600, replaced
+    atomically), so a plugin in another session can skip its own update while this one is fresh.
+    Never fails the update."""
+    path = os.path.join(os.path.dirname(db_path), 'last-update.json')
+    tmp = '%s.%d.tmp' % (path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as fh:
+            fh.write(json.dumps({'ts': now_ms(), 'docs': st.get('docs', 0), 'sessions': st.get('sessions', 0),
+                                 'by': os.getpid()}) + '\n')
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def cmd_update(con, args, db_path, home):
     sources = set(SOURCES)
     if args.sources:
@@ -4296,7 +4316,10 @@ def cmd_update(con, args, db_path, home):
             con.execute('PRAGMA wal_checkpoint(PASSIVE)')
         except sqlite3.OperationalError:
             pass
-        return {'updated': result, 'stats': stats(con, db_path)}
+        st = stats(con, db_path)
+        if not result.get('partial'):
+            write_last_update(db_path, st)
+        return {'updated': result, 'stats': st}
     finally:
         os.close(lock)
 

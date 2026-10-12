@@ -1,7 +1,7 @@
 {
   "name": "recall",
-  "version": "0.1.0",
-  "description": "Makes past sessions recallable: indexes Claude Code and Codex transcripts, subagent runs, memory files, standing orders and second-opinion reviews into a local SQLite index (kept after Claude Code deletes old transcripts), gives Claude search, expand, recap and list tools, and adds /recall (search, last session, timeline, decisions, commands, files, PRs, ask), /remember, a pick-up-where-you-left-off band and a related-work band. Nothing calls a model except /recall ask: one call to the ask model per question, billed to your usage.",
+  "version": "0.2.0",
+  "description": "Makes past sessions recallable: indexes Claude Code and Codex transcripts, subagent runs, memory files, standing orders and second-opinion reviews into a local SQLite index (kept after Claude Code deletes old transcripts), gives Claude search, expand, recap and list tools, and adds /recall (search, last session, timeline, decisions, commands, files, PRs, ask), /remember, a pick-up-where-you-left-off band, a related-work band, and a per-session ledger (goal, open tasks, questions answered, files touched, PRs and commits) that comes back after a compaction and /recall ledger prints. Nothing calls a model except /recall ask: one call to the ask model per question, billed to your usage.",
   "author": {
     "name": "joeldg"
   },
@@ -41,6 +41,12 @@
       "type": "number",
       "title": "Re-index every (minutes)",
       "description": "How often new and changed sessions are indexed in the background while a session is open.",
+      "default": 10
+    },
+    "freshMinutes": {
+      "type": "number",
+      "title": "Skip updates fresher than (minutes)",
+      "description": "When another session finished an update less than this many minutes ago, this session skips its own automatic update (at the start, on the timer and at the end); /recall reindex always runs. 0 never skips.",
       "default": 10
     },
     "relatedBand": {

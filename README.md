@@ -150,9 +150,11 @@ Search everything you've done with coding agents, from Claude or from `/recall`.
 - **What it keeps:** prompts, answers, compaction summaries, session titles, commands, files touched, commits, PRs, issues, URLs, tasks and **decisions** (what you approved or ruled out). Read-only look-ups like `grep` and `cat` are kept but ranked low.
 - **History survives cleanup:** extracts stay searchable after Claude Code deletes old transcripts.
 - **Claude searches it itself** with four read-only tools, `search`, `expand`, `recap` and `list`, which run without permission prompts. It checks them when you say "like last time" or "what did we decide", and before asking you something you already settled.
+- **The ledger survives compaction:** as a session goes, recall keeps what it has settled — your `/goal` (or the Stop hook's condition), open tasks with a count of the done ones, the questions you asked with the first line of each answer, the files touched, the commits made and PRs opened. After a compaction it goes back into Claude's context as `Ledger (this session, before compaction)` (about 40 lines at most), so you don't have to say "don't lose track of where we were". `/recall ledger` prints it any time; `/clear` starts a fresh one. It is written to `~/.claude/recall/ledger/<session>.json` (readable only by you, secrets masked) so a reload keeps it.
 - **Commands:**
   - `/recall <query>` opens a pane of hits grouped by session. **Open** shows the conversation around a hit, **Attach** sends it with your next message, and **Copy resume command** copies `claude --resume <id>`.
   - `/recall last [n]` recaps your last session in this repo: last asks, last answer, PRs, commits, open tasks and decisions. **Send to Claude** attaches it.
+  - `/recall ledger` prints this session's ledger (above).
   - `/recall timeline [7d|30d|90d] [all]`
   - `/recall decisions|commands|files|prs|commits|issues|urls|tasks|notes [query]`
   - `/recall ask <question>` answers from your history with Haiku 4.5, citing sessions. It costs a little usage and sends the matching excerpts to the model.
@@ -163,12 +165,12 @@ Search everything you've done with coding agents, from Claude or from `/recall`.
   - When a prompt mentions `#214`, `ABC-12`, a file name or a quoted phrase seen in past sessions, a band offers what happened then. Nothing is sent unless you click.
 - **Query syntax:** words must all match. `OR` gives alternatives, `"quotes"` an exact phrase, and `-word` excludes. Filters: `project:name`, `kind:decision`, `since:7d`, `until:2026-09-30`, `source:codex`, `routines:include`.
 - **Privacy:**
-  - The index lives at `~/.claude/recall/index.db`, readable only by you, and never goes in a repo.
-  - Secrets are masked before anything is stored: known token shapes, labelled values ("password: …"), the values of secret-named exports in `~/.zshrc`, `~/.zprofile`, `~/.bashrc` and `~/.bash_profile`, and any literal strings you list in `~/.claude/recall/redact.txt` (one per line). Editing that list re-masks the existing index on the next update.
-- **Cost:** no model calls except `/recall ask`. The first index takes about 2 minutes in the background, with progress on the status line. After that it updates incrementally (about 1s) at session start and every 10 minutes.
+  - The index lives at `~/.claude/recall/index.db`, readable only by you, and never goes in a repo. The ledgers beside it are kept the same way.
+  - Secrets are masked before anything is stored: known token shapes, labelled values ("password: …"), the values of secret-named exports in `~/.zshrc`, `~/.zprofile`, `~/.bashrc` and `~/.bash_profile`, and any literal strings you list in `~/.claude/recall/redact.txt` (one per line). Editing that list re-masks the existing index on the next update. The ledger is masked the same way before it is written or shown.
+- **Cost:** no model calls except `/recall ask`. The first index takes about 2 minutes in the background, with progress on the status line. After that it updates incrementally at session start, every 10 minutes and at session end — but only when no other session finished an update in the last 10 minutes (`freshMinutes`): with several sessions open, one update serves them all, and the engine leaves `~/.claude/recall/last-update.json` to say so. Updates run under `nice -n 19`, so a loaded Mac stays responsive; searches don't. `/recall reindex` always runs.
 - **Requires** macOS's `/usr/bin/python3` (Command Line Tools), whose SQLite has FTS5. Nothing else to install.
 
-Settings: `dbPath`, `python`, `sources`, `includeSubagents` (on), `includeRoutines` (off), `updateMinutes` (10), `relatedBand` (on), `lastSessionBand` (on), `maxResults` (8), `askModel` (`claude-haiku-4-5-20251001`).
+Settings: `dbPath`, `python`, `sources`, `includeSubagents` (on), `includeRoutines` (off), `updateMinutes` (10), `freshMinutes` (10; 0 never skips), `relatedBand` (on), `lastSessionBand` (on), `maxResults` (8), `askModel` (`claude-haiku-4-5-20251001`).
 
 ## repo-brief
 

@@ -12,6 +12,11 @@ export const DB = '/Users/me/.claude/recall/index.db'
 export const NOW = Date.UTC(2026, 9, 7, 14, 0)
 export const DAY = 86_400_000
 export const SOURCES = ['--sources', 'claude,codex,memory,orders,reviews', '--subagents']
+/** What the engine leaves beside the index after a complete update. */
+export const SIDECAR = '/Users/me/.claude/recall/last-update.json'
+export const LEDGER_DIR = '/Users/me/.claude/recall/ledger'
+/** How an update's command line begins when /usr/bin/nice exists. */
+export const NICE = ['/usr/bin/nice', '-n', '19']
 
 /** One engine command as the plugin ran it: `search`, `note add`, ...; and what followed the command. */
 export type Call = { command: string; args: string[] }
@@ -28,12 +33,24 @@ export type World = {
   engine: Record<string, (call: Call) => Answer>
   /** Updates run through `process.spawn`. */
   spawned: Call[]
+  /** Their full command lines, as given. */
+  spawnArgvs: string[][]
   /** What a spawned update streams: each piece after `afterMs` on the clock; then it exits with `code`. */
   stream: { steps: { afterMs: number; chunk: ProcessSpawnChunk }[]; code: number; fails?: string }
   /** `/bin/sh` command lines (the update a session's end leaves running). */
   shells: string[][]
+  /** `/bin/chmod` command lines (the ledger's permissions). */
+  chmods: string[][]
   /** True: python cannot start. */
   isBroken: boolean
+  /** True: /usr/bin/nice exists. */
+  hasNice: boolean
+  /** The files `$.fs` finds, by path. */
+  files: Map<string, string>
+  /** Every path written, in order. */
+  writes: string[]
+  /** What `$.session.id()` answers; another after a /clear. */
+  sessionId: string
   toasts: string[]
   statuses: (string | undefined)[]
   logs: string[]
@@ -46,7 +63,7 @@ export type World = {
   canCopy: boolean
   completes: ModelCompleteRequest[]
   reply: ModelCompleteResult | 'refuse'
-  tools: Required<ToolSpec>[]
+  tools: ToolSpec[]
   commands: string[]
   entered: { text: string; context: readonly string[] | undefined }[]
   /** Tools a settings rule denies, beneath the plugin. */
@@ -67,6 +84,11 @@ export const argOf = (call: Call | undefined, flag: string): string | undefined 
 }
 
 export const callsOf = (w: World, command: string): Call[] => w.calls.filter(call => call.command === command)
+
+/** Another process completed an update at `ts`: the sidecar it left beside the index. */
+export const sidecar = (w: World, ts: number): void => {
+  w.files.set(SIDECAR, `${JSON.stringify({ ts, docs: 9_000, sessions: 120, by: 4242 })}\n`)
+}
 
 // ---------------------------------------------------------------------------
 // What the engine knows: generic projects, sessions and extracts.
@@ -297,9 +319,15 @@ export function world(on: On): World {
     argvs: [],
     engine: answers(),
     spawned: [],
+    spawnArgvs: [],
     stream: { steps: [{ afterMs: 0, chunk: { stream: 'stdout', text: `${JSON.stringify(UPDATED)}\n` } }], code: 0 },
     shells: [],
+    chmods: [],
     isBroken: false,
+    hasNice: false,
+    files: new Map(),
+    writes: [],
+    sessionId: SESSION,
     toasts: [],
     statuses: [],
     logs: [],
@@ -320,20 +348,37 @@ export function world(on: On): World {
   }
   mock.env(on, { HOME })
   on('session.cwd', () => ({ value: CWD }))
-  on('session.id', () => ({ value: SESSION }))
+  on('session.id', () => ({ value: w.sessionId }))
   on('session.turns', () => ({ value: w.turns }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('prompt.context', (_$, e) => ({ blocks: e.blocks }))
+  on('fs.exists', (_$, e) => ({ value: w.files.has(e.path) || (e.path === NICE[0] && w.hasNice) }))
+  on('fs.read', (_$, e) => {
+    const text = w.files.get(e.path)
+    return text === undefined ? { deny: `ENOENT: no such file or directory, open '${e.path}'` } : { value: text }
+  })
+  on('fs.write', (_$, e) => {
+    w.files.set(e.path, e.text)
+    w.writes.push(e.path)
+    return { value: undefined }
+  })
   on('process.run', (_$, e) => {
     const argv = [...e.argv]
     w.argvs.push(argv)
-    const [exe = '', script = '', , , command = '', ...rest] = argv
+    // An update may run under nice: the command line proper follows it.
+    const plain = argv[0] === NICE[0] ? argv.slice(NICE.length) : argv
+    const [exe = '', script = '', , , command = '', ...rest] = plain
     if (exe === 'git') {
       return ok(`${ROOT}\n`)
     }
     if (exe === '/bin/sh') {
       w.shells.push(argv)
+      return ok('')
+    }
+    if (exe === '/bin/chmod') {
+      w.chmods.push(argv)
       return ok('')
     }
     if (!script.endsWith('/engine/recall.py')) {
@@ -351,7 +396,9 @@ export function world(on: On): World {
     return ok(stdout, answer.stderr ?? '', answer.exit ?? (json?.error ? 1 : 0))
   })
   on('process.spawn', async function* (_$, e) {
-    const [, , , , command = '', ...args] = e.argv
+    const argv = [...e.argv]
+    w.spawnArgvs.push(argv)
+    const [, , , , command = '', ...args] = argv[0] === NICE[0] ? argv.slice(NICE.length) : argv
     w.spawned.push({ command, args })
     if (w.stream.fails) {
       return { deny: w.stream.fails }

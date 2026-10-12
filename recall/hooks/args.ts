@@ -44,6 +44,8 @@ export type Config = {
   includeRoutines: boolean
   /** 0 turns the periodic re-index off. */
   updateMs: number
+  /** An automatic update is skipped while another process's completed one is younger than this; 0 never skips. */
+  freshMs: number
   relatedBand: boolean
   lastSessionBand: boolean
   maxResults: number
@@ -75,6 +77,7 @@ export function parseSources(raw: string): string[] {
 /** The plugin's options as `register` receives them, with the defaults filled in and odd values set right. */
 export function configFrom(options: PluginOptions): Config {
   const minutes = number(options.updateMinutes, 10)
+  const fresh = number(options.freshMinutes, 10)
   return {
     dbPath: text(options.dbPath, DEFAULT_DB),
     python: text(options.python, DEFAULT_PYTHON),
@@ -82,6 +85,7 @@ export function configFrom(options: PluginOptions): Config {
     includeSubagents: flag(options.includeSubagents, true),
     includeRoutines: flag(options.includeRoutines, false),
     updateMs: minutes > 0 ? Math.round(Math.max(1, Math.min(24 * 60, minutes)) * 60_000) : 0,
+    freshMs: fresh > 0 ? Math.round(Math.min(24 * 60, fresh) * 60_000) : 0,
     relatedBand: flag(options.relatedBand, true),
     lastSessionBand: flag(options.lastSessionBand, true),
     maxResults: Math.round(Math.max(1, Math.min(MAX_LIMIT, number(options.maxResults, DEFAULT_MAX_RESULTS)))),
@@ -100,6 +104,15 @@ export function expandHome(path: string, home: string | undefined): string {
 /** The last part of a path: a project's display name. */
 export const baseName = (path: string): string => path.replace(/\/+$/, '').split('/').pop() || path
 
+/** The folder a file is in, as written: `.` for a bare name. */
+export const dirOf = (path: string): string => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) || '/' : '.')
+
+/** Where the engine leaves `{ ts, docs, sessions, by }` after a complete update: beside the index. */
+export const sidecarPath = (db: string): string => `${dirOf(db)}/last-update.json`
+
+/** Where a session's ledger is kept: beside the index, under the session's id. */
+export const ledgerPath = (db: string, session: string): string => `${dirOf(db)}/ledger/${session}.json`
+
 /** A project's name for people: its folder's, or for a Claude Code worktree (`<repo>/.claude/worktrees/<name>`) its repository's. */
 export function projectNameOf(root: string): string {
   const main = /^(.+?)\/\.claude\/worktrees\/[^/]+\/?$/.exec(root)?.[1]
@@ -116,6 +129,7 @@ export type RecallRequest =
   | { kind: 'ask'; question: string }
   | { kind: 'stats' }
   | { kind: 'reindex' }
+  | { kind: 'ledger' }
   | { kind: 'forget'; target: RecallForgetTarget }
   | { kind: 'usage'; message: string }
 
@@ -226,6 +240,9 @@ export function parseRecallArgs(raw: string): RecallRequest {
   }
   if ((verb === 'reindex' || verb === 'rebuild') && !rest) {
     return { kind: 'reindex' }
+  }
+  if (verb === 'ledger' && !rest) {
+    return { kind: 'ledger' }
   }
   if (verb === 'forget') {
     return parseForget(rest)
@@ -359,9 +376,23 @@ export function listInput(e: Input, maxResults: number): ListInput | { error: st
 /** How searches treat routine (scheduled) sessions. */
 export const routinesOf = (config: Config): 'include' | 'exclude' => (config.includeRoutines ? 'include' : 'exclude')
 
-/** The engine's command line: python, the script the plugin ships, the index, then the command. */
-export function engineArgv(config: Config, pluginRoot: string, db: string, args: readonly string[]): string[] {
-  return [config.python, `${pluginRoot.replace(/\/+$/, '')}/engine/recall.py`, '--db', db, ...args]
+/** `nice` on the host, and the level updates run at: the lowest priority, so a swapping machine stays usable. */
+export const NICE = '/usr/bin/nice'
+export const NICE_LEVEL = 19
+
+/**
+ * The engine's command line: python, the script the plugin ships, the index, then the command; under
+ * `nice -n 19` when asked (an update, never a search). The level is positive, so no `=` form is needed.
+ */
+export function engineArgv(
+  config: Config,
+  pluginRoot: string,
+  db: string,
+  args: readonly string[],
+  options: { nice?: boolean } = {},
+): string[] {
+  const line = [config.python, `${pluginRoot.replace(/\/+$/, '')}/engine/recall.py`, '--db', db, ...args]
+  return options.nice ? [NICE, '-n', String(NICE_LEVEL), ...line] : line
 }
 
 /** `update`: `maxSeconds` stops it early (the next run resumes), `progress` streams JSON lines to stderr, `rebuild` re-reads every file. */

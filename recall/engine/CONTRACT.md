@@ -172,6 +172,10 @@ update [--sources claude,codex,memory,orders,reviews] [--subagents] [--prune-del
   `{"progress":{"files_done":n,"files_total":n,"bytes_done":n,"bytes_total":n}}`.
 - `--retention-days N`: drop docs older than N days (notes are kept) and sessions left without docs.
 - `--rebuild`: re-read every file from the start (notes and forgotten items stay).
+- After a complete run (`partial: false`) the engine writes `<db folder>/last-update.json`
+  (`0600`, replaced atomically): `{"ts": <ms>, "docs": n, "sessions": n, "by": <pid>}`, the
+  stats of the index it just finished. The plugin reads it to skip its own automatic update while
+  another session's is fresh (`freshMinutes`). A busy or partial run leaves it as it was.
 - Index format: when the engine's extraction changes, files indexed by an older format are re-read
   once by the next `update` (resumable with `--max-seconds`), and docs of transcripts that no longer
   exist are brought up to date in place (inspection flags, pieces column, session project). No

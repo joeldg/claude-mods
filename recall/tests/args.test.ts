@@ -9,6 +9,7 @@ import {
   expandInput,
   forgetArgs,
   listArgs,
+  ledgerPath,
   listInput,
   noteArgs,
   normalizeRef,
@@ -24,6 +25,7 @@ import {
   recapInput,
   searchArgs,
   searchInput,
+  sidecarPath,
   timelineArgs,
   updateArgs,
   freeText,
@@ -38,6 +40,7 @@ describe('configFrom', () => {
       includeSubagents: true,
       includeRoutines: false,
       updateMs: 600_000,
+      freshMs: 600_000,
       relatedBand: true,
       lastSessionBand: true,
       maxResults: 8,
@@ -339,4 +342,43 @@ test('free text that starts with a dash is passed as --name=value, so argparse c
   expect(freeText('--query', '--force push')).toEqual(['--query=--force push'])
   expect(freeText('--text', '-x is the flag')).toEqual(['--text=-x is the flag'])
   expect(noteArgs('add', '--dry-run first', null)).toEqual(['note', 'add', '--text=--dry-run first'])
+})
+
+describe('throttled updates and the ledger', () => {
+  test('freshMinutes: 10 by default, 0 turns the skip off, bounded by a day', () => {
+    expect(configFrom({ freshMinutes: 3 }).freshMs).toBe(180_000)
+    expect(configFrom({ freshMinutes: '3' }).freshMs).toBe(180_000)
+    expect(configFrom({ freshMinutes: 0 }).freshMs).toBe(0)
+    expect(configFrom({ freshMinutes: -5 }).freshMs).toBe(0)
+    expect(configFrom({ freshMinutes: 10_000 }).freshMs).toBe(24 * 60 * 60_000)
+    expect(configFrom({ freshMinutes: 'soon' }).freshMs).toBe(600_000)
+  })
+
+  test('an update under nice -n 19 when asked', () => {
+    const config = configFrom({})
+    expect(engineArgv(config, '/opt/mods/recall', '/Users/me/.claude/recall/index.db', ['update'], { nice: true })).toEqual([
+      '/usr/bin/nice',
+      '-n',
+      '19',
+      '/usr/bin/python3',
+      '/opt/mods/recall/engine/recall.py',
+      '--db',
+      '/Users/me/.claude/recall/index.db',
+      'update',
+    ])
+    expect(engineArgv(config, '/opt/mods/recall', '/Users/me/.claude/recall/index.db', ['stats'], { nice: false })[0]).toBe('/usr/bin/python3')
+  })
+
+  test('the files beside the index: the update sidecar and the ledgers', () => {
+    expect(sidecarPath('/Users/me/.claude/recall/index.db')).toBe('/Users/me/.claude/recall/last-update.json')
+    expect(sidecarPath('/data/recall.db')).toBe('/data/last-update.json')
+    expect(ledgerPath('/Users/me/.claude/recall/index.db', 'sess-1')).toBe('/Users/me/.claude/recall/ledger/sess-1.json')
+    expect(ledgerPath('index.db', 'sess-1')).toBe('./ledger/sess-1.json')
+  })
+
+  test('/recall ledger', () => {
+    expect(parseRecallArgs('ledger')).toEqual({ kind: 'ledger' })
+    expect(parseRecallArgs('Ledger')).toEqual({ kind: 'ledger' })
+    expect(parseRecallArgs('ledger lines')).toEqual({ kind: 'search', query: 'ledger lines' })
+  })
 })

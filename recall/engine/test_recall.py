@@ -928,6 +928,38 @@ class IncrementalTest(unittest.TestCase):
             os.close(fd)
         self.assertIsNotNone(self.env.cli('update')['updated'])
 
+    def test_last_update_sidecar(self):
+        # A complete update leaves {ts, docs, sessions, by} beside the index, readable only by its owner.
+        path = os.path.join(os.path.dirname(self.env.db), 'last-update.json')
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path) as fh:
+            side = json.load(fh)
+        self.assertEqual(set(side), {'ts', 'docs', 'sessions', 'by'})
+        self.assertEqual(side['docs'], self.first['stats']['docs'])
+        self.assertEqual(side['sessions'], self.first['stats']['sessions'])
+        self.assertIsInstance(side['by'], int)
+        self.assertLess(abs(side['ts'] - time.time() * 1000), 300_000)
+        # A busy update leaves it alone.
+        before = os.stat(path).st_mtime_ns
+        fd = os.open(self.env.db + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.assertEqual(self.env.cli('update'), {'updated': None, 'busy': True})
+        finally:
+            os.close(fd)
+        self.assertEqual(os.stat(path).st_mtime_ns, before)
+        # A partial update (stopped early) does not write it: the index is not up to date yet.
+        env = Env()
+        try:
+            other = os.path.join(os.path.dirname(env.db), 'last-update.json')
+            self.assertTrue(env.cli('update', '--subagents', '--max-seconds', '0')['updated']['partial'])
+            self.assertFalse(os.path.exists(other))
+            self.assertFalse(env.cli('update', '--subagents')['updated']['partial'])
+            self.assertTrue(os.path.exists(other))
+        finally:
+            env.close()
+
     def test_max_seconds_partial_and_resume(self):
         env = Env()
         try:
