@@ -1,7 +1,7 @@
 {
   "name": "machine-guard",
-  "version": "0.2.0",
-  "description": "Memory, swap and GPU on the status line and a machine_status tool for Claude; refuses heavy local jobs (training, inference, rendering, Docker) while memory is critical or the Mac is reserved with /busy.",
+  "version": "0.3.0",
+  "description": "Memory, swap, GPU and the CPU cores macOS is using on the status line, and a machine_status tool for Claude; refuses heavy local jobs (training, inference, rendering, Docker) while memory is critical or the Mac is reserved with /busy.",
   "author": {
     "name": "joeldg"
   },

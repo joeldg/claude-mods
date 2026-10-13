@@ -3,9 +3,13 @@ import { expect, test } from 'claude-code/testing'
 import type { Snapshot } from '../types'
 import {
   agoText,
+  coresContext,
+  coresToast,
   criticalDenial,
   isHeavy,
+  isParked,
   memoryOf,
+  parseCores,
   parseDuration,
   parseGpu,
   parseLock,
@@ -60,6 +64,9 @@ const SNAPSHOT: Snapshot = {
   swapTotalGB: 10,
   gpuPct: 16,
   gpuAt: 1_000_000,
+  cpuTotal: 16,
+  cpuRecommended: 16,
+  cpuMask: 65535,
   top: [
     { name: 'python', gb: 31 },
     { name: 'Claude', gb: 9 },
@@ -135,12 +142,17 @@ test('reads the shared sample and the lock, and treats anything malformed as abs
   const shared = { ts: 999_000, by: 'sess-b', ttlMs: 15_000, probeMs: 120, n: 7, data: SNAPSHOT }
   expect(parseShared(JSON.stringify(shared))).toEqual(shared)
   // An older session's record without the newer fields still counts.
-  const older = { ts: 999_000, by: 'sess-b', ttlMs: 15_000, data: { ...SNAPSHOT, gpuAt: undefined, topAt: undefined, topTriedAt: undefined } }
+  const older = {
+    ts: 999_000,
+    by: 'sess-b',
+    ttlMs: 15_000,
+    data: { ...SNAPSHOT, gpuAt: undefined, topAt: undefined, topTriedAt: undefined, cpuTotal: undefined, cpuRecommended: undefined, cpuMask: undefined },
+  }
   expect(parseShared(JSON.stringify(older))).toEqual({
     ...shared,
     probeMs: 0,
     n: 0,
-    data: { ...SNAPSHOT, gpuAt: null, topAt: null, topTriedAt: null },
+    data: { ...SNAPSHOT, gpuAt: null, topAt: null, topTriedAt: null, cpuTotal: null, cpuRecommended: null, cpuMask: null },
   })
   expect(parseShared('{"ts":5}')).toBeNull()
   expect(parseShared('not json')).toBeNull()
@@ -227,6 +239,7 @@ test('reports the sample, the verdict and the rules for the model', () => {
       'RAM: 33% free · 16.1 of 48 GB unused (free + inactive + speculative pages) · compressor holds 28.2 GB in 6.9 GB',
       'Swap: 9.2 of 10 GB used',
       'GPU: 16% (read 12 s ago)',
+      'CPU cores: 16 of 16 available.',
       'Pressure: normal (kernel level 1)',
       'Biggest apps (ps 42 s ago): python 31 GB, Claude 9 GB',
       'Verdict: ok — heavy local jobs may start.',
@@ -238,22 +251,22 @@ test('reports the sample, the verdict and the rules for the model', () => {
   const backedOff = statusReport(tight, null, 0, 1_000_000, { ...CADENCE, intervalMs: 60_000 }).split('\n')
   expect(backedOff[0]).toBe('machine-guard · sampled just now · every 60 s (backed off: probes were slow), one sample shared by all sessions')
   expect(backedOff[3]).toBe('GPU: 16%')
-  expect(backedOff[4]).toBe('Pressure: warn (kernel level 2)')
-  expect(backedOff[5]).toBe('Biggest apps (ps just now): python 31 GB, Claude 9 GB')
-  expect(backedOff[6]).toBe('Verdict: ok — memory is tight: run one heavy job at a time.')
+  expect(backedOff[5]).toBe('Pressure: warn (kernel level 2)')
+  expect(backedOff[6]).toBe('Biggest apps (ps just now): python 31 GB, Claude 9 GB')
+  expect(backedOff[7]).toBe('Verdict: ok — memory is tight: run one heavy job at a time.')
   // Critical, blocked; or critical with blocking off; or the guard paused.
   const critical: Snapshot = { ...SNAPSHOT, pressure: 'critical', level: 4, freePct: 6 }
-  expect(statusReport(critical, null, 0, 1_000_000, CADENCE).split('\n')[6]).toBe(
+  expect(statusReport(critical, null, 0, 1_000_000, CADENCE).split('\n')[7]).toBe(
     'Verdict: busy — memory is critical: heavy local jobs are blocked (the user can lift this with /guard pause 15m).',
   )
-  expect(statusReport(critical, null, 0, 1_000_000, { ...CADENCE, blockOnCritical: false }).split('\n')[6]).toBe(
+  expect(statusReport(critical, null, 0, 1_000_000, { ...CADENCE, blockOnCritical: false }).split('\n')[7]).toBe(
     'Verdict: ok — memory is critical but blocking is off: start nothing heavy unless the user asks for it.',
   )
-  expect(statusReport(critical, null, 900_000, 1_000_000, CADENCE).split('\n')[6]).toBe(
+  expect(statusReport(critical, null, 900_000, 1_000_000, CADENCE).split('\n')[7]).toBe(
     'Verdict: ok — the guard is paused for 15m in this session: heavy jobs run even while memory is critical.',
   )
   // Reserved with /busy.
-  expect(statusReport(SNAPSHOT, { reason: 'training', until: 8_200_000, setAt: 1_000_000 }, 0, 1_000_000, CADENCE).split('\n')[6]).toBe(
+  expect(statusReport(SNAPSHOT, { reason: 'training', until: 8_200_000, setAt: 1_000_000 }, 0, 1_000_000, CADENCE).split('\n')[7]).toBe(
     'Verdict: busy — the Mac is reserved for "training" for 2h00m more: heavy local jobs are blocked (/busy off lifts it).',
   )
   // No GPU, vm_stat unread, no process table: tried and failed a moment ago, or never.
@@ -261,14 +274,14 @@ test('reports the sample, the verdict and the rules for the model', () => {
   const bareLines = statusReport(bare, null, 0, 1_000_000, CADENCE).split('\n')
   expect(bareLines[1]).toBe('RAM: free memory unknown (vm_stat did not answer) · 48 GB in all')
   expect(bareLines[3]).toBe('GPU: n/a')
-  expect(bareLines[5]).toBe(
+  expect(bareLines[6]).toBe(
     'Biggest apps: no process table — ps did not answer within 10 s (tried 5 s ago; the Mac is that loaded). machine_status and /guard try again at most once a minute, or run `ps -axo rss=,comm= | sort -rn | head -5` yourself.',
   )
-  expect(statusReport({ ...bare, topTriedAt: null }, null, 0, 1_000_000, CADENCE).split('\n')[5]).toBe(
+  expect(statusReport({ ...bare, topTriedAt: null }, null, 0, 1_000_000, CADENCE).split('\n')[6]).toBe(
     'Biggest apps: no process table from the last 5 min; machine_status or /guard takes one (ps, at most once a minute).',
   )
   // A table older than 5 minutes is not shown.
-  expect(statusReport({ ...SNAPSHOT, topAt: 600_000, topTriedAt: 600_000 }, null, 0, 1_000_000, CADENCE).split('\n')[5]).toBe(
+  expect(statusReport({ ...SNAPSHOT, topAt: 600_000, topTriedAt: 600_000 }, null, 0, 1_000_000, CADENCE).split('\n')[6]).toBe(
     'Biggest apps: no process table from the last 5 min; machine_status or /guard takes one (ps, at most once a minute).',
   )
   expect(statusReport(null, null, 0, 1_000_000, CADENCE)).toBe(
@@ -287,4 +300,35 @@ test('names the biggest apps in a denial or a note only when a process table exi
   expect(warnContext({ ...SNAPSHOT, pressure: 'warn', freePct: 18, top: [] })).toBe(
     'machine-guard: memory is tight on this Mac (18% free, swap 9.2 of 10 GB). Avoid starting more heavy jobs in parallel; prefer running one at a time.',
   )
+})
+
+test('reads the CPU count and the cores the scheduler is recommended to use', () => {
+  expect(parseCores('16\n65535\n')).toEqual({ cpuTotal: 16, cpuRecommended: 16, cpuMask: 65535 })
+  expect(parseCores('16\n15\n')).toEqual({ cpuTotal: 16, cpuRecommended: 4, cpuMask: 15 })
+  expect(parseCores('16\n1055\n')).toEqual({ cpuTotal: 16, cpuRecommended: 6, cpuMask: 1055 })
+  expect(parseCores('16\n')).toBeNull()
+  expect(parseCores('')).toBeNull()
+  expect(isParked(SNAPSHOT)).toBe(false)
+  expect(isParked({ ...SNAPSHOT, cpuRecommended: 4, cpuMask: 15 })).toBe(true)
+  expect(isParked({ ...SNAPSHOT, cpuTotal: null, cpuRecommended: null, cpuMask: null })).toBe(false)
+  expect(isParked(null)).toBe(false)
+})
+
+test('parked performance cores show on the status line, in the report, and in what the model is told', () => {
+  const parked: Snapshot = { ...SNAPSHOT, cpuRecommended: 4, cpuMask: 15 }
+  const unknown: Snapshot = { ...SNAPSHOT, cpuTotal: null, cpuRecommended: null, cpuMask: null }
+  expect(statusLine(parked, null, 0)).toBe('RAM 33% free · swap 9.2/10G · GPU 16% · CPU 4/16 cores')
+  expect(statusLine(SNAPSHOT, null, 0)).toBe('RAM 33% free · swap 9.2/10G · GPU 16%')
+  expect(statusReport(parked, null, 0, 1_000_000, CADENCE).split('\n')[4]).toBe(
+    'CPU cores: 4 of 16 recommended by macOS (kern.sched_recommended_cores = 15) — the performance cores are parked, so CPU-bound work crawls until the controller clears: thermal pressure, or a stuck state that a sleep/wake or reboot resets.',
+  )
+  expect(statusReport(SNAPSHOT, null, 0, 1_000_000, CADENCE).split('\n')[4]).toBe('CPU cores: 16 of 16 available.')
+  expect(statusReport(unknown, null, 0, 1_000_000, CADENCE).split('\n')[4]).toBe('CPU cores: unknown.')
+  expect(coresContext(parked)).toBe(
+    'machine-guard: macOS is scheduling on 4 of 16 CPU cores right now (the performance cores are parked), so CPU-bound work runs several times slower than usual: keep worker counts small and tell the user the cores are parked.',
+  )
+  expect(coresToast(parked)).toBe(
+    'macOS has parked the performance cores: scheduling on 4 of 16 CPUs (kern.sched_recommended_cores = 15). CPU-bound work will crawl until it clears — check thermal pressure (sudo powermetrics --samplers thermal -n 1); a sleep/wake or reboot resets a stuck controller.',
+  )
+  expect(coresToast(SNAPSHOT)).toBe('All 16 CPU cores are back.')
 })

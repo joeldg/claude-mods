@@ -20,6 +20,8 @@ type World = {
   level: number
   freePct: number
   gpu: number
+  /** kern.sched_recommended_cores: 65535 is all sixteen CPUs, 15 the four efficiency cores alone. */
+  mask: number
   /** Milliseconds a probe (by command) takes before answering. */
   slow: Record<string, number>
   /** Probes (by command) that never answer within their timeout. */
@@ -61,6 +63,7 @@ const world = (on: On, clock: MockClock): World => {
     level: 1,
     freePct: 40,
     gpu: 91,
+    mask: 65535,
     slow: {},
     timesOut: new Set(),
     sessionId: 'sess-a',
@@ -75,7 +78,8 @@ const world = (on: On, clock: MockClock): World => {
   }
   mock.env(on, { HOME })
   on('process.run', async (_$, e) => {
-    const command = e.argv[0] ?? ''
+    // The CPU read is a second sysctl call, told apart by its keys and recorded as `cores`.
+    const command = e.argv[0] === 'sysctl' && e.argv.includes('hw.ncpu') ? 'cores' : (e.argv[0] ?? '')
     w.probes.push(command)
     if (command === 'sysctl') {
       w.probeAt.push(clock.now())
@@ -89,6 +93,7 @@ const world = (on: On, clock: MockClock): World => {
     }
     const outputs: Record<string, string> = {
       sysctl: `${MEMSIZE}\n${SWAP}\n${w.level}\n`,
+      cores: `16\n${w.mask}\n`,
       vm_stat: vmStat(w.freePct),
       ps: PS,
       ioreg: `"Device Utilization %"=${w.gpu}`,
@@ -238,6 +243,7 @@ test('/guard reports what it sees, taking a process table on demand', SLOW, asyn
       'Memory pressure: warn (12% free)',
       'Swap: 7.8 of 8 GB',
       'GPU: 91%',
+      'CPU cores: 16 of 16 available.',
       'Biggest: python 31 GB, Claude 9 GB',
       'Not reserved (/busy [2h] [reason] reserves it)',
       'Guard on (/guard pause 15m pauses it)',
@@ -253,7 +259,7 @@ test('the regular sample reads kernel counters only: the GPU every third time, t
   await start($, clock)
 
   // The first sample: memory size, swap and pressure level in one sysctl call, vm_stat, and the GPU.
-  expect(w.probes).toEqual(['sysctl', 'vm_stat', 'ioreg'])
+  expect(w.probes).toEqual(['sysctl', 'cores', 'vm_stat', 'ioreg'])
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91%')
 
   await clock.advance(15_000)
@@ -390,7 +396,7 @@ test('sessions share one sample: a fresh one is shown without probing, a stale o
 
   // 20 s after the other session's sample it is stale: this session takes the lock and the next one.
   await clock.advance(15_000)
-  expect(w.probes).toEqual(['sysctl', 'vm_stat'])
+  expect(w.probes).toEqual(['sysctl', 'cores', 'vm_stat'])
   expect(JSON.parse(w.files.get(LOCK) ?? '{}')).toEqual({ ts: 1_015_000, by: 'sess-a' })
   expect(shared(w)).toMatchObject({ ts: 1_015_000, by: 'sess-a', ttlMs: 15_000, probeMs: 0, n: 8, data: { at: 1_015_000, gpuPct: 3 } })
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 3%')
@@ -406,7 +412,7 @@ test('a lock another session holds defers the sample until it is abandoned', SLO
   expect(w.probes).toEqual([])
   // Older than two probe timeouts (20 s): abandoned.
   await clock.advance(15_000)
-  expect(w.probes).toEqual(['sysctl', 'vm_stat', 'ioreg'])
+  expect(w.probes).toEqual(['sysctl', 'cores', 'vm_stat', 'ioreg'])
   expect(JSON.parse(w.files.get(LOCK) ?? '{}')).toEqual({ ts: 1_030_000, by: 'sess-a' })
 })
 
@@ -415,7 +421,7 @@ test('a session whose own lock is left behind still samples', SLOW, async ($, on
   const w = world(on, clock)
   w.files.set(LOCK, JSON.stringify({ ts: 999_500, by: 'sess-a' }))
   await start($, clock)
-  expect(w.probes).toEqual(['sysctl', 'vm_stat', 'ioreg'])
+  expect(w.probes).toEqual(['sysctl', 'cores', 'vm_stat', 'ioreg'])
 })
 
 test('session.start does not wait for the first sample', SLOW, async ($, on) => {
@@ -429,7 +435,7 @@ test('session.start does not wait for the first sample', SLOW, async ($, on) => 
   })
   await clock.settle()
   expect(isStarted).toBe(true)
-  expect(w.probes).toEqual(['sysctl', 'vm_stat', 'ioreg'])
+  expect(w.probes).toEqual(['sysctl', 'cores', 'vm_stat', 'ioreg'])
   expect(w.statuses).toEqual([])
   await clock.advance(5_000)
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91%')
@@ -455,6 +461,7 @@ test('machine_status gives the model the numbers, the verdict and the biggest ap
       'RAM: 40% free · 19.2 of 48 GB unused (free + inactive + speculative pages) · compressor holds 28.2 GB in 6.9 GB',
       'Swap: 7.8 of 8 GB used',
       'GPU: 91%',
+      'CPU cores: 16 of 16 available.',
       'Pressure: normal (kernel level 1)',
       'Biggest apps (ps just now): python 31 GB, Claude 9 GB',
       'Verdict: ok — heavy local jobs may start.',
@@ -468,7 +475,7 @@ test('machine_status gives the model the numbers, the verdict and the biggest ap
   const again = String((await $.tool.call({ tool: TOOL })).result).split('\n')
   expect(again[0]).toBe('machine-guard · sampled 10 s ago · every 15 s, one sample shared by all sessions')
   expect(again[3]).toBe('GPU: 91% (read 10 s ago)')
-  expect(again[5]).toBe('Biggest apps (ps 10 s ago): python 31 GB, Claude 9 GB')
+  expect(again[6]).toBe('Biggest apps (ps 10 s ago): python 31 GB, Claude 9 GB')
   expect(count(w, 'sysctl')).toBe(1)
   expect(count(w, 'ps')).toBe(1)
 
@@ -477,8 +484,8 @@ test('machine_status gives the model the numbers, the verdict and the biggest ap
   await clock.advance(5_000)
   expect(w.toasts.at(-1)).toBe('Memory critical: 40% free, swap 7.8/8 GB. Biggest: python 31 GB, Claude 9 GB. Heavy jobs are blocked.')
   const busy = String((await $.tool.call({ tool: TOOL })).result).split('\n')
-  expect(busy[4]).toBe('Pressure: critical (kernel level 4)')
-  expect(busy[6]).toBe('Verdict: busy — memory is critical: heavy local jobs are blocked (the user can lift this with /guard pause 15m).')
+  expect(busy[5]).toBe('Pressure: critical (kernel level 4)')
+  expect(busy[7]).toBe('Verdict: busy — memory is critical: heavy local jobs are blocked (the user can lift this with /guard pause 15m).')
   expect(count(w, 'ps')).toBe(1)
 })
 
@@ -491,10 +498,10 @@ test('machine_status says how to get a process table when ps does not answer', S
 
   const lines = String((await $.tool.call({ tool: TOOL })).result).split('\n')
   expect(count(w, 'ps')).toBe(1)
-  expect(lines[5]).toBe(
+  expect(lines[6]).toBe(
     'Biggest apps: no process table — ps did not answer within 10 s (tried just now; the Mac is that loaded). machine_status and /guard try again at most once a minute, or run `ps -axo rss=,comm= | sort -rn | head -5` yourself.',
   )
-  expect(lines[6]).toBe('Verdict: busy — the Mac is reserved for "overnight training" for 10m more: heavy local jobs are blocked (/busy off lifts it).')
+  expect(lines[7]).toBe('Verdict: busy — the Mac is reserved for "overnight training" for 10m more: heavy local jobs are blocked (/busy off lifts it).')
 
   // Asked again within the minute, it does not try again.
   await clock.advance(30_000)
@@ -503,4 +510,46 @@ test('machine_status says how to get a process table when ps does not answer', S
   await clock.advance(30_000)
   await $.tool.call({ tool: TOOL })
   expect(count(w, 'ps')).toBe(2)
+})
+
+test('parked performance cores show on the status line and toast once per episode', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  w.mask = 15
+  await start($, clock)
+
+  expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91% · CPU 4/16 cores')
+  const parked = () => w.toasts.filter(text => text.startsWith('macOS has parked the performance cores'))
+  expect(parked()).toHaveLength(1)
+  expect(parked()[0]).toMatch(/4 of 16 CPUs \(kern\.sched_recommended_cores = 15\)/)
+
+  // The controller lets one core per cluster back: still parked, no second toast.
+  w.mask = 1055
+  await clock.advance(15_000)
+  expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91% · CPU 6/16 cores')
+  expect(parked()).toHaveLength(1)
+
+  // All cores back: one toast, and the segment leaves the status line.
+  w.mask = 65535
+  await clock.advance(15_000)
+  expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91%')
+  expect(w.toasts.filter(text => text === 'All 16 CPU cores are back.')).toHaveLength(1)
+
+  // Parked again: a new episode, a new toast.
+  w.mask = 15
+  await clock.advance(15_000)
+  expect(parked()).toHaveLength(2)
+})
+
+test('tells the model when it starts heavy work while the cores are parked', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  w.mask = 15
+  await start($, clock)
+
+  const ran = await $.tool.call({ tool: 'Bash', command: HEAVY })
+  expect(w.ran).toEqual([HEAVY])
+  expect(ran.context?.join('\n')).toMatch(/scheduling on 4 of 16 CPU cores right now/)
+  const light = await $.tool.call({ tool: 'Bash', command: LIGHT })
+  expect(light.context ?? []).toEqual([])
 })

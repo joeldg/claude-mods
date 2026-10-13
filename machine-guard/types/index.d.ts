@@ -22,6 +22,13 @@ export type Snapshot = {
   /** GPU use as ioreg last reported it, and when; carried between reads. */
   gpuPct: number | null
   gpuAt: number | null
+  /**
+   * The CPUs macOS schedules on: all of them normally, fewer while the performance controller parks the
+   * performance cores (kern.sched_recommended_cores is the bitmask); null when the read failed.
+   */
+  cpuTotal: number | null
+  cpuRecommended: number | null
+  cpuMask: number | null
   /** The apps holding the most memory, helpers summed into their app, from the last process table; [] when none is fresh. */
   top: AppMemory[]
   /** When that table was taken, and when one was last tried: ps runs on demand or under pressure, at most once a minute. */

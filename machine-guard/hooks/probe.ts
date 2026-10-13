@@ -36,6 +36,27 @@ export const parseSysctl = (output: string): { level: number | null; totalGB: nu
   return { level, totalGB, swapUsedGB: round1(megabytes('used') / 1024), swapTotalGB: round1(megabytes('total') / 1024) }
 }
 
+/** `sysctl -n hw.ncpu kern.sched_recommended_cores`: the CPU count, then the bitmask of the cores the scheduler may use. */
+export const parseCores = (output: string): { cpuTotal: number; cpuRecommended: number; cpuMask: number } | null => {
+  const [total, mask] = output.split('\n').map(line => line.trim()).filter(Boolean)
+  if (total === undefined || mask === undefined || !/^\d+$/.test(total) || !/^\d+$/.test(mask) || Number(total) <= 0) {
+    return null
+  }
+  const cpuTotal = Number(total)
+  const cpuMask = Number(mask)
+  let cpuRecommended = 0
+  for (let bit = 0; bit < cpuTotal; bit++) {
+    if (Math.floor(cpuMask / 2 ** bit) % 2 === 1) {
+      cpuRecommended++
+    }
+  }
+  return { cpuTotal, cpuRecommended, cpuMask }
+}
+
+/** Whether macOS is scheduling on fewer CPUs than the Mac has: the performance cores parked. */
+export const isParked = (snapshot: Snapshot | null): boolean =>
+  snapshot?.cpuTotal != null && snapshot.cpuRecommended != null && snapshot.cpuRecommended < snapshot.cpuTotal
+
 export type VmStat = { pageSize: number; free: number; inactive: number; speculative: number; compressorPages: number; compressedPages: number }
 
 /** `vm_stat`: the page size from its header, and the page counts that matter. */
@@ -155,6 +176,9 @@ export const parseShared = (text: string | null): SharedSample | null => {
         swapTotalGB: Number(data.swapTotalGB ?? 0),
         gpuPct: numberOrNull(data.gpuPct),
         gpuAt: numberOrNull(data.gpuAt),
+        cpuTotal: numberOrNull(data.cpuTotal),
+        cpuRecommended: numberOrNull(data.cpuRecommended),
+        cpuMask: numberOrNull(data.cpuMask),
         top: Array.isArray(data.top) ? data.top.filter(isAppMemory) : [],
         topAt: numberOrNull(data.topAt),
         topTriedAt: numberOrNull(data.topTriedAt),
@@ -301,6 +325,9 @@ export const statusLine = (snapshot: Snapshot | null, reservation: Reservation |
     if (snapshot.gpuPct !== null) {
       parts.push(`GPU ${snapshot.gpuPct}%`)
     }
+    if (isParked(snapshot)) {
+      parts.push(`CPU ${snapshot.cpuRecommended}/${snapshot.cpuTotal} cores`)
+    }
   }
   if (reservation) {
     parts.push(`reserved ${formatLeft(reservation.until - (snapshot?.at ?? reservation.setAt))}: ${reservation.reason}`)
@@ -359,6 +386,7 @@ export const statusReport = (snapshot: Snapshot | null, reservation: Reservation
     ram,
     `Swap: ${snapshot.swapUsedGB} of ${snapshot.swapTotalGB} GB used`,
     gpu,
+    coresLine(snapshot),
     `Pressure: ${snapshot.pressure} (kernel level ${snapshot.level ?? 'unknown'})`,
     top,
     verdict(snapshot, reservation, pausedLeftMs, now, cadence),
@@ -382,6 +410,27 @@ export const criticalDenial = (snapshot: Snapshot, command: string): string =>
 export const reservationDenial = (reservation: Reservation, command: string, now: number): string =>
   `machine-guard: the user has reserved this Mac for "${reservation.reason}" for ${formatLeft(reservation.until - now)} more, so heavy local jobs are blocked: ${quoted(command)}. ` +
   'Do other work meanwhile, run it remotely (e.g. Modal), or ask the user, who can lift the reservation with /busy off.'
+
+/** The CPUs line of the report and /guard: all of them, the parked state, or unknown. */
+export const coresLine = (snapshot: Snapshot): string =>
+  snapshot.cpuTotal === null || snapshot.cpuRecommended === null
+    ? 'CPU cores: unknown.'
+    : isParked(snapshot)
+      ? `CPU cores: ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} recommended by macOS (kern.sched_recommended_cores = ${snapshot.cpuMask}) — ` +
+        'the performance cores are parked, so CPU-bound work crawls until the controller clears: thermal pressure, or a stuck state that a sleep/wake or reboot resets.'
+      : `CPU cores: ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} available.`
+
+/** What the model is told when it starts heavy work while the cores are parked. */
+export const coresContext = (snapshot: Snapshot): string =>
+  `machine-guard: macOS is scheduling on ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} CPU cores right now (the performance cores are parked), ` +
+  'so CPU-bound work runs several times slower than usual: keep worker counts small and tell the user the cores are parked.'
+
+/** The toast when the cores are parked, or back. */
+export const coresToast = (snapshot: Snapshot): string =>
+  isParked(snapshot)
+    ? `macOS has parked the performance cores: scheduling on ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} CPUs (kern.sched_recommended_cores = ${snapshot.cpuMask}). ` +
+      'CPU-bound work will crawl until it clears — check thermal pressure (sudo powermetrics --samplers thermal -n 1); a sleep/wake or reboot resets a stuck controller.'
+    : `All ${snapshot.cpuTotal} CPU cores are back.`
 
 export const warnContext = (snapshot: Snapshot): string =>
   `machine-guard: memory is tight on this Mac (${figures(snapshot)}). Avoid starting more heavy jobs in parallel; prefer running one at a time.`

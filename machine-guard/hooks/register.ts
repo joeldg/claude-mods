@@ -23,6 +23,11 @@ import {
   reservationDenial,
   statusLine,
   statusReport,
+  coresContext,
+  coresLine,
+  coresToast,
+  isParked,
+  parseCores,
   warnContext,
 } from './probe'
 
@@ -183,6 +188,10 @@ async function adopt($: Engine, snapshot: Snapshot, previous: Snapshot | null, n
       { timeoutMs: 12_000 },
     )
   }
+  // The performance cores parked, or back: one toast per change, in every session.
+  if (snapshot.cpuTotal !== null && isParked(snapshot) !== isParked(previous)) {
+    $.ui.toast(coresToast(snapshot), { timeoutMs: 12_000 })
+  }
   await showStatus($, snapshot, now)
   return snapshot
 }
@@ -211,13 +220,14 @@ async function takeSample($: Engine): Promise<Snapshot | null> {
   const prior = shared ?? { n: own.n, probeMs: own.probeMs, data: previous }
   const n = prior.n + 1
   const isGpuDue = (n - 1) % GPU_EVERY === 0 && prior.probeMs <= SLOW_MS
-  const [sysctl, vm, gpu] = await Promise.all([
+  const [sysctl, cores, vm, gpu] = await Promise.all([
     run($, ['sysctl', '-n', 'hw.memsize', 'vm.swapusage', 'kern.memorystatus_vm_pressure_level']),
+    run($, ['sysctl', '-n', 'hw.ncpu', 'kern.sched_recommended_cores']),
     run($, ['vm_stat']),
     isGpuDue ? run($, ['ioreg', '-r', '-d', '1', '-w', '0', '-c', 'IOAccelerator']) : Promise.resolve<Probe | null>(null),
   ])
   const at = await $.clock.now()
-  let isTimedOut = sysctl.isTimedOut || vm.isTimedOut || (gpu?.isTimedOut ?? false)
+  let isTimedOut = sysctl.isTimedOut || cores.isTimedOut || vm.isTimedOut || (gpu?.isTimedOut ?? false)
   if (sysctl.text === null && vm.text === null) {
     own = { n: prior.n, probeMs: at - now }
     setPace($, at - now, isTimedOut)
@@ -238,6 +248,8 @@ async function takeSample($: Engine): Promise<Snapshot | null> {
     swapTotalGB: memory.swapTotalGB,
     gpuPct: gpuPct ?? last?.gpuPct ?? null,
     gpuAt: gpuPct === null ? (last?.gpuAt ?? null) : at,
+    // The cores the scheduler may use; carried from the last sample when the read fails.
+    ...(parseCores(cores.text ?? '') ?? { cpuTotal: last?.cpuTotal ?? null, cpuRecommended: last?.cpuRecommended ?? null, cpuMask: last?.cpuMask ?? null }),
     top: hasTop && last ? last.top : [],
     topAt: hasTop && last ? last.topAt : null,
     topTriedAt: last?.topTriedAt ?? null,
@@ -306,6 +318,7 @@ async function describe($: Engine): Promise<string> {
         `Memory pressure: ${snapshot.pressure}${snapshot.freePct === null ? '' : ` (${snapshot.freePct}% free)`}`,
         `Swap: ${snapshot.swapUsedGB} of ${snapshot.swapTotalGB} GB`,
         `GPU: ${snapshot.gpuPct === null ? 'unknown' : `${snapshot.gpuPct}%`}`,
+        coresLine(snapshot),
         `Biggest: ${hasFreshTop(snapshot, now) ? biggestApps(snapshot) : noTableText(snapshot, now)}`,
       ]
     : ['Memory could not be read on this machine.']
@@ -390,10 +403,12 @@ export const register: Register = (on, options) => {
       return { deny: criticalDenial(snapshot, e.command) }
     }
     const ran = await next(e)
-    if (snapshot?.pressure === 'warn' && ran.deny === undefined) {
-      return { ...ran, context: [...(ran.context ?? []), warnContext(snapshot)] }
+    if (!snapshot || ran.deny !== undefined) {
+      return ran
     }
-    return ran
+    // Notes for the model: tight memory, and parked cores, when either holds.
+    const notes = [...(snapshot.pressure === 'warn' ? [warnContext(snapshot)] : []), ...(isParked(snapshot) ? [coresContext(snapshot)] : [])]
+    return notes.length === 0 ? ran : { ...ran, context: [...(ran.context ?? []), ...notes] }
   })
 
   on('tool.check', { tool: TOOL }, async ($, e, next) => {
