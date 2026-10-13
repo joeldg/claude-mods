@@ -28,6 +28,7 @@ import {
   coresToast,
   isParked,
   parseCores,
+  shouldAnnounceParked,
   warnContext,
 } from './probe'
 
@@ -35,6 +36,8 @@ type Engine = EngineInterface
 
 const SNAPSHOT = { plugin: 'machine-guard', key: 'snapshot' } as const
 const PAUSED = { plugin: 'machine-guard', key: 'pausedUntil' } as const
+/** Whether this session has toasted the current parking of the cores, so their return is toasted too. */
+const ANNOUNCED = { plugin: 'machine-guard', key: 'coresAnnounced' } as const
 const TOOL = 'mcp__machine-guard__machine_status'
 /** A guard decision samples afresh when the last reading is older than this. */
 const STALE_MS = 30_000
@@ -178,6 +181,13 @@ const withTable = (snapshot: Snapshot, ps: Probe, now: number): Snapshot => {
 }
 
 /** Takes a snapshot in: this session's state and status line, and the toast when memory turned critical. */
+/** The cores fields of a sample: the fresh read, else the last sample's; parked since the first parked sample in a row. */
+const coresOf = (read: ReturnType<typeof parseCores>, last: Snapshot | null, at: number) => {
+  const cores = read ?? { cpuTotal: last?.cpuTotal ?? null, cpuRecommended: last?.cpuRecommended ?? null, cpuMask: last?.cpuMask ?? null }
+  const parked = cores.cpuTotal !== null && cores.cpuRecommended !== null && cores.cpuRecommended < cores.cpuTotal
+  return { ...cores, cpuParkedSince: parked ? (last?.cpuParkedSince ?? at) : null }
+}
+
 async function adopt($: Engine, snapshot: Snapshot, previous: Snapshot | null, now: number): Promise<Snapshot> {
   await $.state.set(SNAPSHOT, snapshot)
   if (snapshot.pressure === 'critical' && previous?.pressure !== 'critical') {
@@ -188,8 +198,15 @@ async function adopt($: Engine, snapshot: Snapshot, previous: Snapshot | null, n
       { timeoutMs: 12_000 },
     )
   }
-  // The performance cores parked, or back: one toast per change, in every session.
-  if (snapshot.cpuTotal !== null && isParked(snapshot) !== isParked(previous)) {
+  // Parked cores: told once when at least half are parked or the parking has lasted five minutes, and once when they are back.
+  const { value: announced = false } = await $.state.get(ANNOUNCED)
+  if (isParked(snapshot)) {
+    if (!announced && shouldAnnounceParked(snapshot, now)) {
+      await $.state.set(ANNOUNCED, true)
+      $.ui.toast(coresToast(snapshot), { timeoutMs: 12_000 })
+    }
+  } else if (announced && snapshot.cpuTotal !== null) {
+    await $.state.set(ANNOUNCED, false)
     $.ui.toast(coresToast(snapshot), { timeoutMs: 12_000 })
   }
   await showStatus($, snapshot, now)
@@ -248,8 +265,8 @@ async function takeSample($: Engine): Promise<Snapshot | null> {
     swapTotalGB: memory.swapTotalGB,
     gpuPct: gpuPct ?? last?.gpuPct ?? null,
     gpuAt: gpuPct === null ? (last?.gpuAt ?? null) : at,
-    // The cores the scheduler may use; carried from the last sample when the read fails.
-    ...(parseCores(cores.text ?? '') ?? { cpuTotal: last?.cpuTotal ?? null, cpuRecommended: last?.cpuRecommended ?? null, cpuMask: last?.cpuMask ?? null }),
+    // The cores the scheduler may use (carried from the last sample when the read fails), and since when fewer than all.
+    ...coresOf(parseCores(cores.text ?? ''), last, at),
     top: hasTop && last ? last.top : [],
     topAt: hasTop && last ? last.topAt : null,
     topTriedAt: last?.topTriedAt ?? null,

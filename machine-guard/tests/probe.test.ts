@@ -67,6 +67,7 @@ const SNAPSHOT: Snapshot = {
   cpuTotal: 16,
   cpuRecommended: 16,
   cpuMask: 65535,
+  cpuParkedSince: null,
   top: [
     { name: 'python', gb: 31 },
     { name: 'Claude', gb: 9 },
@@ -146,13 +147,13 @@ test('reads the shared sample and the lock, and treats anything malformed as abs
     ts: 999_000,
     by: 'sess-b',
     ttlMs: 15_000,
-    data: { ...SNAPSHOT, gpuAt: undefined, topAt: undefined, topTriedAt: undefined, cpuTotal: undefined, cpuRecommended: undefined, cpuMask: undefined },
+    data: { ...SNAPSHOT, gpuAt: undefined, topAt: undefined, topTriedAt: undefined, cpuTotal: undefined, cpuRecommended: undefined, cpuMask: undefined, cpuParkedSince: undefined },
   }
   expect(parseShared(JSON.stringify(older))).toEqual({
     ...shared,
     probeMs: 0,
     n: 0,
-    data: { ...SNAPSHOT, gpuAt: null, topAt: null, topTriedAt: null, cpuTotal: null, cpuRecommended: null, cpuMask: null },
+    data: { ...SNAPSHOT, gpuAt: null, topAt: null, topTriedAt: null, cpuTotal: null, cpuRecommended: null, cpuMask: null, cpuParkedSince: null },
   })
   expect(parseShared('{"ts":5}')).toBeNull()
   expect(parseShared('not json')).toBeNull()
@@ -320,15 +321,18 @@ test('parked performance cores show on the status line, in the report, and in wh
   expect(statusLine(parked, null, 0)).toBe('RAM 33% free · swap 9.2/10G · GPU 16% · CPU 4/16 cores')
   expect(statusLine(SNAPSHOT, null, 0)).toBe('RAM 33% free · swap 9.2/10G · GPU 16%')
   expect(statusReport(parked, null, 0, 1_000_000, CADENCE).split('\n')[4]).toBe(
-    'CPU cores: 4 of 16 recommended by macOS (kern.sched_recommended_cores = 15) — the performance cores are parked, so CPU-bound work crawls until the controller clears: thermal pressure, or a stuck state that a sleep/wake or reboot resets.',
+    'CPU cores: 4 of 16 recommended by macOS (12 parked, kern.sched_recommended_cores = 15) — the performance controller parks cores under thermal or power pressure; a state that outlasts the load is cleared by a sleep/wake or reboot.',
+  )
+  expect(statusReport({ ...SNAPSHOT, cpuRecommended: 12, cpuMask: 15615 }, null, 0, 1_000_000, CADENCE).split('\n')[4]).toBe(
+    'CPU cores: 12 of 16 recommended by macOS (4 parked, kern.sched_recommended_cores = 15615) — the performance controller parks cores under thermal or power pressure; a state that outlasts the load is cleared by a sleep/wake or reboot.',
   )
   expect(statusReport(SNAPSHOT, null, 0, 1_000_000, CADENCE).split('\n')[4]).toBe('CPU cores: 16 of 16 available.')
   expect(statusReport(unknown, null, 0, 1_000_000, CADENCE).split('\n')[4]).toBe('CPU cores: unknown.')
   expect(coresContext(parked)).toBe(
-    'machine-guard: macOS is scheduling on 4 of 16 CPU cores right now (the performance cores are parked), so CPU-bound work runs several times slower than usual: keep worker counts small and tell the user the cores are parked.',
+    'machine-guard: macOS is scheduling on 4 of 16 CPU cores right now (12 parked by its performance controller), so CPU-bound work runs slower than usual: size worker counts to 4 cores and tell the user if it matters.',
   )
   expect(coresToast(parked)).toBe(
-    'macOS has parked the performance cores: scheduling on 4 of 16 CPUs (kern.sched_recommended_cores = 15). CPU-bound work will crawl until it clears — check thermal pressure (sudo powermetrics --samplers thermal -n 1); a sleep/wake or reboot resets a stuck controller.',
+    'macOS has parked 12 of 16 CPU cores: scheduling on 4 (kern.sched_recommended_cores = 15). CPU-bound work will crawl until it clears — check thermal pressure (sudo powermetrics --samplers thermal -n 1); a sleep/wake or reboot resets a stuck controller.',
   )
   expect(coresToast(SNAPSHOT)).toBe('All 16 CPU cores are back.')
 })

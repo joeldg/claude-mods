@@ -519,9 +519,9 @@ test('parked performance cores show on the status line and toast once per episod
   await start($, clock)
 
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91% · CPU 4/16 cores')
-  const parked = () => w.toasts.filter(text => text.startsWith('macOS has parked the performance cores'))
+  const parked = () => w.toasts.filter(text => text.startsWith('macOS has parked'))
   expect(parked()).toHaveLength(1)
-  expect(parked()[0]).toMatch(/4 of 16 CPUs \(kern\.sched_recommended_cores = 15\)/)
+  expect(parked()[0]).toMatch(/^macOS has parked 12 of 16 CPU cores: scheduling on 4 \(kern\.sched_recommended_cores = 15\)/)
 
   // The controller lets one core per cluster back: still parked, no second toast.
   w.mask = 1055
@@ -552,4 +552,32 @@ test('tells the model when it starts heavy work while the cores are parked', SLO
   expect(ran.context?.join('\n')).toMatch(/scheduling on 4 of 16 CPU cores right now/)
   const light = await $.tool.call({ tool: 'Bash', command: LIGHT })
   expect(light.context ?? []).toEqual([])
+})
+
+test('a mild parking is shown at once but toasted only once it has lasted five minutes', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  w.mask = 15615
+  await start($, clock)
+  expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91% · CPU 12/16 cores')
+  const parked = () => w.toasts.filter(text => text.startsWith('macOS has parked'))
+  const back = () => w.toasts.filter(text => text === 'All 16 CPU cores are back.')
+  expect(parked()).toHaveLength(0)
+
+  // A blip that clears within a sample toasts nothing, coming or going.
+  w.mask = 65535
+  await clock.advance(15_000)
+  expect(back()).toHaveLength(0)
+
+  // Parked again and staying: the toast comes once five minutes have passed, and the return is then announced.
+  w.mask = 15615
+  await clock.advance(15_000)
+  await clock.advance(4 * 60_000)
+  expect(parked()).toHaveLength(0)
+  await clock.advance(60_000)
+  expect(parked()).toHaveLength(1)
+  expect(parked()[0]).toMatch(/^macOS has parked 4 of 16 CPU cores: scheduling on 12 /)
+  w.mask = 65535
+  await clock.advance(15_000)
+  expect(back()).toHaveLength(1)
 })

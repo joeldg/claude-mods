@@ -29,6 +29,8 @@ export type Snapshot = {
   cpuTotal: number | null
   cpuRecommended: number | null
   cpuMask: number | null
+  /** When the current parking began (the first sample with fewer cores than the Mac has); null while all are in use. */
+  cpuParkedSince: number | null
   /** The apps holding the most memory, helpers summed into their app, from the last process table; [] when none is fresh. */
   top: AppMemory[]
   /** When that table was taken, and when one was last tried: ps runs on demand or under pressure, at most once a minute. */
@@ -51,6 +53,6 @@ export type SampleLock = { ts: number; by: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    'machine-guard': { snapshot: Snapshot | null; pausedUntil: number }
+    'machine-guard': { snapshot: Snapshot | null; pausedUntil: number; coresAnnounced: boolean }
   }
 }

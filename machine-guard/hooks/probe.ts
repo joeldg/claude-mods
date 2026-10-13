@@ -53,9 +53,19 @@ export const parseCores = (output: string): { cpuTotal: number; cpuRecommended: 
   return { cpuTotal, cpuRecommended, cpuMask }
 }
 
+/** A parking that is not severe is announced only once it has lasted this long: masks flicker under GPU load. */
+export const PARKED_TOAST_MS = 5 * 60_000
+
 /** Whether macOS is scheduling on fewer CPUs than the Mac has: the performance cores parked. */
 export const isParked = (snapshot: Snapshot | null): boolean =>
   snapshot?.cpuTotal != null && snapshot.cpuRecommended != null && snapshot.cpuRecommended < snapshot.cpuTotal
+
+/** Whether a parking is worth a toast now: at least half the cores gone, or any parking that has lasted PARKED_TOAST_MS. */
+export const shouldAnnounceParked = (snapshot: Snapshot, now: number): boolean =>
+  isParked(snapshot) &&
+  snapshot.cpuTotal !== null &&
+  snapshot.cpuRecommended !== null &&
+  (snapshot.cpuRecommended * 2 <= snapshot.cpuTotal || (snapshot.cpuParkedSince !== null && now - snapshot.cpuParkedSince >= PARKED_TOAST_MS))
 
 export type VmStat = { pageSize: number; free: number; inactive: number; speculative: number; compressorPages: number; compressedPages: number }
 
@@ -179,6 +189,7 @@ export const parseShared = (text: string | null): SharedSample | null => {
         cpuTotal: numberOrNull(data.cpuTotal),
         cpuRecommended: numberOrNull(data.cpuRecommended),
         cpuMask: numberOrNull(data.cpuMask),
+        cpuParkedSince: numberOrNull(data.cpuParkedSince),
         top: Array.isArray(data.top) ? data.top.filter(isAppMemory) : [],
         topAt: numberOrNull(data.topAt),
         topTriedAt: numberOrNull(data.topTriedAt),
@@ -416,19 +427,19 @@ export const coresLine = (snapshot: Snapshot): string =>
   snapshot.cpuTotal === null || snapshot.cpuRecommended === null
     ? 'CPU cores: unknown.'
     : isParked(snapshot)
-      ? `CPU cores: ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} recommended by macOS (kern.sched_recommended_cores = ${snapshot.cpuMask}) — ` +
-        'the performance cores are parked, so CPU-bound work crawls until the controller clears: thermal pressure, or a stuck state that a sleep/wake or reboot resets.'
+      ? `CPU cores: ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} recommended by macOS (${snapshot.cpuTotal - snapshot.cpuRecommended} parked, kern.sched_recommended_cores = ${snapshot.cpuMask}) — ` +
+        'the performance controller parks cores under thermal or power pressure; a state that outlasts the load is cleared by a sleep/wake or reboot.'
       : `CPU cores: ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} available.`
 
 /** What the model is told when it starts heavy work while the cores are parked. */
 export const coresContext = (snapshot: Snapshot): string =>
-  `machine-guard: macOS is scheduling on ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} CPU cores right now (the performance cores are parked), ` +
-  'so CPU-bound work runs several times slower than usual: keep worker counts small and tell the user the cores are parked.'
+  `machine-guard: macOS is scheduling on ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} CPU cores right now (${(snapshot.cpuTotal ?? 0) - (snapshot.cpuRecommended ?? 0)} parked by its performance controller), ` +
+  `so CPU-bound work runs slower than usual: size worker counts to ${snapshot.cpuRecommended} cores and tell the user if it matters.`
 
 /** The toast when the cores are parked, or back. */
 export const coresToast = (snapshot: Snapshot): string =>
   isParked(snapshot)
-    ? `macOS has parked the performance cores: scheduling on ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} CPUs (kern.sched_recommended_cores = ${snapshot.cpuMask}). ` +
+    ? `macOS has parked ${(snapshot.cpuTotal ?? 0) - (snapshot.cpuRecommended ?? 0)} of ${snapshot.cpuTotal} CPU cores: scheduling on ${snapshot.cpuRecommended} (kern.sched_recommended_cores = ${snapshot.cpuMask}). ` +
       'CPU-bound work will crawl until it clears — check thermal pressure (sudo powermetrics --samplers thermal -n 1); a sleep/wake or reboot resets a stuck controller.'
     : `All ${snapshot.cpuTotal} CPU cores are back.`
 
