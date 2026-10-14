@@ -520,6 +520,11 @@ test('parked performance cores show on the status line and toast once per episod
 
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91% · CPU 4/16 cores')
   const parked = () => w.toasts.filter(text => text.startsWith('macOS has parked'))
+  // Even three quarters of the cores gone is a status-line matter until it has lasted a minute: masks blip under GPU load.
+  expect(parked()).toHaveLength(0)
+  await clock.advance(45_000)
+  expect(parked()).toHaveLength(0)
+  await clock.advance(15_000)
   expect(parked()).toHaveLength(1)
   expect(parked()[0]).toMatch(/^macOS has parked 12 of 16 CPU cores: scheduling on 4 \(kern\.sched_recommended_cores = 15\)/)
 
@@ -535,8 +540,10 @@ test('parked performance cores show on the status line and toast once per episod
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91%')
   expect(w.toasts.filter(text => text === 'All 16 CPU cores are back.')).toHaveLength(1)
 
-  // Parked again: a new episode, a new toast.
+  // Parked again: a new episode, a new toast once it has lasted a minute.
   w.mask = 15
+  await clock.advance(60_000)
+  expect(parked()).toHaveLength(1)
   await clock.advance(15_000)
   expect(parked()).toHaveLength(2)
 })

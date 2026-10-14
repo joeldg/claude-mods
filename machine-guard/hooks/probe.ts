@@ -53,19 +53,24 @@ export const parseCores = (output: string): { cpuTotal: number; cpuRecommended: 
   return { cpuTotal, cpuRecommended, cpuMask }
 }
 
-/** A parking that is not severe is announced only once it has lasted this long: masks flicker under GPU load. */
+/**
+ * How long a parking must last before it is announced: a minute when at least half the cores are gone, five
+ * minutes otherwise. Masks blip for seconds under GPU load, and the status line already shows those.
+ */
+export const SEVERE_TOAST_MS = 60_000
 export const PARKED_TOAST_MS = 5 * 60_000
 
 /** Whether macOS is scheduling on fewer CPUs than the Mac has: the performance cores parked. */
 export const isParked = (snapshot: Snapshot | null): boolean =>
   snapshot?.cpuTotal != null && snapshot.cpuRecommended != null && snapshot.cpuRecommended < snapshot.cpuTotal
 
-/** Whether a parking is worth a toast now: at least half the cores gone, or any parking that has lasted PARKED_TOAST_MS. */
+/** Whether a parking is worth a toast now: it has lasted SEVERE_TOAST_MS with at least half the cores gone, or PARKED_TOAST_MS otherwise. */
 export const shouldAnnounceParked = (snapshot: Snapshot, now: number): boolean =>
   isParked(snapshot) &&
   snapshot.cpuTotal !== null &&
   snapshot.cpuRecommended !== null &&
-  (snapshot.cpuRecommended * 2 <= snapshot.cpuTotal || (snapshot.cpuParkedSince !== null && now - snapshot.cpuParkedSince >= PARKED_TOAST_MS))
+  snapshot.cpuParkedSince !== null &&
+  now - snapshot.cpuParkedSince >= (snapshot.cpuRecommended * 2 <= snapshot.cpuTotal ? SEVERE_TOAST_MS : PARKED_TOAST_MS)
 
 export type VmStat = { pageSize: number; free: number; inactive: number; speculative: number; compressorPages: number; compressedPages: number }
 
