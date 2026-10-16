@@ -188,6 +188,14 @@ test('buildSummary is the contract, field for field and in order; isSameSummary 
   expect(buildSummary(window, hits, RESET, WINDOW).nextResetAt).toBeNull()
   expect(isSameSummary(null, bare)).toBe(false)
   expect(isSameSummary(bare, { ...bare, ts: now + MINUTE })).toBe(true)
+
+  // The API's own five-hour reading, while fresh, is the share other mods should act on — before any limit was ever hit.
+  const api = { ts: now - MINUTE, percentUsed: 47.4, resetsAt: now + HOUR, sessionId: 'sess-a' }
+  expect(buildSummary({ ...window, api }, [], now, WINDOW)).toEqual(summary({ ts: now, pct: 47, nextResetAt: now + HOUR }))
+  expect(buildSummary({ ...window, api }, hits, now, WINDOW)).toMatchObject({ capEstimate: 18_000, pct: 47, nextResetAt: now + HOUR })
+  // Stale, or already reset: back to the estimate and the hit's reset.
+  expect(buildSummary({ ...window, api: { ...api, ts: now - 16 * MINUTE } }, hits, now, WINDOW)).toMatchObject({ pct: 72, nextResetAt: RESET })
+  expect(buildSummary({ ...window, api: { ...api, resetsAt: now - 1 } }, hits, now, WINDOW).pct).toBe(72)
   expect(isSameSummary(bare, { ...bare, effective: 1 })).toBe(false)
   expect(isSameSummary(bare, { ...bare, tokens: { ...bare.tokens, output: 1 } })).toBe(false)
 })

@@ -301,9 +301,13 @@ export const parseHits = (text: string | null): Hit[] => {
   return hits
 }
 
-/** summary.json, field for field in the contract's order. */
+/**
+ * summary.json, field for field in the contract's order. `pct` and `nextResetAt` come from the API's own five-hour
+ * reading while it is fresh (the limit's real figure, known before any hit), else from the last learned limit.
+ */
 export const buildSummary = (window: Window, hits: readonly Hit[], now: number, windowMs: number): Summary => {
   const cap = capEstimate(hits)
+  const api = isFreshReading(window.api, now) ? window.api : null
   let last: Hit | null = null
   for (const hit of hits) {
     if (last === null || hit.at >= last.at) {
@@ -317,11 +321,16 @@ export const buildSummary = (window: Window, hits: readonly Hit[], now: number, 
     tokens: { input: window.totals.input, cacheRead: window.totals.cacheRead, cacheWrite: window.totals.cacheWrite, output: window.totals.output },
     effective: window.effective,
     capEstimate: cap,
-    pct: cap !== null && cap > 0 ? Math.round((100 * window.effective) / cap) : null,
+    pct: api !== null ? Math.round(api.percentUsed) : cap !== null && cap > 0 ? Math.round((100 * window.effective) / cap) : null,
     lastHitAt: last === null ? null : last.at,
-    nextResetAt: last !== null && last.resetAt > now ? last.resetAt : null,
+    nextResetAt:
+      api !== null && api.resetsAt !== null && api.resetsAt > now ? api.resetsAt : last !== null && last.resetAt > now ? last.resetAt : null,
   }
 }
+
+/** The estimate alone: the window's effective tokens against the last learned limit, whatever pct carries. */
+export const estimatePct = (summary: Summary): number | null =>
+  summary.capEstimate !== null && summary.capEstimate > 0 ? Math.round((100 * summary.effective) / summary.capEstimate) : null
 
 /** Whether two summaries say the same thing, the timestamp aside. */
 export const isSameSummary = (a: Summary | null, b: Summary): boolean =>
@@ -399,13 +408,13 @@ export const describeUsage = (
       ? `Usage in the last ${hours}, all sessions: 0 eff (no turns counted yet)`
       : `Usage in the last ${hours}, all sessions: ${formatTokens(summary.effective)} eff · input ${formatTokens(t.input)} · cache read ${formatTokens(t.cacheRead)} · cache write ${formatTokens(t.cacheWrite)} · output ${formatTokens(t.output)}`,
   ]
-  if (summary.capEstimate === null || summary.pct === null) {
+  if (summary.capEstimate === null || estimatePct(summary) === null) {
     lines.push('Estimate: no limit hit seen yet, so the cap is unknown until the first')
   } else {
     const n = Math.min(3, hits.length)
     const from = n === 1 ? '1 hit' : `the median of the last ${n} hits`
     const reset = summary.nextResetAt !== null && summary.nextResetAt > now ? ` · resets ${formatClock(summary.nextResetAt, zone)}` : ''
-    lines.push(`Estimate: ${summary.pct}% of the last session limit (cap ${formatTokens(summary.capEstimate)} eff from ${from})${reset}`)
+    lines.push(`Estimate: ${estimatePct(summary)}% of the last session limit (cap ${formatTokens(summary.capEstimate)} eff from ${from})${reset}`)
   }
   const api = window.api
   if (api === null) {
