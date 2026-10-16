@@ -135,8 +135,11 @@ export const parseView = (json: unknown): PrView | null => {
 const stateOf = (view: PrView): PrState =>
   view.state === 'MERGED' ? 'merged' : view.state === 'CLOSED' ? 'closed' : 'open'
 
-/** A newly watched PR, from what gh said of it (or only its URL when gh said nothing). */
-export const watchedFrom = (ref: PrRef, view: PrView | null, now: number): WatchedPr => ({
+/**
+ * A newly watched PR, from what gh said of it (or only its URL when gh said nothing); `isOwn` when
+ * this session opened it or the person added it, false when it was adopted from the repository.
+ */
+export const watchedFrom = (ref: PrRef, view: PrView | null, now: number, isOwn: boolean): WatchedPr => ({
   number: ref.number,
   repo: ref.repo,
   url: view?.url || ref.url,
@@ -148,6 +151,7 @@ export const watchedFrom = (ref: PrRef, view: PrView | null, now: number): Watch
   runIds: view?.rollup.runIds ?? [],
   state: view ? stateOf(view) : 'open',
   cleaned: false,
+  isOwn,
   addedAt: now,
 })
 
@@ -435,3 +439,35 @@ export const gitError = (stderr: string): string => {
   const line = lines.find(one => /^(?:fatal|error):/.test(one)) ?? lines[0] ?? 'failed'
   return clip(line.replace(/^(?:fatal|error):\s*/, ''), 80)
 }
+
+export type Worktree = {
+  /** True in a worktree `git worktree add` made: its git dir is its own, under the clone's common one. */
+  isLinked: boolean
+  /** The worktree's root, absolute. */
+  path: string
+}
+
+/**
+ * Which worktree a folder is, from `git rev-parse --path-format=absolute --git-dir --git-common-dir
+ * --show-toplevel` (one line each): linked when the git dir is not the common dir, the primary one
+ * when both are the same. Null when git printed something else (not a repository, an older git).
+ */
+export const parseWorktree = (output: string): Worktree | null => {
+  const [gitDir = '', commonDir = '', top = ''] = output.split('\n').map(line => line.trim().replace(/\/+$/, ''))
+  if (!gitDir || !commonDir || !top) {
+    return null
+  }
+  return { isLinked: gitDir !== commonDir, path: top }
+}
+
+/**
+ * Whether a CI flip on a watched PR toasts in this session: an own PR's always (opened here with
+ * `gh pr create`, or added with /prs watch); an adopted PR's only when its branch is the one this
+ * worktree has checked out (`currentBranch`; null when not read), so one PR's CI toasts in one of
+ * several worktree sessions of a repository, not in each; every PR's when `toastAdopted` asks for it.
+ */
+export const shouldToastCi = (
+  pr: Pick<WatchedPr, 'isOwn' | 'branch'>,
+  currentBranch: string | null,
+  toastAdopted: boolean,
+): boolean => toastAdopted || pr.isOwn || (pr.branch !== '' && pr.branch === currentBranch)

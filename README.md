@@ -126,11 +126,13 @@ Keeps an eye on Modal so idle GPU containers don't burn credits — in the proje
 Does the "merged #219, clean up branches and start #214" round trip for you, and surfaces CI failures with their logs.
 
 - Watches your open PRs in the session's repo: it adopts them at session start, and picks up every `gh pr create` Claude runs. It polls `gh pr view` every 60s.
-- Status line: `PRs: #219 ✓ · #220 CI… · #221 ✗`. Toasts when CI fails (with the failing check names) or passes.
+- Status line: `PRs: #219 ✓ · #220 CI… · #221 ✗`, for every watched PR.
+- **CI toasts only where they're wanted.** A CI pass or failure (with the failing check names) toasts for the PRs this session opened (`gh pr create`) or you added with `/prs watch`, and for any PR whose branch this worktree has checked out. PRs adopted from the repository at start stay on the status line, in `/prs` and in `prs_status`, and still get the merge ritual, but their CI results don't toast — so with seven worktree sessions of one repo a result toasts once, where it matters, not seven times. `toastAdoptedCi` (off) brings back toasts for every watched PR.
 - **When a PR merges**, it cleans up with plain local git, then toasts the outcome and suggests carrying on (Tab to accept):
   - `git fetch --prune`, switch to the default branch (only from the PR's own branch) and `git pull --ff-only`.
   - Never with uncommitted changes, never `--force`, never other branches.
-  - Deletes the local branch only if it points at exactly the commit GitHub merged, so nothing local is lost. It also leaves a branch checked out in another worktree alone.
+  - Deletes the local branch only if it points at exactly the commit GitHub merged, so nothing local is lost. It also leaves a branch checked out in any worktree alone.
+  - **In a linked worktree** (`git worktree add`, such as Claude Code's `.claude/worktrees/<name>` sessions) it only fetches: it never switches or pulls there, because the default branch is checked out in the primary worktree and the switch could only fail (`'main' is already used by worktree …`). When the merged branch is the one the worktree has checked out, the toast says `#N merged → this worktree's branch; remove the worktree when you're done (git worktree remove <path>)` and the Tab suggestion tells Claude the branch and worktree stay until you remove them. In the primary worktree the ritual is unchanged.
   - A merge seen mid-turn is cleaned up when the turn ends, so git never races Claude.
 - **When you mention failing CI** ("#258 is failing", "CI failed, fix it"), your message goes to Claude with `gh pr checks` and the tail of the failed log attached, so you don't paste it.
 - **Claude reads the watched PRs with a tool**, `prs_status` (number, title, state, branch, CI, URL, and how old the data is), instead of running `gh pr view` or `gh pr checks` itself: no API call, and it refreshes first when the data is older than a poll.
@@ -144,6 +146,7 @@ Settings:
 - `attachCiLogs` (on)
 - `logLines` (120)
 - `deleteRemoteBranch` (off): deletes the branch on GitHub too, only while it still points at the merged commit. GitHub's own "Automatically delete head branches" setting does the same job.
+- `toastAdoptedCi` (off): toast the CI results of PRs adopted from the repository too, as every PR's used to; with several worktree sessions of one repo, each would toast.
 
 It never closes issues; put "Closes #N" in PR bodies for that.
 

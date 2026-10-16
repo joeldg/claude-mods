@@ -24,6 +24,12 @@ export type WatchedPr = {
   state: PrState
   /** True once the post-merge cleanup has run (or was skipped) for this PR. */
   cleaned: boolean
+  /**
+   * True when this session opened the PR (`gh pr create`) or the person added it (/prs watch); false
+   * when it was adopted from the repository at start. Only an own PR's CI flips toast, unless the
+   * PR's branch is the one this worktree has checked out (or toastAdoptedCi asks for every PR's).
+   */
+  isOwn: boolean
   addedAt: number
 }
 

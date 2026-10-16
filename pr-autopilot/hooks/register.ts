@@ -18,14 +18,16 @@ import {
   nameWithOwner,
   parsePrUrls,
   parseView,
+  parseWorktree,
   repoFromRemote,
   shortSha,
+  shouldToastCi,
   statusLine,
   toolReport,
   watchedFrom,
   worktreeHolding,
 } from './pr'
-import type { GhFailure, PrRef, PrView } from './pr'
+import type { GhFailure, PrRef, PrView, Worktree } from './pr'
 
 type Engine = EngineInterface
 
@@ -61,8 +63,17 @@ const RATE_HOLD_MS = 5 * 60_000
 const MAX_BACKOFF_MS = 10 * 60_000
 
 type Ran = { ok: boolean; out: string; err: string }
-type Outcome = { steps: string[]; issues: string[] }
-type Config = { pollMs: number; authRetryMs: number; deleteRemoteBranch: boolean; attachCiLogs: boolean; logLines: number }
+/** What the cleanup did and could not; `ownWorktree` is this linked worktree's root when the merged branch is the one it has checked out (left to the person, with the worktree). */
+type Outcome = { steps: string[]; issues: string[]; ownWorktree: string | null }
+type Config = {
+  pollMs: number
+  authRetryMs: number
+  deleteRemoteBranch: boolean
+  attachCiLogs: boolean
+  logLines: number
+  /** Toast CI flips of PRs adopted from the repository too, not only own PRs' and those on this worktree's branch. */
+  toastAdoptedCi: boolean
+}
 
 /** Why a gh run failed, and the line that says so. */
 type GhFailed = { kind: GhFailure; detail: string }
@@ -92,7 +103,14 @@ type GhStanding = {
   refreshedAt: number | null
 }
 
-let config: Config = { pollMs: 60_000, authRetryMs: 30 * 60_000, deleteRemoteBranch: false, attachCiLogs: true, logLines: 120 }
+let config: Config = {
+  pollMs: 60_000,
+  authRetryMs: 30 * 60_000,
+  deleteRemoteBranch: false,
+  attachCiLogs: true,
+  logLines: 120,
+  toastAdoptedCi: false,
+}
 
 const standing = (): GhStanding => ({
   hold: null,
@@ -282,17 +300,20 @@ async function patch($: Engine, pr: WatchedPr, changes: Partial<WatchedPr>) {
   await update($, prs, list => list.map(one => (isSame(one, pr) ? { ...one, ...changes } : one)))
 }
 
-/** Watches a PR, or refreshes what is known of one already watched (its CI state stays the poll's to change). */
-async function remember($: Engine, ref: PrRef, view: PrView | null) {
+/**
+ * Watches a PR, or refreshes what is known of one already watched (its CI state stays the poll's to
+ * change). `isOwn` for a PR this session opened or the person added: one adopted earlier becomes own.
+ */
+async function remember($: Engine, ref: PrRef, view: PrView | null, isOwn: boolean) {
   const now = await $.clock.now()
-  const fresh = watchedFrom(ref, view, now)
+  const fresh = watchedFrom(ref, view, now, isOwn)
   await update($, prs, list => {
     const known = list.find(one => isSame(one, ref))
     if (!known) {
       return capped([...list, fresh])
     }
     const facts = view ? { title: fresh.title, branch: fresh.branch, headSha: fresh.headSha, url: fresh.url } : {}
-    return list.map(one => (one === known ? { ...one, ...facts } : one))
+    return list.map(one => (one === known ? { ...one, ...facts, isOwn: one.isOwn || isOwn } : one))
   })
   if (view) {
     gh.refreshedAt = now
@@ -324,7 +345,7 @@ async function adopt($: Engine, cwd: string): Promise<GhFailed | null> {
     for (const item of Array.isArray(listed.json) ? listed.json : []) {
       const view = parseView(item)
       if (view?.number) {
-        await remember($, { repo, number: view.number, url: view.url }, view)
+        await remember($, { repo, number: view.number, url: view.url }, view, false)
       }
     }
     gh.refreshedAt = await $.clock.now()
@@ -405,13 +426,22 @@ async function deleteRemote($: Engine, cwd: string, pr: WatchedPr, base: string 
   }
 }
 
+/** Which worktree the session's folder is, the primary one or a linked one, and its root; null when git did not say (then it is taken for the primary one). */
+async function worktreeOf($: Engine, cwd: string): Promise<Worktree | null> {
+  const ran = await git($, cwd, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir', '--show-toplevel'])
+  return ran.ok ? parseWorktree(ran.out) : null
+}
+
+/** Where the ritual runs: the session's folder, its default branch (null when unknown) and the branch it has checked out ('' when detached). */
+type Checkout = { cwd: string; base: string | null; current: string }
+
 /**
- * The post-merge ritual in the session's folder, plain local git and safe: fetch --prune; switch
- * to the default branch (only from the PR's branch) and pull it --ff-only, never with uncommitted
- * changes; delete the PR's branch only when nothing on it would be lost; never --force.
+ * The post-merge ritual in the session's folder, plain local git and safe: nothing in a folder that
+ * is not a clone of the PR's repository; else `git fetch --prune`, then the primary worktree's ritual
+ * (cleanupPrimary) or a linked worktree's (cleanupLinked).
  */
 async function cleanup($: Engine, pr: WatchedPr): Promise<Outcome> {
-  const out: Outcome = { steps: [], issues: [] }
+  const out: Outcome = { steps: [], issues: [], ownWorktree: null }
   const cwd = await $.session.cwd()
   const origin = await git($, cwd, ['remote', 'get-url', 'origin'])
   const originRepo = origin.ok ? repoFromRemote(origin.out) : null
@@ -427,8 +457,25 @@ async function cleanup($: Engine, pr: WatchedPr): Promise<Outcome> {
     out.steps.push(`fetch failed: ${gitError(fetched.err)}`)
     out.issues.push('fetch failed')
   }
+  const tree = await worktreeOf($, cwd)
   const base = await defaultBranch($, cwd, pr.repo)
   const current = (await git($, cwd, ['branch', '--show-current'])).out.trim()
+  const at: Checkout = { cwd, base, current }
+  if (tree?.isLinked) {
+    await cleanupLinked($, pr, at, tree, out)
+  } else {
+    await cleanupPrimary($, pr, at, out)
+  }
+  return out
+}
+
+/**
+ * The primary worktree's ritual: switch to the default branch (only from the PR's branch) and pull
+ * it --ff-only, never with uncommitted changes; delete the PR's branch only when nothing on it would
+ * be lost and no worktree has it checked out; never --force.
+ */
+async function cleanupPrimary($: Engine, pr: WatchedPr, at: Checkout, out: Outcome) {
+  const { cwd, base, current } = at
   const status = await git($, cwd, ['status', '--porcelain', '--untracked-files=no'])
   const isDirty = !status.ok || status.out.trim() !== ''
 
@@ -464,7 +511,22 @@ async function cleanup($: Engine, pr: WatchedPr): Promise<Outcome> {
 
   await deleteLocal($, cwd, pr, base, out)
   await deleteRemote($, cwd, pr, base, out)
-  return out
+}
+
+/**
+ * A linked worktree's ritual (git worktree add): nothing is switched or pulled, the default branch
+ * being the primary worktree's (a switch could only fail, as `'main' is already used by worktree`).
+ * When the merged branch is the one this worktree has checked out, branch and worktree are left to
+ * the person; else the branch is deleted as in the primary worktree, never while a worktree has it.
+ */
+async function cleanupLinked($: Engine, pr: WatchedPr, at: Checkout, tree: Worktree, out: Outcome) {
+  if (at.current && at.current === pr.branch) {
+    out.ownWorktree = tree.path
+    out.steps.push(`this worktree's branch; remove the worktree when you're done (git worktree remove ${tree.path})`)
+  } else {
+    await deleteLocal($, at.cwd, pr, at.base, out)
+  }
+  await deleteRemote($, at.cwd, pr, at.base, out)
 }
 
 async function finishMerged($: Engine, pr: WatchedPr) {
@@ -472,11 +534,29 @@ async function finishMerged($: Engine, pr: WatchedPr) {
   const out = await cleanup($, pr)
   const steps = out.steps.length > 0 ? out.steps.join(' · ') : 'nothing to clean up'
   $.ui.toast(`#${pr.number} merged → ${steps}`, { timeoutMs: 12_000 })
+  // The suggestion is the person's next prompt: it tells Claude the worktree is theirs to remove, never as a command to run.
   const text =
-    out.issues.length === 0
-      ? `#${pr.number} is merged and cleaned up. Carry on with the next task.`
-      : `#${pr.number} is merged (${out.issues[0]}). Carry on with the next task.`
+    out.ownWorktree !== null
+      ? `#${pr.number} is merged; this worktree is on its branch, so both stay until I remove the worktree. Carry on with the next task.`
+      : out.issues.length === 0
+        ? `#${pr.number} is merged and cleaned up. Carry on with the next task.`
+        : `#${pr.number} is merged (${out.issues[0]}). Carry on with the next task.`
   await $.prompt.suggest({ text }).catch(() => undefined)
+}
+
+/**
+ * Whether a CI flip on `pr` toasts here (shouldToastCi): the branch this worktree has checked out is
+ * asked of git only when it decides, for an adopted PR, so the polls of own PRs run no git at all.
+ */
+async function wantsCiToast($: Engine, pr: WatchedPr): Promise<boolean> {
+  if (shouldToastCi(pr, null, config.toastAdoptedCi)) {
+    return true
+  }
+  if (!pr.branch) {
+    return false
+  }
+  const current = (await git($, await $.session.cwd(), ['branch', '--show-current'])).out.trim()
+  return shouldToastCi(pr, current, config.toastAdoptedCi)
 }
 
 /** Reads one open PR's state and checks, and says when CI flips or the PR is merged or closed; what gh refused, if anything. */
@@ -498,10 +578,13 @@ async function refresh($: Engine, pr: WatchedPr): Promise<GhFailed | null> {
   const { ci, failing, runIds } = view.rollup
   await patch($, pr, { ...facts, ci, failing, runIds })
   // CI that was merely unknown (its checks unreadable) has not flipped: no toast for reading it at last.
-  if (pr.ci !== 'unknown' && ci !== pr.ci && ci === 'fail') {
-    $.ui.toast(`CI failed on #${pr.number}: ${clip(failing.join(', '), 100)}`, { timeoutMs: 10_000 })
-  } else if (pr.ci !== 'unknown' && ci !== pr.ci && ci === 'pass') {
-    $.ui.toast(`CI passed on #${pr.number}`)
+  const isFlipped = pr.ci !== 'unknown' && ci !== pr.ci && (ci === 'fail' || ci === 'pass')
+  if (isFlipped && (await wantsCiToast($, { ...pr, ...facts }))) {
+    if (ci === 'fail') {
+      $.ui.toast(`CI failed on #${pr.number}: ${clip(failing.join(', '), 100)}`, { timeoutMs: 10_000 })
+    } else {
+      $.ui.toast(`CI passed on #${pr.number}`)
+    }
   }
   return null
 }
@@ -635,7 +718,7 @@ async function runPrs($: Engine, args: string): Promise<string> {
     if (!view || !resolved) {
       return `pr-autopilot: gh found no PR #${number} in ${repo ?? "this folder's repository"}.`
     }
-    await remember($, { repo: resolved, number, url: view.url }, view)
+    await remember($, { repo: resolved, number, url: view.url }, view, true)
     await poll($)
     const watched = (await read($, prs)).find(pr => isSame(pr, { repo: resolved, number }))
     return watched ? `Watching ${describePrs([watched])}` : `Watching #${number}.`
@@ -669,6 +752,7 @@ export const register: Register = (on, options) => {
     deleteRemoteBranch: options.deleteRemoteBranch === true,
     attachCiLogs: options.attachCiLogs !== false,
     logLines: Math.max(10, Math.min(2000, Number(options.logLines ?? 120))),
+    toastAdoptedCi: options.toastAdoptedCi === true,
   }
   gh = standing()
   timer = null
@@ -716,7 +800,7 @@ export const register: Register = (on, options) => {
     }
     try {
       for (const ref of parsePrUrls(ran.text)) {
-        await remember($, ref, (await viewPr($, String(ref.number), ref.repo)).view)
+        await remember($, ref, (await viewPr($, String(ref.number), ref.repo)).view, true)
       }
       await showStatus($)
     } catch (error) {

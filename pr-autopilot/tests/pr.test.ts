@@ -14,8 +14,10 @@ import {
   nameWithOwner,
   parsePrUrls,
   parseView,
+  parseWorktree,
   repoFromRemote,
   runIdOf,
+  shouldToastCi,
   statusLine,
   summarizeRollup,
   tailLines,
@@ -44,6 +46,7 @@ const pr = (number: number, changes: Partial<WatchedPr> = {}): WatchedPr => ({
   runIds: [],
   state: 'open',
   cleaned: false,
+  isOwn: true,
   addedAt: number,
   ...changes,
 })
@@ -230,6 +233,34 @@ test('finds the worktree that holds a branch', () => {
   ].join('\n')
   expect(worktreeHolding(porcelain, 'codex/faster')).toBe('/Users/me/widgets-faster')
   expect(worktreeHolding(porcelain, 'codex/other')).toBeNull()
+})
+
+test('tells a linked worktree from the primary one by its git dir', () => {
+  // `git rev-parse --path-format=absolute --git-dir --git-common-dir --show-toplevel`, one line each.
+  expect(parseWorktree('/Users/me/widgets/.git\n/Users/me/widgets/.git\n/Users/me/widgets\n')).toEqual({
+    isLinked: false,
+    path: '/Users/me/widgets',
+  })
+  expect(
+    parseWorktree('/Users/me/widgets/.git/worktrees/faster\n/Users/me/widgets/.git\n/Users/me/widgets/.claude/worktrees/faster\n'),
+  ).toEqual({ isLinked: true, path: '/Users/me/widgets/.claude/worktrees/faster' })
+  // Without --path-format, git prints the primary worktree's dirs relative: still the same dir.
+  expect(parseWorktree('.git\n.git\n/Users/me/widgets\n')?.isLinked).toBe(false)
+  expect(parseWorktree('')).toBeNull()
+  expect(parseWorktree('fatal: not a git repository (or any of the parent directories): .git\n')).toBeNull()
+})
+
+test("CI flips toast for own PRs, and for adopted ones only on this worktree's branch", () => {
+  const own = pr(219, { isOwn: true, branch: 'codex/faster' })
+  const adopted = pr(221, { isOwn: false, branch: 'codex/lint' })
+  expect(shouldToastCi(own, null, false)).toBe(true)
+  expect(shouldToastCi(adopted, null, false)).toBe(false)
+  expect(shouldToastCi(adopted, 'main', false)).toBe(false)
+  expect(shouldToastCi(adopted, 'codex/lint', false)).toBe(true)
+  // The option asks for every watched PR's.
+  expect(shouldToastCi(adopted, 'main', true)).toBe(true)
+  // A branch gh never named, in a detached worktree: two empty names are no match.
+  expect(shouldToastCi(pr(222, { isOwn: false, branch: '' }), '', false)).toBe(false)
 })
 
 test('writes the status line and the /prs listing', () => {

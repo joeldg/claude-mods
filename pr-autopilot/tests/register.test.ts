@@ -16,6 +16,11 @@ const CHECKS_DENIED =
 const NOT_LOGGED_IN = 'HTTP 401: Requires authentication (https://api.github.com/graphql)'
 const TOOL = 'mcp__pr-autopilot__prs_status'
 const SESSION = { cwd: CWD, surface: 'terminal' as const, isInteractive: true }
+/** This session's folder when it is a linked worktree of the same clone (`git worktree add .claude/worktrees/faster`). */
+const WT = `${CWD}/.claude/worktrees/faster`
+/** How the cleanup tells a linked worktree from the primary one: git dir, common dir, this worktree's root. */
+const REV_PARSE = 'git rev-parse --path-format=absolute --git-dir --git-common-dir --show-toplevel'
+const VIEW_221 = `gh pr view 221 --repo acme/widgets --json ${FIELDS}`
 
 type Answer = { code?: number; out?: string; err?: string }
 type Ran = { argv: string; cwd: string | undefined }
@@ -53,6 +58,19 @@ const view219 = (state: string, rollup: unknown[] = []) =>
     mergedAt: state === 'MERGED' ? '2026-10-07T10:00:00Z' : null,
   })
 
+/** What `gh pr view 221 --json …` prints: a second PR, on codex/lint. */
+const view221 = (state: string, rollup: unknown[] = []) =>
+  JSON.stringify({
+    number: 221,
+    url: 'https://github.com/acme/widgets/pull/221',
+    state,
+    title: 'Lint fixes',
+    headRefName: 'codex/lint',
+    headRefOid: 'd'.repeat(40),
+    statusCheckRollup: rollup,
+    mergedAt: null,
+  })
+
 /** The same, read without the checks. */
 const plain219 = (state: string) => {
   const full = JSON.parse(view219(state)) as Record<string, unknown>
@@ -64,6 +82,7 @@ const plain219 = (state: string) => {
 const CLEAN_ON_PR_BRANCH: Record<string, Answer> = {
   'git remote get-url origin': { out: 'git@github.com:acme/widgets.git\n' },
   'git fetch --prune origin': {},
+  [REV_PARSE]: { out: `${CWD}/.git\n${CWD}/.git\n${CWD}\n` },
   'git symbolic-ref --short refs/remotes/origin/HEAD': { out: 'origin/main\n' },
   'git branch --show-current': { out: 'codex/faster\n' },
   'git status --porcelain --untracked-files=no': { out: '' },
@@ -74,8 +93,27 @@ const CLEAN_ON_PR_BRANCH: Record<string, Answer> = {
   'git branch -D codex/faster': { out: 'Deleted branch codex/faster (was bbbbbbb).\n' },
 }
 
+/**
+ * The git a clean linked worktree of the same clone answers, on the PR's branch, main checked out in
+ * the primary worktree: what `git switch main` and `git branch -D` would say there.
+ */
+const LINKED_ON_PR_BRANCH: Record<string, Answer> = {
+  'git remote get-url origin': { out: 'git@github.com:acme/widgets.git\n' },
+  'git fetch --prune origin': {},
+  [REV_PARSE]: { out: `${CWD}/.git/worktrees/faster\n${CWD}/.git\n${WT}\n` },
+  'git symbolic-ref --short refs/remotes/origin/HEAD': { out: 'origin/main\n' },
+  'git branch --show-current': { out: 'codex/faster\n' },
+  'git status --porcelain --untracked-files=no': { out: '' },
+  'git switch main': { code: 128, err: `fatal: 'main' is already used by worktree at '${CWD}'\n` },
+  'git rev-parse --verify --quiet refs/heads/codex/faster': { out: `${HEAD}\n` },
+  'git worktree list --porcelain': {
+    out: `worktree ${CWD}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/main\n\nworktree ${WT}\nHEAD ${HEAD}\nbranch refs/heads/codex/faster\n\n`,
+  },
+  'git branch -D codex/faster': { code: 1, err: `error: cannot delete branch 'codex/faster' used by worktree at '${WT}'\n` },
+}
+
 /** Answers the host beneath the plugin: commands by argv, toasts, the status line, the prompt box. */
-const world = (on: On): World => {
+const world = (on: On, cwd = CWD): World => {
   const w: World = { answers: new Map(), ran: [], toasts: [], statuses: [], suggested: [], bash: [], logs: [], tools: [] }
   on('process.run', (_$, e) => {
     const argv = e.argv.join(' ')
@@ -92,7 +130,7 @@ const world = (on: On): World => {
       },
     }
   })
-  on('session.cwd', () => ({ value: CWD }))
+  on('session.cwd', () => ({ value: cwd }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('ui.toast', (_$, e) => {
@@ -147,6 +185,13 @@ const typed = (command: string, args: string) => ({
 
 const createPr = (w: World, rollup: () => unknown[], state: () => string = () => 'OPEN') =>
   w.answers.set(VIEW_219, () => ({ out: view219(state(), rollup()) }))
+
+/** Answers the adoption at session start: a clone of acme/widgets whose open PRs by @me are `items`. */
+const adoptable = (w: World, items: () => unknown[]) => {
+  w.answers.set('git rev-parse --is-inside-work-tree', { out: 'true\n' })
+  w.answers.set('gh repo view --json nameWithOwner', { out: '{"nameWithOwner":"acme/widgets"}\n' })
+  w.answers.set(LIST, () => ({ out: JSON.stringify(items()) }))
+}
 
 test('a PR opened with gh pr create is watched and shown on the status line', async ($, on) => {
   mock.clock(on, { now: 1_000 })
@@ -210,6 +255,7 @@ test('a merge runs the cleanup once, in order, and suggests carrying on', async 
   expect(gitRan(w)).toEqual([
     'git remote get-url origin',
     'git fetch --prune origin',
+    REV_PARSE,
     'git symbolic-ref --short refs/remotes/origin/HEAD',
     'git branch --show-current',
     'git status --porcelain --untracked-files=no',
@@ -742,3 +788,178 @@ test(
     expect(count(w, VIEW_219)).toBe(0)
   },
 )
+
+test("in a linked worktree a merge of this worktree's branch fetches, never switches or pulls, and leaves the worktree to you", async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, WT)
+  let state = 'OPEN'
+  createPr(w, () => [run('lint', 'COMPLETED', 'SUCCESS')], () => state)
+  for (const [argv, answer] of Object.entries(LINKED_ON_PR_BRANCH)) {
+    w.answers.set(argv, answer)
+  }
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+
+  state = 'MERGED'
+  await clock.advance(60_000)
+  expect(gitRan(w)).toEqual([
+    'git remote get-url origin',
+    'git fetch --prune origin',
+    REV_PARSE,
+    'git symbolic-ref --short refs/remotes/origin/HEAD',
+    'git branch --show-current',
+  ])
+  expect(w.ran.filter(one => one.argv.startsWith('git ')).every(one => one.cwd === WT)).toBe(true)
+  expect(w.toasts).toEqual([
+    `#219 merged → this worktree's branch; remove the worktree when you're done (git worktree remove ${WT})`,
+  ])
+  // The suggestion is a prompt to Claude: it says the worktree is the person's to remove, never as a command to run.
+  expect(w.suggested).toEqual([
+    '#219 is merged; this worktree is on its branch, so both stay until I remove the worktree. Carry on with the next task.',
+  ])
+  expect(w.statuses.at(-1)).toBeUndefined()
+  expect((await $.command.run(typed('prs', ''))).text).toBe(
+    '#219 acme/widgets · merged, cleaned up · codex/faster · Faster widgets',
+  )
+})
+
+test('in a linked worktree on another branch, nothing is switched or pulled, and the merged branch is deleted when no worktree holds it', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, WT)
+  let state = 'OPEN'
+  createPr(w, () => [], () => state)
+  for (const [argv, answer] of Object.entries(LINKED_ON_PR_BRANCH)) {
+    w.answers.set(argv, answer)
+  }
+  w.answers.set('git branch --show-current', { out: 'codex/other\n' })
+  w.answers.set('git worktree list --porcelain', {
+    out: `worktree ${CWD}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/main\n\nworktree ${WT}\nHEAD ${'3'.repeat(40)}\nbranch refs/heads/codex/other\n\n`,
+  })
+  w.answers.set('git branch -D codex/faster', { out: 'Deleted branch codex/faster (was bbbbbbb).\n' })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+
+  state = 'MERGED'
+  await clock.advance(60_000)
+  expect(gitRan(w)).toEqual([
+    'git remote get-url origin',
+    'git fetch --prune origin',
+    REV_PARSE,
+    'git symbolic-ref --short refs/remotes/origin/HEAD',
+    'git branch --show-current',
+    'git rev-parse --verify --quiet refs/heads/codex/faster',
+    'git worktree list --porcelain',
+    'git branch -D codex/faster',
+  ])
+  expect(w.toasts).toEqual(['#219 merged → branch codex/faster deleted'])
+  expect(w.suggested).toEqual(['#219 is merged and cleaned up. Carry on with the next task.'])
+})
+
+test('in a linked worktree, a merged branch another worktree has checked out is kept', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const other = `${CWD}/.claude/worktrees/other`
+  const w = world(on, other)
+  let state = 'OPEN'
+  createPr(w, () => [], () => state)
+  for (const [argv, answer] of Object.entries(LINKED_ON_PR_BRANCH)) {
+    w.answers.set(argv, answer)
+  }
+  w.answers.set(REV_PARSE, { out: `${CWD}/.git/worktrees/other\n${CWD}/.git\n${other}\n` })
+  w.answers.set('git branch --show-current', { out: 'codex/other\n' })
+  w.answers.set('git worktree list --porcelain', {
+    out:
+      `worktree ${CWD}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/main\n\n` +
+      `worktree ${WT}\nHEAD ${HEAD}\nbranch refs/heads/codex/faster\n\n` +
+      `worktree ${other}\nHEAD ${'3'.repeat(40)}\nbranch refs/heads/codex/other\n\n`,
+  })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+
+  state = 'MERGED'
+  await clock.advance(60_000)
+  expect(gitRan(w).some(argv => /^git (switch|pull|checkout|branch -D|push)/.test(argv))).toBe(false)
+  expect(w.toasts).toEqual([`#219 merged → branch codex/faster kept: checked out in ${WT}`])
+  expect(w.suggested).toEqual([`#219 is merged (branch codex/faster is checked out in ${WT}). Carry on with the next task.`])
+})
+
+test('when git cannot say which worktree this is, the ritual runs as in the primary worktree', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  let state = 'OPEN'
+  createPr(w, () => [], () => state)
+  for (const [argv, answer] of Object.entries(CLEAN_ON_PR_BRANCH)) {
+    w.answers.set(argv, answer)
+  }
+  w.answers.set(REV_PARSE, { code: 129, err: "error: unknown option `path-format=absolute'\n" })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+
+  state = 'MERGED'
+  await clock.advance(60_000)
+  expect(gitRan(w)).toContain('git switch main')
+  expect(gitRan(w)).toContain('git pull --ff-only origin main')
+  expect(w.toasts).toEqual(['#219 merged → main pulled · branch codex/faster deleted'])
+})
+
+test("CI flips on PRs adopted from the repository do not toast, unless the PR is on this worktree's branch", async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  let rollup219: unknown[] = [run('lint', 'IN_PROGRESS', '')]
+  let rollup221: unknown[] = [run('lint', 'IN_PROGRESS', '')]
+  adoptable(w, () => [JSON.parse(view219('OPEN', rollup219)), JSON.parse(view221('OPEN', rollup221))])
+  w.answers.set(VIEW_219, () => ({ out: view219('OPEN', rollup219) }))
+  w.answers.set(VIEW_221, () => ({ out: view221('OPEN', rollup221) }))
+  // This worktree is on #221's branch.
+  w.answers.set('git branch --show-current', { out: 'codex/lint\n' })
+  await $.session.start(SESSION)
+  await clock.settle()
+  expect(w.statuses.at(-1)).toBe('PRs: #219 CI… · #221 CI…')
+
+  rollup219 = [run('lint', 'COMPLETED', 'SUCCESS')]
+  rollup221 = [run('lint', 'COMPLETED', 'FAILURE', 42)]
+  await clock.advance(60_000)
+  // #219 is on another branch: its pass reaches the status line only. #221 is this worktree's branch: its failure toasts.
+  expect(w.toasts).toEqual(['CI failed on #221: lint'])
+  expect(w.statuses.at(-1)).toBe('PRs: #219 ✓ · #221 ✗')
+  // git is asked for the current branch only for an adopted PR whose CI flipped, in the session's folder.
+  const asked = w.ran.filter(one => one.argv === 'git branch --show-current')
+  expect(asked).toHaveLength(2)
+  expect(asked.every(one => one.cwd === CWD)).toBe(true)
+  // The quiet PR is still reported.
+  expect(String((await $.tool.call({ tool: TOOL, number: 219 })).result)).toMatch(
+    /^#219 Faster widgets · open · codex\/faster · CI passed · /,
+  )
+
+  // `gh pr create` for a PR already adopted (gh says it exists) makes it this session's own: its flips toast from then on.
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  rollup219 = [run('lint', 'COMPLETED', 'FAILURE', 7)]
+  await clock.advance(60_000)
+  expect(w.toasts).toEqual(['CI failed on #221: lint', 'CI failed on #219: lint'])
+})
+
+test('with toastAdoptedCi on, adopted PRs toast their CI flips too, without asking git', { options: { toastAdoptedCi: true } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  let rollup: unknown[] = [run('lint', 'IN_PROGRESS', '')]
+  adoptable(w, () => [JSON.parse(view219('OPEN', rollup))])
+  w.answers.set(VIEW_219, () => ({ out: view219('OPEN', rollup) }))
+  w.answers.set('git branch --show-current', { out: 'main\n' })
+  await $.session.start(SESSION)
+  await clock.settle()
+
+  rollup = [run('lint', 'COMPLETED', 'SUCCESS')]
+  await clock.advance(60_000)
+  expect(w.toasts).toEqual(['CI passed on #219'])
+  expect(count(w, 'git branch --show-current')).toBe(0)
+})
+
+test('a PR added with /prs watch toasts its CI flips like one opened here', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  let rollup: unknown[] = [run('lint', 'IN_PROGRESS', '')]
+  w.answers.set(`gh pr view 219 --json ${FIELDS}`, () => ({ out: view219('OPEN', rollup) }))
+  w.answers.set(VIEW_219, () => ({ out: view219('OPEN', rollup) }))
+  w.answers.set('git branch --show-current', { out: 'main\n' })
+  await $.command.run(typed('prs', 'watch 219'))
+
+  rollup = [run('lint', 'COMPLETED', 'SUCCESS')]
+  await clock.advance(60_000)
+  expect(w.toasts).toEqual(['CI passed on #219'])
+  expect(count(w, 'git branch --show-current')).toBe(0)
+})

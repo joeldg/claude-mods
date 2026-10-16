@@ -1,7 +1,7 @@
 {
   "name": "pr-autopilot",
-  "version": "0.2.0",
-  "description": "Watches your open pull requests: CI pass/fail toasts, failing-check logs attached when you mention them, a prs_status tool so Claude reads them without gh, and the post-merge ritual (fetch --prune, switch, ff-only pull, delete the branch) done for you with no model calls. Tells you once when gh's token cannot read checks.",
+  "version": "0.3.0",
+  "description": "Watches your open pull requests: CI pass/fail toasts for the PRs you open here, failing-check logs attached when you mention them, a prs_status tool so Claude reads them without gh, and the post-merge ritual (fetch --prune, switch, ff-only pull, delete the branch) done for you with no model calls; in a linked worktree it only fetches and leaves the worktree to you. Tells you once when gh's token cannot read checks.",
   "author": {
     "name": "joeldg"
   },
@@ -36,6 +36,12 @@
       "title": "Failed log lines to attach",
       "description": "How many lines from the end of the failed run's log are attached.",
       "default": 120
+    },
+    "toastAdoptedCi": {
+      "type": "boolean",
+      "title": "Toast CI results of adopted PRs too",
+      "description": "CI pass/fail toasts come for the PRs this session opened (gh pr create) or you added with /prs watch, and for any PR whose branch this worktree has checked out; PRs adopted from the repository at start stay on the status line and in prs_status without toasting, so with several worktree sessions of one repository a result toasts once, not in each. On, every watched PR's CI toasts.",
+      "default": false
     }
   }
 }
