@@ -1,6 +1,6 @@
 {
   "name": "job-watch",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Live pane of long-running jobs (training, downloads, extractions): progress, ETA, stalls and finishes, read from their logs with no model calls; jobs_list / jobs_watch / jobs_unwatch tools so Claude follows jobs instead of polling them.",
   "author": {
     "name": "joeldg"
@@ -22,7 +22,7 @@
     "keepDoneMinutes": {
       "type": "number",
       "title": "Keep finished jobs (minutes)",
-      "description": "How long a finished job stays in the pane before it is dropped.",
+      "description": "How long a finished job stays in the pane before it is dropped. A timer (a bare sleep of Claude's) leaves after a minute.",
       "default": 120
     },
     "autoOpen": {

@@ -12,19 +12,19 @@ const LAUNCH_NOISE = new Set(['nohup', 'nice', 'caffeinate', 'env', 'exec', 'tim
 const GENERIC = new Set(['python', 'python3', 'bash', 'sh', 'zsh', 'node', 'uv', 'poetry', 'ruby'])
 const POLLERS = /^(sleep|tail|until|while|watch|wait|gh|git|ls|cat|echo|ps|pgrep)$/
 
-const splitWords = (segment: string): string[] =>
-  segment.match(/"[^"]*"|'[^']*'|\S+/g)?.map(word => word.replace(/^["']|["']$/g, '')) ?? []
+const unquote = (word: string): string => word.replace(/^["']|["']$/g, '')
+
+const splitWords = (segment: string): string[] => segment.match(/"[^"]*"|'[^']*'|\S+/g)?.map(unquote) ?? []
 
 /**
- * A substring that `ps -axo command=` shows while the job runs: a `-m` module, a
- * script path, or the executable, after launch wrappers and env assignments.
+ * The index of the first word that is a program: past assignments, the `skipped` words (launch
+ * wrappers, and for the timer detector the shell's keywords) and a wrapper's options (`nice -n 15`).
  */
-export const matchToken = (segment: string): string | null => {
-  const words = splitWords(segment.split(/\s(?:>>?|2>|&>|<)\s?/)[0] ?? '')
+const programIndex = (words: readonly string[], skipped: ReadonlySet<string>): number => {
   let index = 0
   while (index < words.length) {
     const word = words[index] ?? ''
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || LAUNCH_NOISE.has(word)) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || skipped.has(word)) {
       index += word === 'nice' && words[index + 1] === '-n' ? 3 : 1
       continue
     }
@@ -34,7 +34,16 @@ export const matchToken = (segment: string): string | null => {
     }
     break
   }
-  const rest = words.slice(index)
+  return index
+}
+
+/**
+ * A substring that `ps -axo command=` shows while the job runs: a `-m` module, a
+ * script path, or the executable, after launch wrappers and env assignments.
+ */
+export const matchToken = (segment: string): string | null => {
+  const words = splitWords(segment.split(/\s(?:>>?|2>|&>|<)\s?/)[0] ?? '')
+  const rest = words.slice(programIndex(words, LAUNCH_NOISE))
   const moduleAt = rest.indexOf('-m')
   if (moduleAt >= 0 && rest[moduleAt + 1]) {
     return rest[moduleAt + 1] ?? null
@@ -59,6 +68,111 @@ export const matchToken = (segment: string): string | null => {
     literal.push(word)
   }
   return literal.join(' ') || null
+}
+
+/** What a pure wait is made of: a `sleep`, or a bare `timeout`. */
+const TIMER_PROGRAMS = new Set(['sleep', 'timeout'])
+/** What may dress a timer without making it a job: echoes, shell tests and the clock. */
+const TRIVIAL_PROGRAMS = new Set([
+  'echo', 'printf', 'date', 'true', 'false', ':', 'test', '[', '[[', ']', ']]', 'wait', 'exit', 'seq',
+])
+/**
+ * Programs that only read. A task described as a wait may poll a log or a process with these and
+ * report with them when it wakes (`until rg -q done log; do sleep 30; done; tail -3 log`) and still
+ * be a wait, not a job.
+ */
+const READING_PROGRAMS = new Set([
+  'cat', 'head', 'tail', 'wc', 'cut', 'tr', 'sort', 'uniq', 'grep', 'egrep', 'fgrep', 'rg', 'awk', 'jq',
+  'ls', 'stat', 'du', 'df', 'file', 'basename', 'dirname', 'readlink', 'realpath', 'pwd',
+  'pgrep', 'ps', 'top', 'sysctl', 'vm_stat', 'uptime', 'uname', 'hostname', 'ioreg', 'plutil',
+])
+const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'in', '!', '{', '}'])
+const SKIPPED = new Set([...LAUNCH_NOISE, ...KEYWORDS])
+/** `timeout`'s options that take a value. */
+const TIMEOUT_VALUED = new Set(['-k', '-s', '--kill-after', '--signal'])
+const TIMER_WORDS = /\b(wait|timer|pause|delay)\b/i
+/** A command's words, quotes kept whole, and its control operators. */
+const TOKENS = /"[^"]*"|'[^']*'|&&|\|\||[;|&\n]|[^\s;|&"']+/g
+const OPERATOR = /^(?:&&|\|\||[;|&\n])$/
+const SUBSTITUTION = /\$\(([^()]*)\)|`([^`]*)`/g
+/** A redirection (`> log`, `2>&1`, `&>/dev/null`), whose `&` is no control operator. */
+const REDIRECTION = /\d*[<>]+&?\d*|&>>?/g
+
+const basename = (word: string): string => word.split('/').pop() || word
+
+/** The words of each simple command in `text`: split at `&&`, `||`, `;`, `|`, `&` and newlines outside quotes. */
+const simpleCommands = (text: string): string[][] => {
+  const commands: string[][] = [[]]
+  for (const token of text.match(TOKENS) ?? []) {
+    if (OPERATOR.test(token)) {
+      commands.push([])
+    } else {
+      commands[commands.length - 1]?.push(unquote(token))
+    }
+  }
+  return commands.filter(words => words.length > 0)
+}
+
+/** The command `timeout` runs, past its options and the duration; null for a bare `timeout N`. */
+const timedOut = (words: readonly string[], from: number): string | null => {
+  let at = from
+  while (words[at]?.startsWith('-')) {
+    at += TIMEOUT_VALUED.has(words[at] ?? '') ? 2 : 1
+  }
+  if (/^\d+(\.\d+)?[smhd]?$/.test(words[at] ?? '')) {
+    at += 1
+  }
+  const wrapped = words[at]
+  return wrapped ? basename(wrapped) : null
+}
+
+/**
+ * The program each simple command of `command` runs (`sleep 600 && echo done` → sleep, echo): what
+ * `$(…)` and backticks run counted too, assignments, launch wrappers (nohup, nice…) and shell keywords
+ * skipped, redirections ignored, a `for` list passed over, and the command `timeout` wraps named after it.
+ */
+export const programsOf = (command: string): string[] => {
+  const programs: string[] = []
+  const text = command
+    .replace(SUBSTITUTION, (_whole: string, inner: string | undefined, ticked: string | undefined) => {
+      programs.push(...programsOf(inner ?? ticked ?? ''))
+      return ' '
+    })
+    .replace(REDIRECTION, ' ')
+    .replace(/[()]/g, ' ')
+  for (const words of simpleCommands(text)) {
+    const index = programIndex(words, SKIPPED)
+    const head = words[index]
+    if (!head || words[0] === 'for') {
+      continue
+    }
+    const program = basename(head)
+    programs.push(program)
+    const wrapped = program === 'timeout' ? timedOut(words, index + 1) : null
+    if (wrapped) {
+      programs.push(wrapped)
+    }
+  }
+  return programs
+}
+
+/**
+ * Whether a background command is a pure wait: a `sleep` (or a bare `timeout`) dressed at most with
+ * echoes, tests and the clock; or, when described as a wait, timer, pause or delay, one that at most
+ * polls and reports with programs that only read (rg, tail, pgrep…). Such a task is tracked but never
+ * announced. Anything that runs a real program is a job, however it is described.
+ */
+export const isTimerTask = (command: string, description = ''): boolean => {
+  const programs = programsOf(command)
+  if (programs.length === 0) {
+    return false
+  }
+  const isAllowed = (program: string, mayRead: boolean) =>
+    TIMER_PROGRAMS.has(program) || TRIVIAL_PROGRAMS.has(program) || (mayRead && READING_PROGRAMS.has(program))
+  const isPureTimer =
+    programs.some(program => TIMER_PROGRAMS.has(program)) && programs.every(program => isAllowed(program, false))
+  const isDescribedWait = TIMER_WORDS.test(description) && programs.every(program => isAllowed(program, true))
+  return isPureTimer || isDescribedWait
 }
 
 export type Launch = { log: string; segment: string; cwd: string | null }

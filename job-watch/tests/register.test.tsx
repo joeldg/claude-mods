@@ -35,6 +35,8 @@ type World = {
   psRuns: string[][]
   log: string
   size: number
+  /** Logs and sizes by path, for tests with more than one job; a path not here reads `log` and `size`. */
+  files: Record<string, { log: string; size: number }>
   toasts: string[]
   statuses: (string | undefined)[]
   logs: string[]
@@ -51,6 +53,7 @@ const world = (on: On, now: () => number): World => {
     psRuns: [],
     log: '',
     size: 0,
+    files: {},
     toasts: [],
     statuses: [],
     logs: [],
@@ -67,9 +70,15 @@ const world = (on: On, now: () => number): World => {
       w.psRuns.push([...e.argv])
       return w.psFails ? { deny: 'aborted: still running after 10000ms' } : out(w.ps)
     }
-    return command === 'tail' ? out(w.log) : command === 'df' ? out(DF) : out('')
+    return command === 'tail'
+      ? out(w.files[e.argv[3] ?? '']?.log ?? w.log)
+      : command === 'df'
+        ? out(DF)
+        : out('')
   })
-  on('fs.stat', () => ({ value: { kind: 'file' as const, size: w.size, mtimeMs: now(), isLink: false } }))
+  on('fs.stat', (_$, e) => ({
+    value: { kind: 'file' as const, size: w.files[e.path]?.size ?? w.size, mtimeMs: now(), isLink: false },
+  }))
   on('fs.exists', (_$, e) => ({ value: !e.path.includes('missing') }))
   on('ui.toast', (_$, e) => {
     w.toasts.push(e.text)
@@ -470,36 +479,160 @@ test('a ps probe that times out backs off, doubling up to a cap, and a fast one 
   await clock.advance(60_000)
   expect(w.psRuns).toHaveLength(6)
 
-  // Each timeout doubles the interval: 20s, 40s, 80s, 160s, then the 5 min cap.
+  // Each timeout doubles the interval: 20s, 40s, 80s, 160s, then the 5 min cap. No pace has held for two
+  // probes yet, so none is logged.
   w.psFails = true
   w.psRuns.length = 0
   await clock.advance(600_000)
   expect(w.psRuns).toHaveLength(5)
-  expect(w.logs.filter(line => line.startsWith('job-watch: ps'))).toEqual([
-    'job-watch: ps timed out: probing every 20s',
-    'job-watch: ps timed out: probing every 40s',
-    'job-watch: ps timed out: probing every 80s',
-    'job-watch: ps timed out: probing every 3m',
-    'job-watch: ps timed out: probing every 5m',
-  ])
+  expect(w.logs.filter(line => line.startsWith('job-watch: ps'))).toEqual([])
   // With ps unanswered the job is judged by its log alone, so it is not pronounced finished.
   expect(await tool($, 'jobs_list')).toMatch(/^train \[pid-4242\]: running · pid 4242/)
+  // That jobs_list was the 30th tick since the last probe and probed again (still failing): the cap has
+  // held for two probes now, and is logged once.
+  expect(w.logs.filter(line => line.startsWith('job-watch: ps'))).toEqual(['job-watch: ps timed out: probing every 5m'])
 
-  // That jobs_list was the 30th tick since the last probe and probed again (still failing), so the next
-  // probe is due 5 min on: fast, it restores the pace, and ps runs every tick again.
+  // The next probe is due 5 min on: fast, it restores the pace, and ps runs every tick again. The base
+  // pace is logged once it too has held for two probes: that one and the tick after it.
   w.psFails = false
   w.psRuns.length = 0
   await clock.advance(300_000)
   expect(w.psRuns).toHaveLength(1)
-  expect(w.logs.at(-1)).toBe('job-watch: ps is fast again: probing every 10s')
+  expect(w.logs.at(-1)).toBe('job-watch: ps timed out: probing every 5m')
   await clock.advance(60_000)
   expect(w.psRuns).toHaveLength(7)
   expect(w.logs.filter(line => line.startsWith('job-watch: ps'))).toEqual([
-    'job-watch: ps timed out: probing every 20s',
-    'job-watch: ps timed out: probing every 40s',
-    'job-watch: ps timed out: probing every 80s',
-    'job-watch: ps timed out: probing every 3m',
     'job-watch: ps timed out: probing every 5m',
     'job-watch: ps is fast again: probing every 10s',
   ])
+})
+
+test('a pace is logged once it has held for two probes, at most once in five minutes; one that flaps is not', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  await start($)
+  w.ps = ' 4242 python train.py\n  777 ffmpeg -i in.mov out.mp4\n'
+  await tool($, 'jobs_watch', { pid: 4242, name: 'train' })
+  const psLogs = () => w.logs.filter(line => line.startsWith('job-watch: ps'))
+  let fails: () => boolean = () => false
+  Object.defineProperty(w, 'psFails', { get: () => fails() })
+
+  // Slow and fast probes alternate for ten minutes, as under a swinging load: the pace flips between
+  // 20s and 10s on every probe, holds nowhere, and leaves no line.
+  w.psRuns.length = 0
+  fails = () => w.psRuns.length % 2 === 1
+  await clock.advance(600_000)
+  expect(w.psRuns).toHaveLength(40)
+  expect(psLogs()).toEqual([])
+
+  // Every probe slow: 20s, 40s, 80s, 160s, then the 5 min cap, logged once it has held for two probes.
+  w.psRuns.length = 0
+  fails = () => true
+  await clock.advance(700_000)
+  expect(w.psRuns).toHaveLength(6)
+  expect(psLogs()).toEqual(['job-watch: ps timed out: probing every 5m'])
+
+  // Fast again, in the probe a jobs_watch forces 90 s after that line: the base pace holds from the next
+  // tick on, but its line waits for the five-minute gap, and comes once.
+  w.psRuns.length = 0
+  fails = () => false
+  expect(await tool($, 'jobs_watch', { pid: 777, name: 'encode' })).toMatch(/^Watching encode/)
+  await clock.advance(190_000)
+  expect(w.psRuns).toHaveLength(20)
+  expect(psLogs()).toHaveLength(1)
+  await clock.advance(120_000)
+  expect(psLogs()).toEqual(['job-watch: ps timed out: probing every 5m', 'job-watch: ps is fast again: probing every 10s'])
+})
+
+test('a sleep timer is listed, but never toasted, counted or opened for, and leaves a minute after it ends', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  on('tool.call', { tool: 'Bash' }, (_$, e) => {
+    const id = String(e.command).startsWith('sleep') ? 't1' : 'r1'
+    return {
+      result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: id },
+      text: `Command running in background with ID: ${id}. Output is being written to: /tmp/s/tasks/${id}.output.`,
+    }
+  })
+  w.files['/tmp/s/tasks/t1.output'] = { log: '', size: 0 }
+  w.files['/tmp/s/tasks/r1.output'] = { log: 'collecting tests\n', size: 17 }
+
+  // A timer Claude set itself: kept for jobs_list, but no job to count, to open the pane for, or to run ps for.
+  await $.tool.call({
+    tool: 'Bash',
+    command: 'sleep 600 && echo "timer done"',
+    run_in_background: true,
+    description: 'Wait ten minutes, then report merge-check results',
+  })
+  await clock.advance(70_000)
+  expect(w.statuses.at(-1)).toBeUndefined()
+  expect(w.opened).toEqual([])
+  expect(w.psRuns).toEqual([])
+  let listed = await tool($, 'jobs_list')
+  expect(listed).toMatch(
+    /^Wait ten minutes, then report merge-che… \[t1\]: running · timer · last output \d+s ago\n  log \/tmp\/s\/tasks\/t1\.output\n/,
+  )
+  expect(listed).toMatch(/a minute after/)
+  let texts = await paneTexts($)
+  expect(texts).toContain('Wait ten minutes, then report merge-che…')
+  expect(texts).toContain('timer')
+  expect(texts).not.toContain('running')
+
+  // A real job beside it: the status line counts that one alone, and it opens the pane.
+  w.ps = 'pytest tests/\n'
+  await $.tool.call({ tool: 'Bash', command: 'pytest tests/', run_in_background: true, description: 'Run the suite' })
+  await clock.advance(70_000)
+  expect(w.statuses.at(-1)).toBe('jobs: 1 running')
+  expect(w.opened).toEqual(['job-watch'])
+
+  // The timer ends: no toast; it is listed as finished for a minute, then dropped.
+  w.files['/tmp/s/tasks/t1.output'] = { log: 'timer done\n[exited with code 0]\n', size: 31 }
+  await clock.advance(10_000)
+  expect(w.toasts).toEqual([])
+  listed = await tool($, 'jobs_list')
+  expect(listed).toMatch(/^Wait ten minutes, then report merge-che… \[t1\]: finished \d+s ago \(exit 0\) · timer/m)
+  texts = await paneTexts($)
+  expect(texts).toContain('Wait ten minutes, then report merge-che…')
+  expect(texts.some(text => /^ended \d+s ago$/.test(text))).toBe(true)
+  await clock.advance(70_000)
+  expect(await paneTexts($)).not.toContain('Wait ten minutes, then report merge-che…')
+  expect(await tool($, 'jobs_list')).not.toMatch(/Wait ten minutes/)
+  expect(w.statuses.at(-1)).toBe('jobs: 1 running')
+
+  // The real job's finish is announced as ever.
+  w.ps = ''
+  w.files['/tmp/s/tasks/r1.output'] = { log: 'collecting tests\n12 passed\n[exited with code 0]\n', size: 48 }
+  await clock.advance(10_000)
+  expect(w.toasts).toEqual(['Run the suite finished after 3m: 12 passed'])
+  expect(w.statuses.at(-1)).toBeUndefined()
+})
+
+test('a wait loop that ps would show never goes stalled, and costs no ps probe', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 't2' },
+    text: 'Command running in background with ID: t2. Output is being written to: /tmp/s/tasks/t2.output.',
+  }))
+  w.ps = '/bin/zsh -c until [ "$(date +%H%M)" -ge 0146 ]; do sleep 30; done; date\n'
+  await $.tool.call({
+    tool: 'Bash',
+    command: 'until [ "$(date +%H%M)" -ge 0146 ]; do sleep 30; done; date',
+    run_in_background: true,
+    description: 'Wait until about 1:46 to check the Gemini queue',
+  })
+  // Fifteen silent minutes, past the ten-minute stall threshold, with the process alive.
+  await clock.advance(900_000)
+  expect(w.toasts).toEqual([])
+  expect(await tool($, 'jobs_list')).toMatch(/^Wait until about 1:46 to check the Gemi… \[t2\]: running · timer/)
+  expect(w.psRuns).toEqual([])
+  expect(w.statuses.at(-1)).toBeUndefined()
+
+  w.log = 'Wed Oct 14 01:46:01 PDT 2026\n[exited with code 0]\n'
+  w.size = 50
+  await clock.advance(10_000)
+  expect(w.toasts).toEqual([])
+  expect(await tool($, 'jobs_list')).toMatch(
+    /^Wait until about 1:46 to check the Gemi… \[t2\]: finished \d+s ago \(exit 0\) · timer/,
+  )
 })

@@ -1,5 +1,13 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ProcessRunResult, Register } from 'claude-code'
+import type {
+  BoxProps,
+  ButtonProps,
+  ElementConstructor,
+  EngineInterface,
+  ProcessRunResult,
+  Register,
+  TextProps,
+} from 'claude-code'
 
 import type { Disk, Job, JobState, Progress } from '../types'
 import {
@@ -11,6 +19,7 @@ import {
   formatDuration,
   isAlive,
   isPidAlive,
+  isTimerTask,
   launchFromCommand,
   matchToken,
   outputFileFromText,
@@ -21,6 +30,12 @@ import {
 
 type Engine = EngineInterface
 type Json = Record<string, unknown>
+/** The elements the pane draws with, as every surface has them. */
+type Kit = {
+  Box: ElementConstructor<BoxProps>
+  Text: ElementConstructor<TextProps>
+  Button: ElementConstructor<ButtonProps>
+}
 
 const PANE = 'job-watch'
 const TITLE = 'Jobs'
@@ -35,6 +50,10 @@ const SLOW_MS = 2_000
 const BACKOFF_MAX_MS = 300_000
 /** How often disks are re-read while `df` is quick. */
 const DF_MS = 60_000
+/** A pace is written to the debug log once it has held for two probes, and at most this often per probe. */
+const LOG_GAP_MS = 300_000
+/** How long a finished timer (a bare `sleep` of Claude's) stays listed before it is dropped. */
+const TIMER_KEEP_MS = 60_000
 
 const TOOLS = ['mcp__job-watch__jobs_list', 'mcp__job-watch__jobs_watch', 'mcp__job-watch__jobs_unwatch'] as const
 
@@ -94,13 +113,35 @@ let hasOpened = false
 /**
  * A probe's pacing, in ticks of the poll timer: a timeout or a run slower than SLOW_MS doubles
  * the ticks between runs (up to BACKOFF_MAX_MS), a fast run restores the base. `last` is the
- * newest answer (null after a failure) and stands in on the ticks in between.
+ * newest answer (null after a failure) and stands in on the ticks in between. The debug log
+ * names a pace once it has held for two probes (`heldFor`), and at most once per LOG_GAP_MS, so
+ * a pace that flips with the machine's load leaves no trail.
  */
-type Pace = { name: string; baseTicks: number; everyTicks: number; sinceTicks: number; last: ProcessRunResult | null }
+type Pace = {
+  name: string
+  baseTicks: number
+  everyTicks: number
+  sinceTicks: number
+  last: ProcessRunResult | null
+  /** Consecutive probes that ended at `everyTicks`. */
+  heldFor: number
+  /** The pace the debug log last named, and when. */
+  loggedTicks: number
+  loggedAt: number | null
+}
 
 const paceOf = (name: string, baseMs: number): Pace => {
   const baseTicks = Math.max(1, Math.round(baseMs / config.pollMs))
-  return { name, baseTicks, everyTicks: baseTicks, sinceTicks: baseTicks, last: null }
+  return {
+    name,
+    baseTicks,
+    everyTicks: baseTicks,
+    sinceTicks: baseTicks,
+    last: null,
+    heldFor: 0,
+    loggedTicks: baseTicks,
+    loggedAt: null,
+  }
 }
 
 let psPace = paceOf('ps', config.pollMs)
@@ -116,22 +157,28 @@ const isDue = (pace: Pace): boolean => {
   return true
 }
 
-/** Runs a due probe, adjusts its pace from how long it took, and logs the change once. */
+/** Runs a due probe, adjusts its pace from how long it took, and logs a pace once it has settled. */
 async function probe($: Engine, pace: Pace, argv: readonly string[]): Promise<ProcessRunResult | null> {
   const startedAt = await $.clock.now()
   const ran = await $.process.run(argv, { timeoutMs: PROBE_TIMEOUT_MS }).catch(() => null)
-  const tookMs = (await $.clock.now()) - startedAt
+  const now = await $.clock.now()
+  const tookMs = now - startedAt
   const isSlow = ran === null || tookMs > SLOW_MS
   const maxTicks = Math.max(pace.baseTicks, Math.ceil(BACKOFF_MAX_MS / config.pollMs))
   const everyTicks = isSlow ? Math.min(pace.everyTicks * 2, maxTicks) : pace.baseTicks
-  if (everyTicks !== pace.everyTicks) {
+  pace.heldFor = everyTicks === pace.everyTicks ? pace.heldFor + 1 : 1
+  pace.everyTicks = everyTicks
+  pace.last = ran
+  // A pace that has held for two probes is news once, and never within LOG_GAP_MS of the last line.
+  const isSettled = pace.heldFor >= 2 && everyTicks !== pace.loggedTicks
+  if (isSettled && (pace.loggedAt === null || now - pace.loggedAt >= LOG_GAP_MS)) {
     const why = ran === null ? 'timed out' : isSlow ? `took ${formatDuration(tookMs / 1000)}` : 'is fast again'
     $.ui.log(`job-watch: ${pace.name} ${why}: probing every ${formatDuration((everyTicks * config.pollMs) / 1000)}`, {
       to: 'debug',
     })
+    pace.loggedTicks = everyTicks
+    pace.loggedAt = now
   }
-  pace.everyTicks = everyTicks
-  pace.last = ran
   return ran
 }
 
@@ -147,8 +194,10 @@ const progressText = (progress: Progress): string =>
   `${progress.pct.toFixed(progress.pct < 10 ? 1 : 0)}%` +
   (progress.total > 0 ? ` (${formatCount(progress.done)}/${formatCount(progress.total)})` : '')
 
+/** The status line's figures: the real jobs by state; a timer is not counted. */
 function summary(list: readonly Job[]): string | undefined {
-  const count = (state: JobState) => list.filter(job => job.state === state).length
+  const counted = list.filter(job => !job.isTimer)
+  const count = (state: JobState) => counted.filter(job => job.state === state).length
   const parts = [
     count('running') && `${count('running')} running`,
     count('stalled') && `${count('stalled')} stalled`,
@@ -163,6 +212,7 @@ const normalize = (job: Job): Job => ({
   pid: job.pid ?? null,
   stallMs: job.stallMs ?? null,
   exitCode: job.exitCode ?? null,
+  isTimer: job.isTimer ?? false,
 })
 
 async function refreshDisks($: Engine) {
@@ -247,22 +297,29 @@ async function readJob($: Engine, job: Job, now: number, ps: string | null): Pro
   }
   // A pid never seen in two polls is a process that is not running, whatever it was.
   const isGone = alive === false && (next.seenAlive || (isUnseen && next.pid !== null))
-  const state: JobState = isGone || next.exitCode !== null ? 'done' : quietState(next, now, alive)
+  // A timer is silent by nature: it runs until it ends, never quiet or stalled.
+  const state: JobState =
+    isGone || next.exitCode !== null ? 'done' : next.isTimer ? 'running' : quietState(next, now, alive)
   return state === 'done' ? { ...next, state, finishedAt: now, etaSeconds: null, etaAt: null } : { ...next, state }
 }
 
-/** Toasts a finish or a stall the tick it first shows; false for a quick command, which leaves unannounced. */
+/**
+ * Toasts a finish or a stall the tick it first shows; false for a quick command, which leaves
+ * unannounced. A timer is kept but never announced: its end is Claude's cue, not the person's.
+ */
 function announce($: Engine, was: Job, job: Job, now: number): boolean {
   if (job.state === 'done' && was.state !== 'done') {
     const lived = now - job.addedAt
     if (lived < SHORT_MS) {
       return false
     }
-    $.ui.toast(`${job.label} finished after ${formatDuration(lived / 1000)}: ${shorten(job.lastLine, 80)}`, {
-      timeoutMs: 10_000,
-    })
+    if (!job.isTimer) {
+      $.ui.toast(`${job.label} finished after ${formatDuration(lived / 1000)}: ${shorten(job.lastLine, 80)}`, {
+        timeoutMs: 10_000,
+      })
+    }
   }
-  if (job.state === 'stalled' && was.state !== 'stalled') {
+  if (job.state === 'stalled' && was.state !== 'stalled' && !job.isTimer) {
     $.ui.toast(`${job.label} has written nothing for ${formatDuration((job.stallMs ?? config.stallMs) / 1000)}`, {
       timeoutMs: 10_000,
     })
@@ -270,9 +327,11 @@ function announce($: Engine, was: Job, job: Job, now: number): boolean {
   return true
 }
 
-/** Whether a finished or quiet job has stayed its keepDoneMinutes and leaves the list. */
+/** Whether a finished or quiet job has stayed its keepDoneMinutes (a timer, its minute) and leaves the list. */
 const isExpired = (job: Job, now: number): boolean =>
-  (job.state === 'done' && job.finishedAt !== null && now - job.finishedAt > config.keepDoneMs) ||
+  (job.state === 'done' &&
+    job.finishedAt !== null &&
+    now - job.finishedAt > (job.isTimer ? TIMER_KEEP_MS : config.keepDoneMs)) ||
   (job.state === 'quiet' && now - job.changedAt > config.keepDoneMs)
 
 /** One pass: disks when due, then every job read, judged, toasted and kept or dropped. */
@@ -296,7 +355,8 @@ async function pass($: Engine) {
   await update($, jobs, () => fresh)
   $.ui.status(summary(fresh))
 
-  const isLong = fresh.some(job => job.state !== 'done' && now - job.addedAt >= SHORT_MS)
+  // A real job a minute old opens the pane once; a timer, however long, is not news.
+  const isLong = fresh.some(job => job.state !== 'done' && !job.isTimer && now - job.addedAt >= SHORT_MS)
   if (config.autoOpen && !hasOpened && isLong) {
     hasOpened = true
     void $.ui.open({ id: PANE, title: TITLE })
@@ -329,7 +389,7 @@ function ensureTimer($: Engine) {
   }
 }
 
-type NewJob = Pick<Job, 'id' | 'label' | 'log' | 'match'> & Partial<Pick<Job, 'pid' | 'stallMs'>>
+type NewJob = Pick<Job, 'id' | 'label' | 'log' | 'match'> & Partial<Pick<Job, 'pid' | 'stallMs' | 'isTimer'>>
 
 async function addJob($: Engine, job: NewJob) {
   const now = await $.clock.now()
@@ -337,6 +397,7 @@ async function addJob($: Engine, job: NewJob) {
     ...job,
     pid: job.pid ?? null,
     stallMs: job.stallMs ?? null,
+    isTimer: job.isTimer ?? false,
     seenAlive: false,
     addedAt: now,
     size: -1,
@@ -407,6 +468,7 @@ function describeJob(job: Job, now: number): string {
         : `${job.state} (no output for ${formatDuration((job.stallMs ?? config.stallMs) / 1000)})`
   const parts = [
     state,
+    job.isTimer && 'timer',
     job.pid !== null && `pid ${job.pid}`,
     job.progress && progressText(job.progress),
     job.state !== 'done' && etaText(job, now),
@@ -432,7 +494,10 @@ async function listTool($: Engine): Promise<string> {
   const footer =
     `quiet = no output for ${formatDuration(config.stallMs / 1000)} with no process to check · ` +
     `stalled = the process is alive but has written nothing for that long · ` +
-    `finished jobs stay listed for ${formatDuration(config.keepDoneMs / 1000)}; jobs_unwatch removes one.`
+    `finished jobs stay listed for ${formatDuration(config.keepDoneMs / 1000)}; jobs_unwatch removes one.` +
+    (list.some(job => job.isTimer)
+      ? ' · timer = a wait of yours (sleep …): listed while it runs and for a minute after it ends, never announced.'
+      : '')
   return [...list.slice().reverse().map(job => describeJob(job, now)), '', footer].join('\n')
 }
 
@@ -538,6 +603,33 @@ async function registerTools($: Engine): Promise<void> {
   }
 }
 
+/**
+ * A timer's pane row: dim, with when it started or ended, and the × that drops it, so the pane and
+ * jobs_list agree on what is watched. The row leaves a minute after the timer ends.
+ */
+function timerRow($: Engine, { Box, Text, Button }: Kit, job: Job, now: number) {
+  const since = formatDuration((now - (job.state === 'done' ? (job.finishedAt ?? now) : job.addedAt)) / 1000)
+  return (
+    <Box key={`job-${job.id}`} flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text dimColor wrap="truncate-end">
+          {job.label}
+        </Text>
+        <Box flexDirection="row" gap={1}>
+          <Text dimColor>timer</Text>
+          <Button
+            key={`rm-${job.id}`}
+            label="×"
+            plain
+            onPress={() => update($, jobs, all => all.filter(one => one.id !== job.id))}
+          />
+        </Box>
+      </Box>
+      <Text dimColor>{job.state === 'done' ? `ended ${since} ago` : `started ${since} ago`}</Text>
+    </Box>
+  )
+}
+
 export const register: Register = (on, options) => {
   config = {
     stallMs: Math.max(1, Number(options.stallMinutes ?? 10)) * 60_000,
@@ -590,11 +682,14 @@ export const register: Register = (on, options) => {
       if (output) {
         const match = matchToken(e.command.split(/\s*(?:&&|;|\n)\s*/).pop() ?? e.command)
         if (match !== null || e.description) {
+          // A pure wait (`sleep 600 && echo done`) is kept for jobs_list, judged by its exit marker alone.
+          const isTimer = isTimerTask(e.command, e.description)
           await addJob($, {
             id: output.split('/').pop()?.replace(/\.output$/, '') ?? hashOf(output),
             label: shorten(e.description || match || 'background task', 40),
             log: output,
-            match,
+            match: isTimer ? null : match,
+            isTimer,
           })
         }
         return ran
@@ -607,11 +702,13 @@ export const register: Register = (on, options) => {
         const log = resolvePath(launch.log, home, base)
         if (log) {
           const match = matchToken(launch.segment)
+          const isTimer = isTimerTask(launch.segment, e.description)
           await addJob($, {
             id: hashOf(log),
             label: shorten(e.description || match || log.split('/').pop() || log, 40),
             log,
-            match,
+            match: isTimer ? null : match,
+            isTimer,
           })
         }
       }
@@ -679,6 +776,9 @@ export const register: Register = (on, options) => {
           .slice()
           .reverse()
           .map(job => {
+            if (job.isTimer) {
+              return timerRow($, { Box, Text, Button }, job, now)
+            }
             const age = formatDuration((now - Math.max(job.changedAt, job.addedAt)) / 1000)
             const figures = job.progress
               ? `${bar(job.progress.pct, barWidth)} ${job.progress.pct.toFixed(job.progress.pct < 10 ? 1 : 0)}%` +
@@ -722,7 +822,7 @@ export const register: Register = (on, options) => {
               </Box>
             )
           })}
-        {list.some(job => job.state === 'done') && (
+        {list.some(job => job.state === 'done' && !job.isTimer) && (
           <Button
             key="clear-done"
             label="Clear finished"

@@ -64,12 +64,12 @@ A **Jobs** pane for long-running work: training runs, downloads, extractions —
 - `/watch <log> [label]` adds any other log file.
 - Shows progress, ETA and the last log line, and flags a job as stalled when its log goes quiet; a background task's exit code is read from the end of its output.
 - Shows free space on `/` and `/Volumes/*` (the NAS).
-- Toasts when a job finishes or stalls. The status line shows `jobs: 2 running · 1 stalled`.
+- Toasts when a job finishes or stalls. The status line shows `jobs: 2 running · 1 stalled`. A timer Claude sets for itself — `sleep 600 && echo done`, a loop of sleeps, or a task described as a wait, timer, pause or delay that only polls and reports with read-only programs (`rg`, `tail`, `pgrep`…) — is still listed by `jobs_list` and shown as a dim `timer` row, but never toasts, never counts in the status line, does not open the pane, is judged by its exit marker alone (no `ps`), and leaves a minute after it ends. Anything that runs a real program is a job, however it is described.
 - `/jobs` opens the pane, `/unwatch <label|id|done|all>` removes jobs.
 - Tools for Claude: `jobs_list` (every watched job's state, pid, progress, ETA, last-output age, exit code and log path), `jobs_watch` (`{ pid?, log?, name?, quietMinutes? }`: follow a process or log started elsewhere; it never starts commands) and `jobs_unwatch` (`{ name }`). The first message of each conversation says jobs are watched and names them, so Claude stops writing `until … sleep` loops and running `ps`. They need no permission prompt: they only read the mod's own list.
-- Makes no model calls: it reads logs with `tail`, checks processes with `ps` (one listing, or a per-pid lookup when only pids are watched), and runs `df`. A probe that times out or takes over 2 s is retried at a doubling interval, up to 5 minutes, until it is fast again.
+- Makes no model calls: it reads logs with `tail`, checks processes with `ps` (one listing, or a per-pid lookup when only pids are watched), and runs `df`. A probe that times out or takes over 2 s is retried at a doubling interval, up to 5 minutes, until it is fast again. The debug log names a probe's pace only once it has held for two probes in a row, and at most once per five minutes per probe, so a pace that flips with the Mac's load leaves no trail.
 
-Settings (in `/config`): stall minutes (10), refresh seconds (10), how long finished jobs stay (120 min), auto-open (on), which disks to show.
+Settings (in `/config`): stall minutes (10), refresh seconds (10), how long finished jobs stay (120 min; a timer leaves after a minute), auto-open (on), which disks to show.
 
 ## machine-guard
 

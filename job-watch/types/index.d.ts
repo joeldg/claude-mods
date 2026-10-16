@@ -29,6 +29,12 @@ export type Job = {
   finishedAt: number | null
   /** The exit code a background task's output file ends with (`[exited with code N]`); null until then. */
   exitCode: number | null
+  /**
+   * A pure wait of Claude's own (`sleep 600 && echo done`, a loop of sleeps, or a wait/timer/pause/delay
+   * described as one): listed for jobs_list and shown dim, judged by its exit marker alone, never toasted
+   * or counted, and dropped a minute after it ends.
+   */
+  isTimer: boolean
 }
 
 export type Disk = { mount: string; freeGB: number; capacityPct: number }
