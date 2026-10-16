@@ -9,6 +9,7 @@ import {
   findConflict,
   formatUptime,
   holderNote,
+  isClaudeCode,
   isFresh,
   isInside,
   isSystemProgram,
@@ -385,6 +386,29 @@ test('reads LISTEN rows from ss -ltnp: every pid of a socket, rows without a pro
   expect(parseSs(NETSTAT)).toBeNull()
 })
 
+test("tells Claude Code's own processes, the desktop app's engine and the CLI, which are never a project's servers", () => {
+  // The desktop app's engine: its path has a space in it, so the whole line is read, not its first word.
+  expect(
+    isClaudeCode(
+      '/Users/me/Library/Application Support/Claude/claude-code/2.1.299/4fa9694b7975/claude.app/Contents/MacOS/claude --output-format stream-json',
+    ),
+  ).toBe(true)
+  // The CLI's versioned binaries, and the launcher that runs them.
+  expect(isClaudeCode('/Users/me/.local/share/claude/versions/2.1.296')).toBe(true)
+  expect(isClaudeCode('/Users/me/.local/share/claude/versions/2.1.295 --resume 1234')).toBe(true)
+  expect(isClaudeCode('claude')).toBe(true)
+  expect(isClaudeCode('claude --continue')).toBe(true)
+  expect(isClaudeCode('/Users/me/.local/bin/claude -p hello')).toBe(true)
+  // netstat's name alone: `claude` says enough; a bare version number does not until ps has answered.
+  expect(isClaudeCode('2.1.296')).toBe(false)
+  // The desktop app itself is not a session, and nothing merely named after Claude is one.
+  expect(isClaudeCode('/Applications/Claude.app/Contents/MacOS/Claude')).toBe(false)
+  expect(isClaudeCode('node /Users/me/claude-proxy/server.js')).toBe(false)
+  expect(isClaudeCode('python3 claude_client.py --port 8000')).toBe(false)
+  expect(isClaudeCode('/opt/homebrew/bin/postgres -D /x')).toBe(false)
+  expect(isClaudeCode('')).toBe(false)
+})
+
 test("tells the system's own programs, whose folder is never asked, from a project's", () => {
   expect(isSystemProgram('/usr/libexec/rapportd')).toBe(true)
   expect(isSystemProgram('/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter')).toBe(true)
@@ -464,6 +488,7 @@ test('the dev_servers tool text: running servers with their pane logs, stopped e
       },
       { pid: 646, command: 'rapportd', ports: [53480], detail: null },
     ],
+    claudeSessions: 0,
     scannedAt: 1_000_000 - 12_000,
   }
   const logs = new Map([[4242, '/home/dev/.claude/dev-servers/app-1x2y3z/dev.log']])
@@ -483,4 +508,13 @@ test('the dev_servers tool text: running servers with their pane logs, stopped e
   expect(toolText({ ...snapshot, servers: [], stopped: [], others: 0, otherListeners: [] }, { all: true, logs: new Map(), now: 1_000_000 })).toContain(
     'No dev servers are listening in /home/dev/app.\nNo other listeners on this machine.',
   )
+  // Claude Code's own sessions are never listed, only counted, in one line after the others: nothing is left out silently.
+  expect(toolText({ ...snapshot, claudeSessions: 3 }, { all: true, logs: new Map(), now: 1_000_000 })).toContain(
+    '  :53480 · rapportd · pid 646\n(3 Claude Code sessions not listed)\nScanned 12s ago.',
+  )
+  expect(toolText({ ...snapshot, otherListeners: [], claudeSessions: 1 }, { all: true, logs: new Map(), now: 1_000_000 })).toContain(
+    'No other listeners on this machine.\n(1 Claude Code session not listed)\n',
+  )
+  expect(toolText(snapshot, { all: true, logs: new Map(), now: 1_000_000 })).not.toContain('Claude Code')
+  expect(toolText({ ...snapshot, claudeSessions: 3 }, { all: false, logs, now: 1_000_000 })).not.toContain('Claude Code')
 })

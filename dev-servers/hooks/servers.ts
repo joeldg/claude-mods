@@ -713,6 +713,18 @@ export function programOf(commandLine: string): string {
   return basename(tokenize(commandLine)[0] ?? '')
 }
 
+/** Where Claude Code runs from: the desktop app's engine (its path has a space in it, so the whole line is read) and the CLI's versioned binaries. */
+const CLAUDE_CODE = /\/claude\.app\/Contents\/MacOS\/claude(?:\s|$)|\/\.local\/share\/claude\/versions\//
+
+/**
+ * Whether a command line, or a process name as netstat has it, is one of Claude Code's own sessions: the
+ * desktop app's engine, the CLI's versioned binary or a bare `claude`. They listen on localhost with the
+ * project as their folder, so they would pass for its servers.
+ */
+export function isClaudeCode(commandLine: string): boolean {
+  return CLAUDE_CODE.test(commandLine) || programOf(commandLine) === 'claude'
+}
+
 /** Whole seconds since `startedAt`, as of `now`; null when the start is unknown. */
 export function upSince(startedAt: number | null, now: number): number | null {
   return startedAt === null ? null : Math.max(0, Math.floor((now - startedAt) / 1000))
@@ -796,12 +808,36 @@ export function mayScan(lock: ScanLock | null, now: number, by: string, staleMs:
   return lock === null || lock.by === by || now - lock.ts >= staleMs
 }
 
+/** The `all` listing's other listeners, each with its ports, process, pid and folder; one line when there are none. */
+function otherListenersText(listeners: readonly CachedListener[]): string {
+  if (listeners.length === 0) {
+    return 'No other listeners on this machine.'
+  }
+  const rows = listeners.map(listener => {
+    const cwd = listener.detail?.cwd ?? null
+    const parts = [
+      portList(listener.ports),
+      listener.command || programOf(listener.detail?.commandLine ?? '') || 'unknown',
+      `pid ${listener.pid}`,
+      cwd === null ? null : `in ${cwd}`,
+    ]
+    return `  ${parts.filter(Boolean).join(' · ')}`
+  })
+  return `Other listeners on this machine:\n${rows.join('\n')}`
+}
+
+/** `(7 Claude Code sessions not listed)`: what an `all` listing leaves out, said once so nothing is hidden silently; nothing with none. */
+function sessionsNote(count: number): string[] {
+  return count > 0 ? [`(${count} Claude Code session${count === 1 ? '' : 's'} not listed)`] : []
+}
+
 /**
  * The dev_servers tool's answer: the running servers (with the log of one started from the pane), the
- * stopped entries and, asked, every other listener on the machine.
+ * stopped entries and, asked, every other listener on the machine, Claude Code's own sessions counted
+ * rather than listed.
  */
 export function toolText(
-  snapshot: Pick<Snapshot, 'root' | 'servers' | 'stopped' | 'others' | 'otherListeners' | 'scannedAt'>,
+  snapshot: Pick<Snapshot, 'root' | 'servers' | 'stopped' | 'others' | 'otherListeners' | 'claudeSessions' | 'scannedAt'>,
   options: { all: boolean; logs: ReadonlyMap<number, string>; now: number },
 ): string {
   const running = snapshot.servers.map(server => {
@@ -819,20 +855,8 @@ export function toolText(
   }
   if (!options.all) {
     lines.push(`${snapshot.others} other listener${snapshot.others === 1 ? '' : 's'} on this machine (all: true lists them).`)
-  } else if (snapshot.otherListeners.length === 0) {
-    lines.push('No other listeners on this machine.')
   } else {
-    const others = snapshot.otherListeners.map(listener => {
-      const cwd = listener.detail?.cwd ?? null
-      const parts = [
-        portList(listener.ports),
-        listener.command || programOf(listener.detail?.commandLine ?? '') || 'unknown',
-        `pid ${listener.pid}`,
-        cwd === null ? null : `in ${cwd}`,
-      ]
-      return `  ${parts.filter(Boolean).join(' · ')}`
-    })
-    lines.push(`Other listeners on this machine:\n${others.join('\n')}`)
+    lines.push(otherListenersText(snapshot.otherListeners), ...sessionsNote(snapshot.claudeSessions))
   }
   lines.push(
     `Scanned ${formatUptime((options.now - snapshot.scannedAt) / 1000)} ago. Starting, stopping and restarting are the Servers pane's buttons (/servers); this tool only lists.`,

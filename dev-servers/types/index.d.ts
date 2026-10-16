@@ -68,6 +68,8 @@ export type Snapshot = {
   others: number
   /** Those processes, for the dev_servers tool's `all`. */
   otherListeners: CachedListener[]
+  /** Claude Code's own sessions among the listeners (the desktop app's engine, the CLI): left out of every list, counted. */
+  claudeSessions: number
   /** When the listeners were scanned, by whichever session did. */
   scannedAt: number
   /** When this snapshot was made. */

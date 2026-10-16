@@ -1,6 +1,6 @@
 {
   "name": "dev-servers",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A Servers pane for this project's dev servers: what is listening, on which port, since when, with Start, Stop, Restart and Log buttons; names the process holding a port when a command fails with EADDRINUSE; a read-only dev_servers tool for Claude. Scans with netstat (never lsof), one session for all; no model calls.",
   "author": {
     "name": "joeldg"

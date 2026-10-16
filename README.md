@@ -15,13 +15,13 @@ A pane of your project's running dev servers, so you don't have to ask Claude to
 - `/servers` opens the **Servers** pane:
   - running servers whose working folder is in this repo: name, port, pid and uptime, with **Restart**, **Stop** and **Log**
   - known start commands that aren't running, with **Start**: `package.json` `dev`/`start`/`serve`/`preview` scripts (run with your lockfile's package manager), `.claude/launch.json` and `Procfile`
-  - a count of other listeners on the machine
+  - a count of other listeners on the machine. Claude Code's own sessions (the desktop app's engine and the `claude` CLI, which also listen on localhost from the project's folder) are never listed as servers nor counted as other listeners.
 - Only button presses start or stop anything:
   - **Start** runs the command detached, logging to `~/.claude/dev-servers/<project>/`.
   - **Stop** sends SIGTERM. If the server ignores it, pressing again within 10s force-stops it.
   - **Restart** stops the server, waits for the port to free up, then starts it.
   - Before any signal, it checks the pid still runs the same command.
-- Claude gets a read-only `dev_servers` tool: this project's running servers (name, port, pid, uptime, and the log when it was started from the pane), the start commands that aren't running, and with `all: true` every other listener on the machine (port, process). Its description tells Claude to use it instead of `lsof`/`netstat`/`ps`. It never starts or stops anything.
+- Claude gets a read-only `dev_servers` tool: this project's running servers (name, port, pid, uptime, and the log when it was started from the pane), the start commands that aren't running, and with `all: true` every other listener on the machine (port, process), ending with how many Claude Code sessions it left out, e.g. `(7 Claude Code sessions not listed)`, so nothing is hidden silently. Its description tells Claude to use it instead of `lsof`/`netstat`/`ps`. It never starts or stops anything.
 - When a command fails with "address already in use", Claude gets a note (and you a toast) naming the holder, e.g. `Port 4000 is held by node (pid 123, up 2h, in /Users/me/other)`.
 - Status line: `servers: :4000 :5173`.
 - Makes no model calls. The port scan is `netstat -anv -p tcp` (macOS) or `ss -ltnp` (Linux), never a bare `lsof`; `ps` and `lsof -d cwd` run once per new pid, one pid at a time. One open session scans per interval (15s by default) and writes `~/.claude/dev-servers/scan-cache.json` for the others; a slow scan doubles the interval, up to 5 minutes.
@@ -96,7 +96,7 @@ Memory, swap and GPU on the status line, a `machine_status` tool for Claude, and
 Watches how the other mods behave in real use, without changing them. It is listed first in `CLAUDE_CODE_PLUGIN_DIRS`, so the other mods' hooks run beneath it.
 
 - **Failures:** any mod hook that throws, times out or rejects, read from the hook chain's results (`next.trace`), with the mod's name, the event and how long it ran. Slow hooks (over 1.5 s) are recorded too. The first failure of each mod in a session raises a toast.
-- **What each mod did:** its toasts ("#219 merged → …", "Blocked: …"), status-line changes, the mod commands you used (never their arguments), and failed subprocesses (a burst of 5 in 10 minutes raises a toast). Git checks run outside a repository are logged as expected, not as failures. It also records model calls (the only usage the mods cost: `/second-opinion`, `/recall ask`) and file writes (folders only, never contents).
+- **What each mod did:** its toasts ("#219 merged → …", "Blocked: …"), status-line changes, the mod commands you used (never their arguments), and failed subprocesses (a burst of 5 in 10 minutes raises a toast). Git checks run outside a repository, and `rg`, `grep`, `pgrep` or `pkill` exiting 1 with nothing on stderr (no match, no such process), are logged as expected (`proc-expected`, with why), not as failures; an exit of 2 or more, or anything on stderr, still counts. It also records model calls (the only usage the mods cost: `/second-opinion`, `/recall ask`) and file writes (folders only, never contents).
 - **`/mods`:** a pane with one row per mod: ✓ active, ⚠ failing, ✗ not seen this session, · seen but idle. Each row shows today's counts and last activity, with **Details** for its recent events. It also says which mods it can't see, if any of them run above it.
 - **`/mods report [24h|7d|30d]`:** a per-mod report across all sessions, also written to `~/.claude/mods/monitor/report-latest.md` for a scheduled review or Claude to read.
 - **`/mods failures [7d]`:** failures and failed subprocesses only.

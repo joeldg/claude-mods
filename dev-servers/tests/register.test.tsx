@@ -120,6 +120,25 @@ const POSTGRES: Proc = {
 }
 const RAPPORTD: Proc = { pid: 646, command: 'rapportd', ports: [53480], cwd: '/', etime: '5-07:27:48', commandLine: '/usr/libexec/rapportd' }
 
+/** Claude Code's own sessions, listening on localhost with a project as their folder: the desktop app's engine, the CLI's versioned binary, a bare `claude`. */
+const DESKTOP_SESSION: Proc = {
+  pid: 28890,
+  command: 'claude',
+  ports: [62202],
+  cwd: ROOT,
+  etime: '01:02:03',
+  commandLine: '/Users/me/Library/Application Support/Claude/claude-code/2.1.299/4fa9694b7975/claude.app/Contents/MacOS/claude --output-format stream-json',
+}
+const CLI_SESSION: Proc = {
+  pid: 5150,
+  command: '2.1.296',
+  ports: [53031],
+  cwd: ROOT,
+  etime: '40:00',
+  commandLine: '/Users/me/.local/share/claude/versions/2.1.296',
+}
+const BARE_SESSION: Proc = { pid: 5151, command: 'claude', ports: [64701], cwd: '/Users/me/other', etime: '05:00', commandLine: 'claude --resume' }
+
 const NETSTAT_HEAD = [
   'Active Internet connections (including servers)',
   'Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs',
@@ -852,4 +871,70 @@ test('the dev_servers tool is registered for the model, allowed without asking, 
   )
   // It only lists: nothing was signalled or started.
   expect(w.events.filter(event => !event.startsWith('scan'))).toEqual([])
+})
+
+// ---------------------------------------------------------------------------
+// Claude Code's own sessions among the listeners
+// ---------------------------------------------------------------------------
+
+test("Claude Code's own sessions are left out of the servers, the other listeners and the pane, and counted once in the tool's all: true answer", SLOW, async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  const w = world(on, [VITE, DESKTOP_SESSION, CLI_SESSION, POSTGRES, BARE_SESSION, RAPPORTD])
+
+  const ran = await $.command.run(typed('servers'))
+  expect(ran.text).toBe(
+    [
+      `Running in ${ROOT}:`,
+      '  dev · :5173 :24678 · pid 4242 · up 2h',
+      'Not running: dev:api (pnpm run dev:api), preview (pnpm run preview)',
+      '2 other listeners on this machine.',
+    ].join('\n'),
+  )
+  expect(w.statuses.at(-1)).toBe('servers: :5173 :24678')
+  // Known from ps alone: their folders are never asked, like the system's own programs.
+  expect(w.lookups.filter(lookup => lookup.startsWith('cwd'))).toEqual(['cwd 4242', 'cwd 986'])
+
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface)
+    const shown = await texts(ui)
+    expect(shown.some(text => /claude|2\.1\.296|28890|5150|5151/.test(text))).toBe(false)
+    expect(shown).toContain('2 other listeners on this machine')
+    await ui.unmount()
+  }
+
+  expect(String((await $.tool.call({ tool: TOOL })).result)).toContain('2 other listeners on this machine (all: true lists them).')
+  const everything = String((await $.tool.call({ tool: TOOL, all: true })).result)
+  expect(everything).toContain(
+    [
+      'Other listeners on this machine:',
+      '  :5432 · postgres · pid 986 · in /opt/homebrew/var/postgresql',
+      '  :53480 · rapportd · pid 646',
+      '(3 Claude Code sessions not listed)',
+      'Scanned 0s ago.',
+    ].join('\n'),
+  )
+  expect(everything).not.toMatch(/:62202|:53031|:64701/)
+})
+
+test("a session another scan found but has not looked up: netstat's `claude` name is enough, a bare version number waits for ps", SLOW, async ($, on) => {
+  const now = 1_000_000
+  const clock = mock.clock(on, { now })
+  const w = world(on, [VITE])
+  const vite = { pid: 4242, command: 'node', ports: [5173, 24678], detail: { commandLine: VITE.commandLine, startedAt: now - 7_800_000, cwd: ROOT } }
+  w.files[CACHE] = JSON.stringify({
+    ts: now - 5_000,
+    by: 'session-b',
+    data: {
+      listeners: [vite, { pid: 28890, command: 'claude', ports: [62202], detail: null }, { pid: 5150, command: '2.1.296', ports: [53031], detail: null }],
+    },
+  })
+  await start($)
+  await clock.settle()
+  expect(scans(w)).toEqual([])
+  expect(w.statuses).toEqual(['servers: :5173 :24678'])
+  const ui = await mountPane($)
+  const shown = await texts(ui)
+  expect(shown.some(text => /claude|28890/.test(text))).toBe(false)
+  expect(shown).toContain('1 other listener on this machine')
+  await ui.unmount()
 })

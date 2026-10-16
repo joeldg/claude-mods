@@ -8,6 +8,7 @@ import {
   expandHome,
   findConflict,
   holderNote,
+  isClaudeCode,
   isFresh,
   isInside,
   isSystemProgram,
@@ -80,7 +81,7 @@ const SCANNERS: readonly { argv: readonly string[]; parse: (text: string) => Lis
 ]
 
 const TOOL_DESCRIPTION = [
-  "Lists this project's dev servers: which are running (name, port, pid, uptime, and the log file when it was started from the Servers pane) and which known start commands (package.json scripts, .claude/launch.json, Procfile) are not running. With all: true it also lists every other TCP listener on this machine, with its port and process.",
+  "Lists this project's dev servers: which are running (name, port, pid, uptime, and the log file when it was started from the Servers pane) and which known start commands (package.json scripts, .claude/launch.json, Procfile) are not running. With all: true it also lists every other TCP listener on this machine, with its port and process; Claude Code's own sessions are left out and only counted.",
   'Use it instead of running lsof, netstat, ss or ps in Bash to learn what is listening on which port, whether a dev server is up, or who holds a port: it answers from a scan every open session shares, where lsof alone can take 10s or more on a loaded machine.',
   'Read-only: it never starts, stops or restarts anything; the person does that with the Start, Stop and Restart buttons of the Servers pane (/servers).',
 ].join(' ')
@@ -242,7 +243,8 @@ async function listenerOn($: Engine, port: number): Promise<Listener | null> {
 
 /**
  * What ps and lsof say about one pid: its command line and start from ps, then its working directory from
- * lsof, unless the program is the system's own or already gone. 'timeout' when either did not answer in time.
+ * lsof, unless the program is the system's own, Claude Code's own or already gone. 'timeout' when either did
+ * not answer in time.
  */
 async function lookupDetail($: Engine, pid: number): Promise<ProcessDetail | 'timeout'> {
   const ps = await attempt($, ['ps', '-o', 'pid=,etime=,command=', '-p', String(pid)], DETAIL_TIMEOUT_MS)
@@ -254,7 +256,7 @@ async function lookupDetail($: Engine, pid: number): Promise<ProcessDetail | 'ti
     return { commandLine: null, startedAt: null, cwd: null }
   }
   const startedAt = row.upSeconds === null ? null : (await $.clock.now()) - row.upSeconds * 1000
-  if (isSystemProgram(row.commandLine)) {
+  if (isSystemProgram(row.commandLine) || isClaudeCode(row.commandLine)) {
     return { commandLine: row.commandLine, startedAt, cwd: null }
   }
   const cwd = await attempt($, ['lsof', '-a', '-p', String(pid), '-d', 'cwd', '-Fn'], DETAIL_TIMEOUT_MS)
@@ -413,9 +415,12 @@ async function collect($: Engine, force: boolean): Promise<Snapshot | null> {
     return read($, snapshot)
   }
   const now = await $.clock.now()
+  // Claude Code's own sessions listen on localhost from the project's folder: neither its servers nor listeners worth naming.
+  const isSession = (listener: CachedListener) => isClaudeCode(listener.command) || isClaudeCode(listener.detail?.commandLine ?? '')
+  const listeners = shared.listeners.filter(listener => !isSession(listener))
   const isMine = (listener: CachedListener) =>
     listener.detail !== null && listener.detail.cwd !== null && isInside(listener.detail.cwd, root)
-  const mine = shared.listeners.filter(isMine)
+  const mine = listeners.filter(isMine)
   const servers: Server[] = mine.map(listener => {
     const commandLine = listener.detail?.commandLine ?? ''
     return {
@@ -434,8 +439,9 @@ async function collect($: Engine, force: boolean): Promise<Snapshot | null> {
     servers: matched.servers,
     entries,
     stopped: matched.stopped,
-    others: shared.listeners.length - mine.length,
-    otherListeners: shared.listeners.filter(listener => !isMine(listener)),
+    others: listeners.length - mine.length,
+    otherListeners: listeners.filter(listener => !isMine(listener)),
+    claudeSessions: shared.listeners.length - listeners.length,
     scannedAt: shared.scannedAt,
     at: now,
   }
