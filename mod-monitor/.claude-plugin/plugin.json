@@ -1,6 +1,6 @@
 {
   "name": "mod-monitor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Watches how your other mods really behave: hook failures and slow hooks (read off the chain's own trace), what each one did (toasts, status lines, commands, processes, model calls, writes), with /mods for a live pane and /mods report for the last day, week or month. Changes nothing they do; no model calls.",
   "author": {
     "name": "joeldg"

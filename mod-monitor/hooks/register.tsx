@@ -455,9 +455,25 @@ function onStatus(plugin: string, text: string | undefined) {
   })
 }
 
-/** Why a process failure is expected and not worth counting, or null: git probing a folder that is no repository. */
-export function expectedFailure(text: string): string | null {
-  return /not a git repository/i.test(text) ? 'not in a git repository' : null
+/** Programs whose exit 1 with nothing on stderr is their answer "nothing found", not a failure. */
+const NOTHING_FOUND: Readonly<Record<string, string>> = {
+  rg: 'no match',
+  grep: 'no match',
+  pgrep: 'no such process',
+  pkill: 'no such process',
+}
+
+/**
+ * Why a process failure is expected and not worth counting, or null: git probing a folder that is no
+ * repository; rg, grep, pgrep or pkill exiting 1 with nothing on stderr, their "nothing found". An exit
+ * of 2 or more, or anything on stderr, is a failure as for every other program.
+ */
+export function expectedFailure(argv: readonly string[], exit: number | null, text: string): string | null {
+  if (/not a git repository/i.test(text)) {
+    return 'not in a git repository'
+  }
+  const quiet = NOTHING_FOUND[basename(argv[0] ?? '')]
+  return exit === 1 && quiet !== undefined && text.trim() === '' ? quiet : null
 }
 
 type ProcOutcome = { value?: { exitCode: number; stderr: string }; deny?: string } | undefined
@@ -475,9 +491,9 @@ function onProcess($: Engine, plugin: string, argv: readonly string[], outcome: 
     return
   }
   const why = outcome?.deny ?? (error !== undefined ? String(error) : (outcome?.value?.stderr ?? ''))
-  const expected = expectedFailure(why)
+  const expected = expectedFailure(argv, exit, why)
   if (expected) {
-    // A probe that fails by design (git asked about a folder that is no repository): logged, never counted.
+    // A probe that fails by design (git outside a repository, rg or pgrep finding nothing): logged, never counted.
     logEvent({ t: 'event', ts: at, plugin, kind: 'proc-expected', cmd, exit, why: expected }, `procx|${plugin}|${cmd}|${expected}`)
     return
   }

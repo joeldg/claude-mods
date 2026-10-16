@@ -60,6 +60,14 @@ const CHATTY: Plugin = {
   },
 }
 
+// The engine types admit an MCP tool's name only once it is declared (McpToolInputs; the engine lays the connected
+// servers' tools under .claude-plugin/types/, loose until then): chatty's, so this file type-checks whatever is connected.
+declare module 'claude-code' {
+  interface McpToolInputs {
+    mcp__chatty__ask: { question?: string }
+  }
+}
+
 /** A mod that only registers a command: loaded, never used. */
 const QUIET: Plugin = {
   name: 'quiet',
@@ -86,6 +94,20 @@ const GIT_PROBE: Plugin = {
     on('command.run', { command: 'probe' }, async $ => {
       await $.process.run(['git', 'rev-parse', '--show-toplevel']).catch(() => null)
       return { text: 'probed' }
+    })
+  },
+}
+
+/** A mod that looks for things that may not be there, as modal-meter (rg) and slicer-handoff (pgrep) do. */
+const SEARCHER: Plugin = {
+  name: 'searcher',
+  register(on) {
+    on('command.run', { command: 'search' }, async $ => {
+      await $.process.run(['rg', '-l', 'modal', '*.py']).catch(() => null)
+      await $.process.run(['/usr/bin/grep', '-q', 'needle', 'hay.txt']).catch(() => null)
+      await $.process.run(['pgrep', '-x', 'Snapmaker_Orca']).catch(() => null)
+      await $.process.run(['pkill', '-f', 'ghost']).catch(() => null)
+      return { text: 'searched' }
     })
   },
 }
@@ -544,6 +566,51 @@ test('a git probe outside a repository is expected: logged, not counted, never a
   expect(alerts(w).filter(text => text.includes('processes failed'))).toEqual([])
   const summary = await mods($)
   expect(summary).not.toContain('⚠ git-probe')
+})
+
+test('rg, grep, pgrep or pkill exiting 1 with nothing on stderr found nothing: expected, logged with why, not counted, never alerted', { ...SLOW, plugins: [SEARCHER] }, async ($, on) => {
+  const w = world(on, {})
+  w.procs.rg = { exitCode: 1 }
+  w.procs['/usr/bin/grep'] = { exitCode: 1, stderr: '\n' }
+  w.procs.pgrep = { exitCode: 1 }
+  w.procs.pkill = { exitCode: 1 }
+  await start($, w)
+  for (let i = 0; i < 6; i++) {
+    await $.command.run(typed('search'))
+  }
+  await w.clock.settle()
+  expect(alerts(w).filter(text => text.includes('processes failed'))).toEqual([])
+  expect(await mods($)).not.toContain('⚠ searcher')
+
+  await w.clock.advance(60_000)
+  const lines = ownLines(w)
+  expect(events(lines, 'searcher', 'proc-fail')).toEqual([])
+  expect(events(lines, 'searcher', 'proc-expected')).toEqual([
+    expect.objectContaining({ cmd: 'rg modal', exit: 1, why: 'no match' }),
+    expect.objectContaining({ cmd: 'grep needle', exit: 1, why: 'no match' }),
+    expect.objectContaining({ cmd: 'pgrep Snapmaker_Orca', exit: 1, why: 'no such process' }),
+    expect.objectContaining({ cmd: 'pkill ghost', exit: 1, why: 'no such process' }),
+  ])
+  expect(tally(lines, 'searcher')).toMatchObject({ procs: 24, procFails: 0 })
+})
+
+test('the same programs exiting 2, or 1 with something on stderr, are failures as before', { ...SLOW, plugins: [SEARCHER] }, async ($, on) => {
+  const w = world(on, {})
+  w.procs.rg = { exitCode: 2, stderr: 'rg: regex parse error' }
+  w.procs['/usr/bin/grep'] = { exitCode: 2, stderr: 'grep: hay.txt: No such file or directory' }
+  w.procs.pgrep = { exitCode: 1, stderr: 'pgrep: Cannot get process list' }
+  w.procs.pkill = { exitCode: 1 }
+  await start($, w)
+  await $.command.run(typed('search'))
+  await w.clock.advance(60_000)
+  const lines = ownLines(w)
+  expect(events(lines, 'searcher', 'proc-fail')).toEqual([
+    expect.objectContaining({ cmd: 'rg modal', exit: 2, err: 'rg: regex parse error' }),
+    expect.objectContaining({ cmd: 'grep needle', exit: 2, err: 'grep: hay.txt: No such file or directory' }),
+    expect.objectContaining({ cmd: 'pgrep Snapmaker_Orca', exit: 1, err: 'pgrep: Cannot get process list' }),
+  ])
+  expect(events(lines, 'searcher', 'proc-expected')).toEqual([expect.objectContaining({ cmd: 'pkill ghost', exit: 1, why: 'no such process' })])
+  expect(tally(lines, 'searcher')).toMatchObject({ procs: 4, procFails: 3 })
 })
 
 test('error lines a mod logs itself are counted; three in an hour mark it failing and raise one toast', { ...SLOW, plugins: [LOGGER] }, async ($, on) => {
