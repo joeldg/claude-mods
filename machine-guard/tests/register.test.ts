@@ -299,7 +299,7 @@ test('the process table is taken when a sample shows pressure, at most once a mi
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91%')
 })
 
-test('a slow probe doubles the interval up to two minutes; a fast one resets it', SLOW, async ($, on) => {
+test('two slow samples in a row double the interval, each further one again up to two minutes; two fast ones in a row reset it', SLOW, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on, clock)
   w.slow.vm_stat = 3_000
@@ -308,63 +308,95 @@ test('a slow probe doubles the interval up to two minutes; a fast one resets it'
   expect(w.statuses).toEqual([])
   await clock.advance(3_000)
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91%')
+  // One slow sample is a blip: the pace stays at 15 s and nothing is logged.
+  expect(w.logs).toEqual([])
+  await clock.advance(15_000)
+  expect(w.probeAt).toEqual([0, 18_000])
 
-  // 15 s → 30 s → 60 s → 120 s, then the cap.
+  // The second slow sample in a row: 15 s → 30 s; the third and fourth → 60 s → 120 s, the cap.
+  await clock.advance(3_000)
   await clock.advance(30_000)
   await clock.advance(3_000)
   await clock.advance(60_000)
   await clock.advance(3_000)
   await clock.advance(120_000)
+  expect(w.probeAt).toEqual([0, 18_000, 51_000, 114_000, 237_000])
   await clock.advance(3_000)
-  await clock.advance(120_000)
-  expect(w.probeAt).toEqual([0, 33_000, 96_000, 219_000, 342_000])
-  await clock.advance(3_000)
-
-  // Fast again: the interval is the configured one from the next sample on.
-  w.slow = {}
-  await clock.advance(120_000)
-  expect(w.probeAt).toEqual([0, 33_000, 96_000, 219_000, 342_000, 465_000])
-  await clock.advance(15_000)
-  expect(w.probeAt.at(-1)).toBe(480_000)
-
-  // Each change of pace is logged once, to the debug log.
-  expect(w.logs.map(line => line.to)).toEqual(['debug', 'debug', 'debug', 'debug'])
   expect(w.logs.map(line => line.text)).toEqual([
     'machine-guard: probes took 3.0 s; sampling every 30 s until they are fast again',
     'machine-guard: probes took 3.0 s; sampling every 60 s until they are fast again',
     'machine-guard: probes took 3.0 s; sampling every 120 s until they are fast again',
-    'machine-guard: probes are fast again; sampling every 15 s',
   ])
+
+  // Fast again: the first fast sample keeps the slow pace, the second brings the configured one back.
+  w.slow = {}
+  await clock.advance(120_000)
+  expect(w.probeAt).toEqual([0, 18_000, 51_000, 114_000, 237_000, 360_000])
+  expect(w.logs).toHaveLength(3)
+  await clock.advance(120_000)
+  expect(w.probeAt.at(-1)).toBe(480_000)
+  await clock.advance(15_000)
+  expect(w.probeAt.at(-1)).toBe(495_000)
+
+  // Each change of pace is logged once, to the debug log.
+  expect(w.logs.map(line => line.to)).toEqual(['debug', 'debug', 'debug', 'debug'])
+  expect(w.logs.at(-1)?.text).toBe('machine-guard: probes are fast again; sampling every 15 s')
 })
 
-test('a probe that times out counts as slow, and the GPU is skipped after a slow sample', SLOW, async ($, on) => {
+test('one slow sample between fast ones is a blip: the pace holds and nothing is logged', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock)
+  await start($, clock)
+  await clock.advance(15_000)
+  // The third sample takes 3 s (a slow fork while the Mac swaps for a moment); the ones around it are fast.
+  w.slow.vm_stat = 3_000
+  await clock.advance(15_000)
+  await clock.advance(3_000)
+  w.slow = {}
+  await clock.advance(15_000)
+  await clock.advance(15_000)
+  expect(w.probeAt).toEqual([0, 15_000, 30_000, 48_000, 63_000])
+  expect(w.logs).toEqual([])
+  expect(shared(w)?.ttlMs).toBe(15_000)
+})
+
+test('timed-out probes count as slow, and the GPU is skipped after a slow sample', SLOW, async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on, clock)
   w.timesOut.add('vm_stat')
   await start($, clock)
   // Swap and the level still come from sysctl; the status line does without the free percentage.
   expect(w.statuses.at(-1)).toBe('RAM · swap 7.8/8G · GPU 91%')
+  // The first timeout is a blip; the second in a row slows the pace.
+  expect(w.logs).toEqual([])
+  await clock.advance(15_000)
+  expect(w.probeAt).toEqual([0, 15_000])
   expect(w.logs.map(line => line.text)).toEqual(['machine-guard: a probe timed out; sampling every 30 s until they are fast again'])
   await clock.advance(15_000)
-  expect(w.probeAt).toEqual([0])
-  await clock.advance(15_000)
-  expect(w.probeAt).toEqual([0, 30_000])
+  expect(w.probeAt).toEqual([0, 15_000])
 
-  // The GPU's turn comes on the fourth sample, but the third was slow: ioreg is skipped until a fast sample.
+  // A third slow sample (2.5 s) slows it further. The GPU's turn comes on the fourth sample, but the third was slow: ioreg is skipped until a fast sample.
   w.timesOut.clear()
   w.slow.vm_stat = 2_500
-  await clock.advance(60_000)
-  await clock.advance(2_500)
-  expect(w.probeAt).toEqual([0, 30_000, 90_000])
-  w.slow = {}
-  await clock.advance(120_000)
-  expect(w.probeAt).toEqual([0, 30_000, 90_000, 212_500])
-  expect(count(w, 'ioreg')).toBe(1)
   await clock.advance(15_000)
+  await clock.advance(2_500)
+  expect(w.probeAt).toEqual([0, 15_000, 45_000])
+  w.slow = {}
+  await clock.advance(60_000)
+  expect(w.probeAt).toEqual([0, 15_000, 45_000, 107_500])
+  expect(count(w, 'ioreg')).toBe(1)
+  // The first fast sample keeps the pace at 60 s; the second resets it; the GPU is read on the next sample due one.
+  await clock.advance(60_000)
+  expect(w.probeAt).toEqual([0, 15_000, 45_000, 107_500, 167_500])
   await clock.advance(15_000)
   await clock.advance(15_000)
   expect(w.probeAt).toHaveLength(7)
   expect(count(w, 'ioreg')).toBe(2)
+  expect(w.logs.map(line => line.text)).toEqual([
+    'machine-guard: a probe timed out; sampling every 30 s until they are fast again',
+    'machine-guard: probes took 2.5 s; sampling every 60 s until they are fast again',
+    'machine-guard: probes are fast again; sampling every 15 s',
+  ])
 })
 
 test('sessions share one sample: a fresh one is shown without probing, a stale one is retaken under a lock', SLOW, async ($, on) => {
@@ -587,4 +619,62 @@ test('a mild parking is shown at once but toasted only once it has lasted five m
   w.mask = 65535
   await clock.advance(15_000)
   expect(back()).toHaveLength(1)
+})
+
+test("following another session's pace is logged once per change of pace, never per adopted sample", SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  const data = {
+    pressure: 'normal',
+    level: 1,
+    freePct: 21,
+    unusedGB: 10.1,
+    totalGB: 48,
+    compressorGB: 6.9,
+    compressedGB: 28.2,
+    swapUsedGB: 16.7,
+    swapTotalGB: 18,
+    gpuPct: 3,
+    top: [],
+    topAt: null,
+    topTriedAt: null,
+  }
+  /** The sampling session writes a fresh sample now, at the pace it is on. */
+  const sampled = (ttlMs: number) => {
+    const now = clock.now()
+    w.files.set(SHARED, JSON.stringify({ ts: now, by: 'sess-b', ttlMs, probeMs: 120, n: 7, data: { ...data, at: now, gpuAt: now } }))
+  }
+  /** This session's next `count` ticks, at its pace, each finding a sample the other session wrote a second before. */
+  const adoptFresh = async (count: number, ttlMs: number, paceMs: number) => {
+    for (let i = 0; i < count; i += 1) {
+      await clock.advance(paceMs - 1_000)
+      sampled(ttlMs)
+      await clock.advance(1_000)
+    }
+  }
+  const follows = () => w.logs.filter(line => line.text.includes("another session's pace")).map(line => line.text)
+
+  // At the configured pace there is nothing to say.
+  sampled(15_000)
+  await start($, clock)
+  await adoptFresh(10, 15_000, 15_000)
+  expect(w.probes).toEqual([])
+  expect(follows()).toEqual([])
+
+  // The sampling session has backed off to 30 s: said once; ten more samples at that pace pass in silence.
+  await adoptFresh(1, 30_000, 15_000)
+  expect(follows()).toEqual(["machine-guard: following another session's pace; sampling every 30 s"])
+  await adoptFresh(10, 30_000, 30_000)
+  expect(follows()).toHaveLength(1)
+
+  // Its probes are fast again: said once more, and then nothing while that lasts.
+  await adoptFresh(1, 15_000, 30_000)
+  await adoptFresh(10, 15_000, 15_000)
+  expect(follows()).toEqual([
+    "machine-guard: following another session's pace; sampling every 30 s",
+    "machine-guard: following another session's pace; sampling every 15 s",
+  ])
+  expect(w.probes).toEqual([])
+  expect(w.logs.map(line => line.to)).toEqual(['debug', 'debug'])
+  expect(w.statuses.at(-1)).toBe('RAM 21% free · swap 16.7/18G · GPU 3%')
 })

@@ -65,6 +65,8 @@ let timer: { cancel: () => void } | null = null
 let sampling: Promise<Snapshot | null> | null = null
 /** This session's own count of samples and the last one's duration: what paces the GPU when the shared file cannot be read. */
 let own = { n: 0, probeMs: 0 }
+/** Slow (or timed-out) and fast samples of this session's own in a row, as the last one left them; one of the two is always 0. */
+let streak = { slow: 0, fast: 0 }
 const fallbackId = `session-${Math.random().toString(36).slice(2, 10)}`
 
 /** Runs one probe; a rejection (its timeout, or a command that cannot start) counts as timed out, the text left null. */
@@ -130,9 +132,19 @@ async function showStatus($: Engine, snapshot: Snapshot | null, now: number) {
   $.ui.status(statusLine(snapshot, reservation, await pausedLeft($, now)) || undefined)
 }
 
-/** Sets the pace from how the last probes went, and logs each change once. */
+/**
+ * Sets the pace from how the probes have been going, with two samples' hysteresis each way, and logs each
+ * change once. One slow sample is a blip (a slow fork while the Mac swaps for a moment) and changes nothing;
+ * the second in a row doubles the interval, and each further one doubles it again up to the cap. The
+ * configured pace returns once two samples in a row are fast again. Followers echo each change, so a blip
+ * stays quiet in every session.
+ */
 function setPace($: Engine, probeMs: number, isTimedOut: boolean) {
   const isSlow = isTimedOut || probeMs > SLOW_MS
+  streak = isSlow ? { slow: streak.slow + 1, fast: 0 } : { slow: 0, fast: streak.fast + 1 }
+  if ((isSlow ? streak.slow : streak.fast) < 2) {
+    return
+  }
   const next = isSlow ? Math.min(intervalMs * 2, BACKOFF_CAP_MS) : config.sampleMs
   if (next === intervalMs) {
     return
@@ -373,6 +385,7 @@ export const register: Register = (on, options) => {
   timer = null
   sampling = null
   own = { n: 0, probeMs: 0 }
+  streak = { slow: 0, fast: 0 }
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
