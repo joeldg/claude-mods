@@ -47,12 +47,14 @@ Sets effort per message, so you don't have to switch it by hand.
 - **Deep asks** (audit, review, plan, design, investigate, root cause, "why does…", "figure out") run at **max**.
 - **Everything else**, including approvals like "yes", "go ahead" and "continue" and anything that starts new work ("merged 219, go ahead with #214"), keeps your session's own effort.
 - **Prompt cache:** changing effort makes the whole conversation get cached again. So it never switches mid-turn, raises effort at once, and over a large, warm cache lowers it only after 2 routine turns in a row. In small contexts, or once the cache has lapsed, it switches right away.
+- **Budget cap:** reads usage-meter's machine-wide summary of the last 5 hours (`~/.claude/usage-meter/summary.json`, at most every 30 s) and, once `pct` reaches `budgetCapAt` (80%), caps every turn at `budgetCapEffort` (high), deep asks included, so you stop hitting the 5-hour wall. A turn already at or below the cap is left alone; lowering over a warm cache waits like any other lowering and never happens mid-turn. A missing or stale summary (over 10 minutes old), or one written before a limit was ever hit, is no budget information. The debug log gets one line when the cap engages and one when it releases. `budgetCapAt: 0` turns it off.
+- **Subagents:** set `subagentEffort` (empty by default) to run every subagent request at that effort; the budget cap applies to them too (the lower of the two). Each subagent turn's effort is decided at its first request and kept for the turn.
 - **Model guard:** set `avoidModel` (a regex such as `fable`) to send those requests to `fallbackModel` instead, subagents included.
-- `/route` shows the last decision and the session's counts. `/route off` and `/route on` toggle it; `/route deep` and `/route routine` force the next turn.
-- Status line while a turn is routed: `effort: low (routine)`.
+- `/route` shows the last decision, the session's counts, the budget state (percent used, the cap, whether it is engaged) and the subagent effort. `/route off` and `/route on` toggle it all; `/route deep` and `/route routine` force the next turn.
+- Status line while a turn is routed: `effort: low (routine)`; while the budget cap lowers it: `effort: high (budget 84%)`.
 - Makes no model calls.
 
-Settings: `routineEffort` (low), `deepEffort` (max), `routinePattern`, `deepPattern`, `avoidModel`, `fallbackModel` (opus), `stickyTurns` (2), `freeSwitchTokens` (30000), `cacheTtlMinutes` (60).
+Settings: `routineEffort` (low), `deepEffort` (max), `routinePattern`, `deepPattern`, `avoidModel`, `fallbackModel` (opus), `stickyTurns` (2), `freeSwitchTokens` (30000), `cacheTtlMinutes` (60), `budgetCapAt` (80; 0 = off), `budgetCapEffort` (high), `subagentEffort` (empty = the session's own).
 
 ## job-watch
 

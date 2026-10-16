@@ -1,7 +1,7 @@
 {
   "name": "effort-router",
-  "version": "0.1.0",
-  "description": "Routes each turn's effort from your prompt: git housekeeping replies (\"merged\", \"commit and push\", \"push it\") run at low effort, deep asks (review, audit, plan, why does...) at max, everything else (approvals like \"yes\" or \"continue\" included) at the session's own. Switches only when the prompt cache makes it worth it, never mid-turn; optional model guard; /route shows and steers it. No model calls of its own.",
+  "version": "0.2.0",
+  "description": "Routes each turn's effort from your prompt: git housekeeping replies (\"merged\", \"commit and push\", \"push it\") run at low effort, deep asks (review, audit, plan, why does...) at max, everything else (approvals like \"yes\" or \"continue\" included) at the session's own. Switches only when the prompt cache makes it worth it, never mid-turn. Caps every turn and subagent at a lower effort once usage-meter says the plan's 5-hour budget is nearly used; can give subagents an effort of their own; optional model guard; /route shows and steers it. No model calls of its own.",
   "author": {
     "name": "joeldg"
   },
@@ -80,6 +80,31 @@
       "title": "Prompt cache lifetime (minutes)",
       "description": "After this long idle the cache has lapsed and a switch costs nothing extra. Claude Code keeps the main thread's cache 60 minutes on a subscription, 5 with an API key.",
       "default": 60
+    },
+    "budgetCapAt": {
+      "type": "number",
+      "title": "Budget cap (percent of the 5-hour limit)",
+      "description": "Once usage-meter's summary (~/.claude/usage-meter/summary.json) says this percent of the plan's 5-hour limit is used, every turn and subagent is capped at the effort below, deep asks included. 0 turns the cap off. A missing or stale summary (over 10 minutes old), or one written before a limit was ever hit, is no budget information.",
+      "default": 80
+    },
+    "budgetCapEffort": {
+      "type": "string",
+      "title": "Effort while over the budget cap",
+      "description": "The most effort any request gets while the budget cap is in force. A turn already at or below it is left alone.",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "high"
+    },
+    "subagentEffort": {
+      "type": "string",
+      "title": "Subagent effort",
+      "description": "The effort subagent requests run at: low, medium, high, xhigh or max. Empty leaves them at the session's own effort. The budget cap applies to subagents too (the lower of the two).",
+      "default": ""
     }
   }
 }

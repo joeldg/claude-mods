@@ -1,6 +1,6 @@
 import type { ModelEffort, ModelUsage } from 'claude-code'
 
-import type { RouteCache, RouteClass, RouteCounts, RoutePending, RouteState, RouteTurn } from '../types'
+import type { RouteAgentTurn, RouteBudget, RouteCache, RouteClass, RouteCounts, RoutePending, RouteState, RouteTurn } from '../types'
 
 export type Level = ModelEffort
 
@@ -204,6 +204,8 @@ export const EMPTY_STATE: RouteState = {
   cache: null,
   counts: EMPTY_COUNTS,
   rewrites: [],
+  budget: null,
+  agents: {},
 }
 
 /** A prompt was submitted: classify it (or take the class /route forced) for the turn it starts. */
@@ -224,11 +226,128 @@ export function started(state: RouteState, turnId: string, text: string, pattern
     (text.trim() === ''
       ? { cls: 'neutral', why: 'no prompt', isForced: false, text: '' }
       : { ...classify(text, patterns), isForced: false, text })
-  const turn: RouteTurn = { ...pending, id: turnId, effort: null, want: null, decision: null, streak: 0 }
+  const turn: RouteTurn = { ...pending, id: turnId, effort: null, want: null, decision: null, streak: 0, cappedAt: null }
   return { ...state, pending: null, turn }
 }
 
-export type Settings = { routineEffort: Level; deepEffort: Level; guard: Guard }
+export type Settings = {
+  routineEffort: Level
+  deepEffort: Level
+  guard: Guard
+  /** Percent of the 5-hour limit used at which every effort is capped; 0 turns the cap off. */
+  budgetCapAt: number
+  /** The most effort any request gets while the cap is in force. */
+  budgetCapEffort: Level
+  /** The effort subagent requests run at; null leaves them at the session's own. */
+  subagentEffort: Level | null
+}
+
+/** Where usage-meter writes its machine-wide summary of the last 5 hours, under the home folder. */
+export const SUMMARY_PATH = '.claude/usage-meter/summary.json'
+/** How long one reading of the summary serves. */
+export const BUDGET_MEMO_MS = 30_000
+/** A summary older than this says nothing about now. */
+export const BUDGET_STALE_MS = 10 * 60_000
+
+/** What usage-meter's summary says: the percent of the 5-hour limit used, or why there is no information. */
+export type BudgetReading = { pct: number | null; note: string }
+
+const NO_SUMMARY: BudgetReading = { pct: null, note: 'no usage-meter summary' }
+
+/**
+ * usage-meter's summary (`{ ts, pct, ... }`) read as budget information: its `pct` when the file parses
+ * and its `ts` is at most 10 minutes old; none when the file is missing, unreadable or stale, or `pct`
+ * is null (no limit has been hit yet, so none is learned).
+ */
+export function parseSummary(text: string | null, now: number): BudgetReading {
+  if (text === null) {
+    return NO_SUMMARY
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return NO_SUMMARY
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return NO_SUMMARY
+  }
+  const { ts, pct } = parsed as { ts?: unknown; pct?: unknown }
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) {
+    return NO_SUMMARY
+  }
+  if (now - ts > BUDGET_STALE_MS) {
+    return { pct: null, note: `summary is ${Math.round((now - ts) / 60_000)} min old` }
+  }
+  if (pct === null) {
+    return { pct: null, note: 'no limit learned yet' }
+  }
+  if (typeof pct !== 'number' || !Number.isFinite(pct)) {
+    return NO_SUMMARY
+  }
+  return { pct, note: '' }
+}
+
+export type BudgetChange = 'engaged' | 'released' | null
+
+/** A fresh reading of the summary: kept for the memo, the cap engaging or releasing as it crosses `capAt`. */
+export function noteBudget(state: RouteState, reading: BudgetReading, now: number, capAt: number): { state: RouteState; change: BudgetChange } {
+  const was = state.budget?.isCapping ?? false
+  const isCapping = capAt > 0 && reading.pct !== null && reading.pct >= capAt
+  const budget: RouteBudget = { checkedAt: now, pct: reading.pct, note: reading.note, isCapping }
+  return { state: { ...state, budget }, change: isCapping === was ? null : isCapping ? 'engaged' : 'released' }
+}
+
+/** The percent used while the cap is in force; null when it is not (cap off, no information, under the threshold). */
+export function cappingPct(state: RouteState, settings: Settings): number | null {
+  const budget = state.budget ?? null
+  return settings.budgetCapAt > 0 && budget !== null && budget.isCapping ? budget.pct : null
+}
+
+/** The effort a turn or subagent wants, lowered to the cap while the budget is in force; a want at or below it is left alone. */
+function capped(want: Level, state: RouteState, settings: Settings): { want: Level; cappedAt: number | null } {
+  const pct = cappingPct(state, settings)
+  return pct !== null && rank(want) > rank(settings.budgetCapEffort) ? { want: settings.budgetCapEffort, cappedAt: pct } : { want, cappedAt: null }
+}
+
+/** The debug-log line when the budget cap engages or releases. */
+export function describeBudgetChange(change: 'engaged' | 'released', budget: RouteBudget, settings: Settings): string {
+  const used =
+    budget.pct === null ? `no budget information (${budget.note})` : `${Math.round(budget.pct)}% of the 5-hour limit used (cap at ${settings.budgetCapAt}%)`
+  return change === 'engaged'
+    ? `effort-router: budget cap engaged: ${used}; turns run at ${settings.budgetCapEffort} or less`
+    : `effort-router: budget cap released: ${used}`
+}
+
+/** What a subagent's request carries. */
+export type AgentFacts = { agentId: string; turnId: string; effort: Level }
+
+/**
+ * The effort a subagent's request is sent at: `subagentEffort` when set, else its own, lowered to the
+ * budget cap while it is in force. Decided at the first request of the agent's turn and kept for the
+ * turn (routing off included), so a subagent never switches midway either.
+ */
+export function planAgentStep(state: RouteState, facts: AgentFacts, settings: Settings): { state: RouteState; effort: Level } {
+  const agents = state.agents ?? {}
+  const pinned = agents[facts.agentId]
+  if (pinned !== undefined && pinned.turnId === facts.turnId) {
+    return { state, effort: pinned.effort }
+  }
+  const want = state.isOn ? capped(settings.subagentEffort ?? facts.effort, state, settings).want : facts.effort
+  const pin: RouteAgentTurn = { turnId: facts.turnId, effort: want }
+  return { state: { ...state, agents: { ...agents, [facts.agentId]: pin } }, effort: want }
+}
+
+/** A subagent's turn ended: the effort pinned for it is dropped. */
+export function agentDone(state: RouteState, agentId: string): RouteState {
+  const agents = state.agents ?? {}
+  if (!(agentId in agents)) {
+    return state
+  }
+  const rest = { ...agents }
+  delete rest[agentId]
+  return { ...state, agents: rest }
+}
 
 /** What a main-loop request carries, as the engine is about to send it. */
 export type StepFacts = {
@@ -245,10 +364,18 @@ export type StepFacts = {
 
 export type Planned = { state: RouteState; effort: Level; isNew: boolean; status: string | undefined }
 
-/** What the status line says while a turn runs; undefined when the turn runs as the session would. */
-export function statusText(cls: RouteClass, decision: Decision, isForced: boolean, stickyTurns: number): string | undefined {
+/**
+ * What the status line says while a turn runs; undefined when the turn runs as the session would.
+ * `cappedAt` is the budget percent that lowered the turn's want, when the cap did.
+ */
+export function statusText(cls: RouteClass, decision: Decision, isForced: boolean, stickyTurns: number, cappedAt: number | null = null): string | undefined {
+  const budget = cappedAt === null ? null : `budget ${Math.round(cappedAt)}%`
   if (decision.why === 'hold') {
-    return `effort: ${decision.effort} (${cls === 'neutral' ? '' : `${cls}, `}held for the prompt cache ${decision.lowerStreak}/${stickyTurns})`
+    const lead = budget !== null ? `${budget}, ` : cls === 'neutral' ? '' : `${cls}, `
+    return `effort: ${decision.effort} (${lead}held for the prompt cache ${decision.lowerStreak}/${stickyTurns})`
+  }
+  if (budget !== null) {
+    return `effort: ${decision.effort} (${budget})`
   }
   if (cls === 'neutral' || decision.why === 'off') {
     return undefined
@@ -268,7 +395,7 @@ export function planStep(state: RouteState, facts: StepFacts, settings: Settings
   const turn: RouteTurn =
     current !== null && current.id === facts.turnId
       ? current
-      : { id: facts.turnId, cls: 'neutral', why: 'its prompt was not seen', isForced: false, text: '', effort: null, want: null, decision: null, streak: 0 }
+      : { id: facts.turnId, cls: 'neutral', why: 'its prompt was not seen', isForced: false, text: '', effort: null, want: null, decision: null, streak: 0, cappedAt: null }
   const cache: RouteCache = state.cache ?? {
     applied: facts.base,
     model: facts.model,
@@ -279,7 +406,9 @@ export function planStep(state: RouteState, facts: StepFacts, settings: Settings
     lowerStreak: 0,
   }
   const isRouted = state.isOn || turn.isForced
-  const want = !isRouted || turn.cls === 'neutral' ? facts.base : turn.cls === 'routine' ? settings.routineEffort : settings.deepEffort
+  const asked: Level = !isRouted || turn.cls === 'neutral' ? facts.base : turn.cls === 'routine' ? settings.routineEffort : settings.deepEffort
+  // The budget cap lowers what any routed turn wants, deep asks included; the cache guard below treats it as any lowering.
+  const { want, cappedAt } = isRouted ? capped(asked, state, settings) : { want: asked, cappedAt: null }
   const decision: Decision = isRouted
     ? decide(cache, { want, model: facts.model, base: facts.base, messageCount: facts.messageCount, now: facts.now, isForced: turn.isForced }, settings.guard)
     : { effort: want, why: 'off', lowerStreak: 0 }
@@ -292,7 +421,7 @@ export function planStep(state: RouteState, facts: StepFacts, settings: Settings
   return {
     state: {
       ...state,
-      turn: { ...turn, effort: decision.effort, want, decision: decision.why, streak: decision.lowerStreak },
+      turn: { ...turn, effort: decision.effort, want, decision: decision.why, streak: decision.lowerStreak, cappedAt },
       cache: {
         ...cache,
         applied: decision.effort,
@@ -305,7 +434,7 @@ export function planStep(state: RouteState, facts: StepFacts, settings: Settings
     },
     effort: decision.effort,
     isNew: true,
-    status: statusText(turn.cls, decision, turn.isForced, Math.max(1, settings.guard.stickyTurns)),
+    status: statusText(turn.cls, decision, turn.isForced, Math.max(1, settings.guard.stickyTurns), cappedAt),
   }
 }
 
@@ -336,6 +465,7 @@ export function cleared(state: RouteState): RouteState {
     turn: null,
     counts: EMPTY_COUNTS,
     cache: state.cache === null ? null : { ...state.cache, messageCount: 0, contextTokens: 0, lastAt: null, lowerStreak: 0 },
+    agents: {},
   }
 }
 
@@ -398,6 +528,34 @@ export type Describe = {
 
 const formatTokens = (n: number): string => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
 
+/** The /route line about the last turn: its class, prompt and why, and the effort it got or is held at. */
+function lastTurnLine(turn: RouteTurn): string {
+  const quoted = turn.text === '' ? '' : ` "${clip(turn.text, 60)}"`
+  const cappedAt = turn.cappedAt ?? null
+  const budget = cappedAt === null ? null : `budget ${Math.round(cappedAt)}%`
+  const effort =
+    turn.effort === null
+      ? 'effort not chosen yet'
+      : turn.decision === 'hold'
+        ? `${turn.effort}, held for the prompt cache (wanted ${turn.want ?? '?'}${budget === null ? '' : `: ${budget}`})`
+        : budget !== null
+          ? `${turn.effort} (${budget})`
+          : `${turn.effort} (${WHY_WORDS[turn.decision ?? 'same'] ?? turn.decision})`
+  return `Last turn: ${turn.cls}${quoted}, ${turn.why} → ${effort}`
+}
+
+/** The /route lines about the budget cap (the last reading, the threshold and effort, whether it is in force) and subagents. */
+function budgetLines(state: RouteState, settings: Settings): string[] {
+  const subagents = settings.subagentEffort === null ? "Subagents: the session's own effort" : `Subagents: run at ${settings.subagentEffort}`
+  if (settings.budgetCapAt <= 0) {
+    return ['Budget cap: off', subagents]
+  }
+  const budget = state.budget ?? null
+  const used = budget === null ? 'not read yet' : budget.pct === null ? `unknown (${budget.note})` : `${Math.round(budget.pct)}% of the 5-hour limit used`
+  const standing = budget === null || !budget.isCapping ? 'not engaged' : state.isOn ? 'engaged' : 'not applied while routing is off'
+  return [`Budget: ${used} · cap at ${settings.budgetCapAt}% → ${settings.budgetCapEffort}: ${standing}`, subagents]
+}
+
 /** What /route prints. */
 export function describeRoute(state: RouteState, info: Describe): string {
   const { settings } = info
@@ -406,19 +564,7 @@ export function describeRoute(state: RouteState, info: Describe): string {
   if (state.forced !== null) {
     lines.push(`Next prompt: forced ${state.forced} (${effortFor(state.forced)})`)
   }
-  const turn = state.turn
-  if (turn === null) {
-    lines.push('No turn routed yet.')
-  } else {
-    const quoted = turn.text === '' ? '' : ` "${clip(turn.text, 60)}"`
-    const effort =
-      turn.effort === null
-        ? 'effort not chosen yet'
-        : turn.decision === 'hold'
-          ? `${turn.effort}, held for the prompt cache (wanted ${turn.want ?? '?'})`
-          : `${turn.effort} (${WHY_WORDS[turn.decision ?? 'same'] ?? turn.decision})`
-    lines.push(`Last turn: ${turn.cls}${quoted}, ${turn.why} → ${effort}`)
-  }
+  lines.push(state.turn === null ? 'No turn routed yet.' : lastTurnLine(state.turn))
   const c = state.counts
   lines.push(
     `This session: ${c.routine} routine, ${c.deep} deep, ${c.neutral} neutral turns · ${c.switches} effort ${c.switches === 1 ? 'switch' : 'switches'} · ${c.holds} held for the prompt cache`,
@@ -429,6 +575,6 @@ export function describeRoute(state: RouteState, info: Describe): string {
     lines.push(`Prompt cache: written at ${state.cache.applied} over about ${formatTokens(state.cache.contextTokens)} tokens.`)
   }
   lines.push(info.modelGuard === null ? 'Model guard: off' : `Model guard: ${info.modelGuard}`)
-  lines.push(...info.errors)
+  lines.push(...budgetLines(state, settings), ...info.errors)
   return lines.join('\n')
 }

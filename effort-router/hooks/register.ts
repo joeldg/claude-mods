@@ -24,24 +24,43 @@
  *
  * The model guard (`avoidModel` → `fallbackModel`) rewrites every request the same way, main loop and
  * subagents alike, so the cache is rebuilt once for the new model and then reused.
+ *
+ * The budget cap (`budgetCapAt` → `budgetCapEffort`). usage-meter writes a machine-wide summary of the
+ * last 5 hours to ~/.claude/usage-meter/summary.json; once its `pct` (of the last learned limit)
+ * reaches `budgetCapAt`, every turn's effort is capped at `budgetCapEffort`, deep asks included: the
+ * point is not to hit the wall. The summary is read at a turn's first request, one reading serving
+ * 30 s; a missing or stale file (over 10 minutes old) or a null `pct` is no budget information. The
+ * cap only lowers what a turn wants, so it goes through the same cache discipline: over a warm, large
+ * cache it waits for `stickyTurns` turns like any lowering, and a turn's effort never changes midway.
+ *
+ * Subagents (`subagentEffort`) run at that effort when it is set, the budget cap applying to them too
+ * (the lower of the two); each subagent turn's effort is decided at its first request and kept.
  */
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PromptOrigin, Register, TurnStepInput, TurnStepResult } from 'claude-code'
 
+import type { RouteBudget, RouteState } from '../types'
 import {
+  BUDGET_MEMO_MS,
   EMPTY_STATE,
+  SUMMARY_PATH,
+  agentDone,
   cleared,
   compilePatterns,
+  describeBudgetChange,
   describeRoute,
   guardModel,
   isLevel,
+  noteBudget,
+  parseSummary,
+  planAgentStep,
   planStep,
   resolveModel,
   responded,
   started,
   submitted,
 } from './route'
-import type { Level, Patterns, Planned, Settings } from './route'
+import type { BudgetChange, Level, Patterns, Planned, Settings } from './route'
 
 type Engine = EngineInterface
 
@@ -68,6 +87,9 @@ const DEFAULT_SETTINGS: Settings = {
   routineEffort: 'low',
   deepEffort: 'max',
   guard: { stickyTurns: 2, freeSwitchTokens: 30_000, cacheTtlMs: 60 * 60_000 },
+  budgetCapAt: 80,
+  budgetCapEffort: 'high',
+  subagentEffort: null,
 }
 
 let config: Config = {
@@ -121,6 +143,45 @@ async function contextNow($: Engine): Promise<number> {
   }
 }
 
+/** usage-meter's summary of the last 5 hours, machine-wide; null when there is none to read. */
+async function readSummary($: Engine): Promise<string | null> {
+  try {
+    const home = await $.env.get('HOME')
+    return home ? await $.fs.read(`${home}/${SUMMARY_PATH}`) : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Brings the budget reading up to date once the memo has run out, and logs the cap engaging or
+ * releasing. Never throws: without a fresh reading the turn runs on the last one.
+ */
+async function refreshBudget($: Engine, now: number, known: RouteState): Promise<void> {
+  if (config.settings.budgetCapAt <= 0) {
+    return
+  }
+  const memo = known.budget ?? null
+  if (memo !== null && now - memo.checkedAt < BUDGET_MEMO_MS) {
+    return
+  }
+  try {
+    const reading = parseSummary(await readSummary($), now)
+    const noted: { change: BudgetChange; budget: RouteBudget | null } = { change: null, budget: null }
+    await update($, router, state => {
+      const next = noteBudget(state, reading, now, config.settings.budgetCapAt)
+      noted.change = next.change
+      noted.budget = next.state.budget
+      return next.state
+    })
+    if (noted.change !== null && noted.budget !== null) {
+      $.ui.log(describeBudgetChange(noted.change, noted.budget, config.settings), { to: 'debug' })
+    }
+  } catch (error) {
+    reportFailure($, 'reading the budget', error, 'so the turn runs on the last reading')
+  }
+}
+
 /** The effort this main-loop request is sent at: decided at the turn's first request, then kept. */
 async function chooseEffort($: Engine, e: TurnStepInput, model: string, base: Level): Promise<Level> {
   const before = await read($, router)
@@ -128,6 +189,9 @@ async function chooseEffort($: Engine, e: TurnStepInput, model: string, base: Le
     return before.turn.effort
   }
   const now = await $.clock.now()
+  if (before.isOn || (before.turn !== null && before.turn.id === e.turnId && before.turn.isForced)) {
+    await refreshBudget($, now, before)
+  }
   const contextTokens = before.cache === null ? await contextNow($) : 0
   const plan: { planned: Planned | null } = { planned: null }
   await update($, router, state => {
@@ -143,6 +207,25 @@ async function chooseEffort($: Engine, e: TurnStepInput, model: string, base: Le
   return plan.planned.effort
 }
 
+/** The effort a subagent's request is sent at: decided at its turn's first request, then kept. */
+async function chooseAgentEffort($: Engine, agentId: string, turnId: string, base: Level): Promise<Level> {
+  const before = await read($, router)
+  const pinned = (before.agents ?? {})[agentId]
+  if (pinned !== undefined && pinned.turnId === turnId) {
+    return pinned.effort
+  }
+  if (before.isOn) {
+    await refreshBudget($, await $.clock.now(), before)
+  }
+  const plan = { effort: base }
+  await update($, router, state => {
+    const planned = planAgentStep(state, { agentId, turnId, effort: base }, config.settings)
+    plan.effort = planned.effort
+    return planned.state
+  })
+  return plan.effort
+}
+
 /** Remembers how large the cached conversation is now, and when it was last written. */
 async function noteResponse($: Engine, messageCount: number, model: string, result: TurnStepResult) {
   try {
@@ -154,9 +237,79 @@ async function noteResponse($: Engine, messageCount: number, model: string, resu
 }
 
 /** A failure in effort-router's own code, logged (to the debug log) for mod-monitor to count. */
-function reportFailure($: Engine, what: string, error: unknown) {
+function reportFailure($: Engine, what: string, error: unknown, consequence = 'so the request went out unchanged') {
   const message = error instanceof Error ? error.message : String(error)
-  $.ui.log(`effort-router: ${what} failed, so the request went out unchanged: ${message.slice(0, 200)}`, { to: 'debug' })
+  $.ui.log(`effort-router: ${what} failed, ${consequence}: ${message.slice(0, 200)}`, { to: 'debug' })
+}
+
+/**
+ * The request as it goes out: the model after the guard, and the effort chosen for the main loop's
+ * turn or the subagent's. Routing must never cost a request: if choosing fails, the request goes out
+ * exactly as it came, and the failure is logged where mod-monitor reads it (the response stream is not
+ * a hook it can watch). `isRouted` says the main loop's response should be noted for the cache.
+ */
+async function routeRequest($: Engine, e: TurnStepInput): Promise<{ routed: TurnStepInput; model: string; isRouted: boolean }> {
+  try {
+    const model = await guardedModel($, e.model)
+    if (!isLevel(e.effort)) {
+      // A model without effort levels has none to route.
+      return { routed: model === e.model ? e : { ...e, model }, model, isRouted: false }
+    }
+    if (e.agentId !== undefined) {
+      const effort = await chooseAgentEffort($, e.agentId, e.turnId, e.effort)
+      return { routed: effort === e.effort && model === e.model ? e : { ...e, model, effort }, model, isRouted: false }
+    }
+    const effort = await chooseEffort($, e, model, e.effort)
+    return { routed: effort === e.effort && model === e.model ? e : { ...e, model, effort }, model, isRouted: true }
+  } catch (error) {
+    reportFailure($, 'choosing the effort', error)
+    return { routed: e, model: e.model, isRouted: false }
+  }
+}
+
+/** A subagent's turn ended: the effort pinned for it is dropped. */
+async function forgetAgent($: Engine, agentId: string): Promise<void> {
+  try {
+    await update($, router, state => agentDone(state, agentId))
+  } catch (error) {
+    reportFailure($, 'forgetting a subagent turn', error, 'so its effort stays pinned until its next turn')
+  }
+}
+
+/** /route: the status, on or off for the session, or forcing the next prompt deep or routine. */
+async function runRoute($: Engine, args: string): Promise<{ text: string }> {
+  if (!config.enabled) {
+    return { text: 'effort-router is turned off in its settings (enabled: false); requests are left as they are.' }
+  }
+  const verb = args.trim().toLowerCase()
+  if (verb === 'off') {
+    await update($, router, state => ({ ...state, isOn: false }))
+    return { text: "Effort routing is off for this session: turns run at the session's own effort. /route on turns it back on." }
+  }
+  if (verb === 'on') {
+    await update($, router, state => ({ ...state, isOn: true }))
+    return { text: 'Effort routing is on.' }
+  }
+  if (verb === 'deep' || verb === 'routine') {
+    const forced: 'deep' | 'routine' = verb
+    await update($, router, state => ({ ...state, forced }))
+    const effort = forced === 'deep' ? config.settings.deepEffort : config.settings.routineEffort
+    return { text: `Your next prompt runs at ${effort} (${forced}), whatever it says.` }
+  }
+  if (verb !== '' && verb !== 'status') {
+    return { text: USAGE }
+  }
+  let state = await read($, router)
+  if (state.isOn && config.settings.budgetCapAt > 0) {
+    // Shows the budget as it stands now, not as the last turn saw it.
+    try {
+      await refreshBudget($, await $.clock.now(), state)
+      state = await read($, router)
+    } catch (error) {
+      reportFailure($, 'reading the budget', error, 'so /route shows the last reading')
+    }
+  }
+  return { text: describeRoute(state, { settings: config.settings, modelGuard: modelGuardLine(), errors: config.errors }) }
 }
 
 export const register: Register = (on, options) => {
@@ -181,6 +334,9 @@ export const register: Register = (on, options) => {
         freeSwitchTokens: numberIn(options.freeSwitchTokens, 30_000, 0, 10_000_000),
         cacheTtlMs: numberIn(options.cacheTtlMinutes, 60, 0, 24 * 60) * 60_000,
       },
+      budgetCapAt: numberIn(options.budgetCapAt, 80, 0, 100),
+      budgetCapEffort: isLevel(options.budgetCapEffort) ? options.budgetCapEffort : 'high',
+      subagentEffort: isLevel(options.subagentEffort) ? options.subagentEffort : null,
     },
     patterns: compiled.patterns,
     errors,
@@ -198,31 +354,7 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'route' }, async ($, e) => {
-    if (!config.enabled) {
-      return { text: 'effort-router is turned off in its settings (enabled: false); requests are left as they are.' }
-    }
-    const verb = e.args.trim().toLowerCase()
-    if (verb === 'off') {
-      await update($, router, state => ({ ...state, isOn: false }))
-      return { text: "Effort routing is off for this session: turns run at the session's own effort. /route on turns it back on." }
-    }
-    if (verb === 'on') {
-      await update($, router, state => ({ ...state, isOn: true }))
-      return { text: 'Effort routing is on.' }
-    }
-    if (verb === 'deep' || verb === 'routine') {
-      const forced: 'deep' | 'routine' = verb
-      await update($, router, state => ({ ...state, forced }))
-      const effort = forced === 'deep' ? config.settings.deepEffort : config.settings.routineEffort
-      return { text: `Your next prompt runs at ${effort} (${forced}), whatever it says.` }
-    }
-    if (verb !== '' && verb !== 'status') {
-      return { text: USAGE }
-    }
-    const state = await read($, router)
-    return { text: describeRoute(state, { settings: config.settings, modelGuard: modelGuardLine(), errors: config.errors }) }
-  })
+  on('command.run', { command: 'route' }, ($, e) => runRoute($, e.args))
 
   if (!config.enabled) {
     return
@@ -240,32 +372,16 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    if (e.agentId !== undefined) {
+      // A subagent's turn: its prompt is not the person's, and the main turn keeps its own record.
+      return next(e)
+    }
     await update($, router, state => started(state, e.turnId, e.text, config.patterns))
     return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
-    // Routing must never cost a request: if choosing fails, the request goes out exactly as it came, and
-    // the failure is logged where mod-monitor reads it (this stream is not a hook it can watch).
-    let routed = e
-    let model = e.model
-    let isRouted = false
-    try {
-      model = await guardedModel($, e.model)
-      if (e.agentId !== undefined || !isLevel(e.effort)) {
-        // A subagent keeps its own effort; a model without effort levels has none to route.
-        routed = model === e.model ? e : { ...e, model }
-      } else {
-        const effort = await chooseEffort($, e, model, e.effort)
-        routed = effort === e.effort && model === e.model ? e : { ...e, model, effort }
-        isRouted = true
-      }
-    } catch (error) {
-      routed = e
-      model = e.model
-      isRouted = false
-      reportFailure($, 'choosing the effort', error)
-    }
+    const { routed, model, isRouted } = await routeRequest($, e)
     const result = yield* next(routed)
     if (isRouted) {
       try {
@@ -281,6 +397,8 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     if (e.agentId === undefined) {
       $.ui.status(undefined)
+    } else {
+      await forgetAgent($, e.agentId)
     }
     return done
   })

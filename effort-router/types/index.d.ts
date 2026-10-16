@@ -25,6 +25,8 @@ export type RouteTurn = RoutePending & {
   decision: string | null
   /** Turns in a row that wanted less effort than was being sent, this one included. */
   streak: number
+  /** The percent of the 5-hour budget used when its cap lowered this turn's wanted effort; null when the cap did not. */
+  cappedAt: number | null
 }
 
 /** What the prompt cache was last written with on the main loop, so a switch is only made when it pays. */
@@ -55,6 +57,24 @@ export type RouteCounts = {
   holds: number
 }
 
+/** usage-meter's reading of the machine-wide 5-hour budget, as last read (one reading serves 30 s). */
+export type RouteBudget = {
+  /** When the summary was last read, for the memo. */
+  checkedAt: number
+  /** Percent of the last learned 5-hour limit already used; null without budget information. */
+  pct: number | null
+  /** Why there is no information ("no usage-meter summary", "summary is 12 min old", "no limit learned yet"); "" when pct is known. */
+  note: string
+  /** True while pct is at or over budgetCapAt: every turn and subagent is capped at budgetCapEffort. */
+  isCapping: boolean
+}
+
+/** A subagent's running turn and the effort chosen at its first request, kept for the turn. */
+export type RouteAgentTurn = {
+  turnId: string
+  effort: RouteLevel
+}
+
 export type RouteState = {
   /** /route off turns automatic routing off for the session; /route deep and /route routine still apply. */
   isOn: boolean
@@ -66,6 +86,10 @@ export type RouteState = {
   counts: RouteCounts
   /** Model rewrites already announced with a toast (`from→to`). */
   rewrites: string[]
+  /** The last budget reading; null before one, or while the cap is off. */
+  budget: RouteBudget | null
+  /** Subagents with a turn running, by agent id, each with the effort its turn keeps. */
+  agents: Record<string, RouteAgentTurn>
 }
 
 declare module 'claude-code' {
