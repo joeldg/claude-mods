@@ -1,0 +1,29 @@
+{
+  "name": "usage-meter",
+  "version": "0.1.0",
+  "description": "A machine-wide meter of the plan's rolling 5-hour usage: every session's turns summed as effective tokens, the cap learned from each session-limit hit, the burn on the status line, a toast before the wall, /usage and a usage_status tool so Claude can pace itself. No process runs, no model calls.",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "windowHours": {
+      "type": "number",
+      "title": "Window (hours)",
+      "description": "How far back the rolling window reaches: the plan's session limit meters 5 hours.",
+      "default": 5
+    },
+    "refreshSeconds": {
+      "type": "number",
+      "title": "Refresh every (seconds)",
+      "description": "How often every session's turns are summed again, the status line redrawn and summary.json rewritten when the figures changed.",
+      "default": 30
+    },
+    "warnAt": {
+      "type": "number",
+      "title": "Warn at (% of the last limit)",
+      "description": "Toast once when the window's effective tokens first cross this share of the cap estimate; armed again once the share falls back below it.",
+      "default": 80
+    }
+  }
+}

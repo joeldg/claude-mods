@@ -293,12 +293,25 @@ Raises the alarm when a session you walked away from has stalled: a dialog waiti
 
 Settings: `stallMinutes` (5), `repeatMinutes` (30, permission dialogs), `questionRepeatMinutes` (120), `questionRepeats` (3; 0 = alarm once), `notifyMac` (on), `notifyCommand` (empty), `alarmOnAnyError` (off), `skipRoutines` (on).
 
+## usage-meter
+
+A machine-wide meter of the plan's rolling 5-hour usage, so the burn shows before the wall. Every session counts its turns into `~/.claude/usage-meter/turns/<session>.jsonl` and sums every session's last 5 hours (`windowHours`) as **effective tokens** = input + 0.1·cache read + 2·cache write + 5·output, an estimate of what the session limit meters (the weights follow Anthropic's usage explainer). No process runs, no model calls.
+
+- Status line: `usage 5h: 12.4M eff`, then ` · 58% used` while the API's own five-hour reading (the `rateLimits` the last response reported) is fresher than 15 minutes, else ` · 61% of last limit` once a limit hit has taught it the cap, and ` · resets 10:30pm` while a reset is ahead.
+- Learns the cap from the hits: the API error `You've hit your session limit · resets 10:30pm (America/Los_Angeles)` (heard as the transcript row, as the classic `StopFailure`, or as the turn's end, counted once) records `{at, resetAt, effectiveAtHit}` in `~/.claude/usage-meter/hits.json`, one per reset time across all sessions, the last 20 kept; the cap estimate is the median of the last three.
+- Toasts once when the share first crosses `warnAt` (80%), armed again once it falls back below; and once at the hit itself: `Session limit hit · resets 10:30pm · 14.1M eff in the last 5h, cap estimate updated`.
+- Writes `~/.claude/usage-meter/summary.json` for other mods (effort-router's budget cap reads it), at most every `refreshSeconds` (30) and only when the figures changed: `{ ts, windowMs, sessions, tokens: { input, cacheRead, cacheWrite, output }, effective, capEstimate, pct, lastHitAt, nextResetAt }`.
+- `/meter` prints the window's totals by category and effective, the estimate and the API's reading, a per-session table (id, turns, subagent turns, effective, share), the hits with the cap estimate, and the weights (`/usage` is Claude Code's own command). The `usage_status` tool returns the same text without a permission prompt, so Claude can check the budget before fanning out subagents or starting optional work.
+- Each session's file is rewritten without lines older than the window about once an hour; a file idle for longer than the window is never read.
+
+Settings: `windowHours` (5), `refreshSeconds` (30), `warnAt` (80).
+
 ## Loading
 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`. Put mod-monitor first so it sees the others; `CLAUDE_CODE_PLUGIN_DIR_WATCH` makes desktop sessions pick up edits and show mod failures:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1", "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/mod-monitor:~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1", "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/mod-monitor:~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall:~/Projects/claude-mods/stall-alarm:~/Projects/claude-mods/usage-meter" } }
   ```
 
 ## Checking
@@ -321,5 +334,7 @@ claude plugin validate effort-router && claude plugin test effort-router
 claude plugin validate secret-guard && claude plugin test secret-guard
 claude plugin validate recall && claude plugin test recall
 claude plugin validate mod-monitor && claude plugin test mod-monitor
+claude plugin validate stall-alarm && claude plugin test stall-alarm
+claude plugin validate usage-meter && claude plugin test usage-meter
 (cd recall/engine && /usr/bin/python3 -m unittest)
 ```
