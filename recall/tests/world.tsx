@@ -14,6 +14,8 @@ export const DAY = 86_400_000
 export const SOURCES = ['--sources', 'claude,codex,memory,orders,reviews', '--subagents']
 /** What the engine leaves beside the index after a complete update. */
 export const SIDECAR = '/Users/me/.claude/recall/last-update.json'
+/** The window the start update's random wait falls in (`startJitterSeconds`, 45 by default), in ms. */
+export const START_JITTER_MS = 45_000
 export const LEDGER_DIR = '/Users/me/.claude/recall/ledger'
 /** How an update's command line begins when /usr/bin/nice exists. */
 export const NICE = ['/usr/bin/nice', '-n', '19']
@@ -490,10 +492,13 @@ export const recall = async ($: Engine, args: string): Promise<string> => (await
 
 export const say = ($: Engine, text: string) => $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
 
-/** An interactive session's start; its timer work (indexing, the last-session band) has run once settled. */
+/**
+ * An interactive session's start, its timer work done: the ledger and the last-session band at once, the start update
+ * after its random wait of up to START_JITTER_MS, which the clock is moved past.
+ */
 export async function start($: Engine, w: World): Promise<void> {
   await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
-  await w.clock.settle()
+  await w.clock.advance(START_JITTER_MS)
 }
 
 export const PANE_PROPS = {

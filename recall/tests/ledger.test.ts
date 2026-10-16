@@ -2,7 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
 import { goalOf, isQuestion, parseLedger } from '../hooks/ledger'
-import { LEDGER_DIR, NOW, SESSION, recall, start, world } from './world'
+import { LEDGER_DIR, NOW, SESSION, START_JITTER_MS, recall, start, world } from './world'
 
 const SLOW = { timeoutMs: 30_000 }
 const FILE = `${LEDGER_DIR}/${SESSION}.json`
@@ -158,7 +158,8 @@ test('the ledger is written two seconds after a change, once per burst, readable
   expect(JSON.parse(w.files.get(FILE) ?? '{}')).toEqual({
     v: 1,
     session: SESSION,
-    ts: NOW + 2_000,
+    // The start moved the clock past the start update's wait; the write came two seconds after the change.
+    ts: NOW + START_JITTER_MS + 2_000,
     goal: null,
     decisions: ['Q: is the key sk-ant-‹masked› still valid? → A: No: it was rotated last week.'],
     tasks: [],

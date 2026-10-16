@@ -46,6 +46,8 @@ export type Config = {
   updateMs: number
   /** An automatic update is skipped while another process's completed one is younger than this; 0 never skips. */
   freshMs: number
+  /** The automatic update at a session's start waits a random part of this long, so sessions that start together spread out; 0 runs it at once. */
+  startJitterMs: number
   relatedBand: boolean
   lastSessionBand: boolean
   maxResults: number
@@ -78,6 +80,7 @@ export function parseSources(raw: string): string[] {
 export function configFrom(options: PluginOptions): Config {
   const minutes = number(options.updateMinutes, 10)
   const fresh = number(options.freshMinutes, 10)
+  const jitter = number(options.startJitterSeconds, 45)
   return {
     dbPath: text(options.dbPath, DEFAULT_DB),
     python: text(options.python, DEFAULT_PYTHON),
@@ -86,11 +89,23 @@ export function configFrom(options: PluginOptions): Config {
     includeRoutines: flag(options.includeRoutines, false),
     updateMs: minutes > 0 ? Math.round(Math.max(1, Math.min(24 * 60, minutes)) * 60_000) : 0,
     freshMs: fresh > 0 ? Math.round(Math.min(24 * 60, fresh) * 60_000) : 0,
+    startJitterMs: jitter > 0 ? Math.round(Math.min(60 * 60, jitter) * 1000) : 0,
     relatedBand: flag(options.relatedBand, true),
     lastSessionBand: flag(options.lastSessionBand, true),
     maxResults: Math.round(Math.max(1, Math.min(MAX_LIMIT, number(options.maxResults, DEFAULT_MAX_RESULTS)))),
     askModel: text(options.askModel, DEFAULT_ASK_MODEL),
   }
+}
+
+/**
+ * How long a session's start update waits: `fraction` (a draw in [0, 1), `Math.random()`'s) of the jitter window, held
+ * inside it, so sessions that start together do not all update at once. 0 when the window is 0 or the draw is odd.
+ */
+export function startDelayMs(startJitterMs: number, fraction: number): number {
+  if (startJitterMs <= 0 || !(fraction > 0)) {
+    return 0
+  }
+  return Math.min(startJitterMs - 1, Math.floor(Math.min(1, fraction) * startJitterMs))
 }
 
 /** A path with a leading `~` made absolute under `home`; as given when it has none or HOME is unset. */

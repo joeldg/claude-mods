@@ -1,10 +1,14 @@
 import { expect, test } from 'claude-code/testing'
 
-import { CWD, DB, NICE, NOW, PYTHON, SESSION, SIDECAR, SOURCES, STATS, callsOf, progress, recall, say, sidecar, start, world } from './world'
+import { CWD, DB, NICE, NOW, PYTHON, SESSION, SIDECAR, SOURCES, START_JITTER_MS, STATS, callsOf, progress, recall, say, sidecar, start, world } from './world'
 
 const SLOW = { timeoutMs: 30_000 }
+/** No random wait before the start update: it runs as soon as the start's timers fire. */
+const AT_ONCE = { ...SLOW, options: { startJitterSeconds: 0 } }
+/** What the debug log says, once per session, when another process's update holds the index. */
+const BUSY_LINE = 'recall: another update holds the index: this session stands down until its next tick (said once per session)'
 
-test('a first run builds the index in the background, its progress on the status line, then says how many', SLOW, async ($, on) => {
+test('a first run (startJitterSeconds 0: at once) builds the index in the background, its progress on the status line, then says how many', AT_ONCE, async ($, on) => {
   const w = world(on)
   w.engine.stats = () => ({ json: { ...STATS, docs: 0, sessions: 0 } })
   w.engine.recap = () => ({ json: { sessions: [] } })
@@ -26,6 +30,8 @@ test('a first run builds the index in the background, its progress on the status
   expect(w.calls).toEqual([])
 
   await w.clock.settle()
+  // This project's last session was looked for at once, for the band; the index check followed.
+  expect(callsOf(w, 'recap')).toHaveLength(1)
   expect(callsOf(w, 'stats')).toHaveLength(1)
   expect(w.spawned).toEqual([{ command: 'update', args: [...SOURCES, '--progress'] }])
   expect(w.statuses).toEqual(['recall: indexing 0%'])
@@ -37,7 +43,7 @@ test('a first run builds the index in the background, its progress on the status
   await w.clock.advance(1_000)
   expect(w.statuses).toEqual(['recall: indexing 0%', 'recall: indexing 42%', 'recall: indexing 99%', undefined])
   expect(w.toasts).toEqual(['recall: indexed 12 sessions'])
-  // Then this project's last session is looked for, for the band.
+  // The band's look-up did not wait for the build, and is not made again after it.
   expect(callsOf(w, 'recap')).toHaveLength(1)
 })
 
@@ -59,7 +65,7 @@ test('with an index in place: a quiet update at the start and every updateMinute
   expect(callsOf(w, 'update')).toHaveLength(2)
   expect(callsOf(w, 'update')[1]).toEqual({ command: 'update', args: [...SOURCES, '--max-seconds', '120'] })
   expect(w.toasts).toEqual([])
-  expect(w.logs).toContain('recall: another update holds the index')
+  expect(w.logs).toEqual([BUSY_LINE])
 })
 
 test(
@@ -206,4 +212,94 @@ test('with /usr/bin/nice present the updates run under nice -n 19; the stats che
   expect(w.spawnArgvs[0]?.slice(0, 4)).toEqual([...NICE, PYTHON])
   await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION, resume: { id: SESSION } })
   expect(w.shells[0]?.slice(0, 8)).toEqual(['/bin/sh', '-c', 'nohup "$@" >/dev/null 2>&1 &', 'recall-update', ...NICE, PYTHON])
+})
+
+test('the start update waits a random part of startJitterSeconds (45 s by default); the band does not wait', SLOW, async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  // This project's last session was looked for at once; the index was not touched yet.
+  expect(w.calls.map(call => call.command)).toEqual(['recap'])
+  // The wait is under the window: 45 s less a millisecond covers every draw.
+  await w.clock.advance(START_JITTER_MS - 1)
+  expect(callsOf(w, 'stats')).toHaveLength(1)
+  expect(callsOf(w, 'update')).toEqual([{ command: 'update', args: [...SOURCES, '--max-seconds', '45'] }])
+  expect(w.statuses).toEqual([])
+  expect(w.toasts).toEqual([])
+  expect(w.logs).toEqual([])
+})
+
+test('startJitterSeconds 10: the wait is under 10 s', { ...SLOW, options: { startJitterSeconds: 10 } }, async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  expect(callsOf(w, 'update')).toEqual([])
+  await w.clock.advance(9_999)
+  expect(callsOf(w, 'update')).toHaveLength(1)
+})
+
+test('startJitterSeconds 0: the start update runs at once', AT_ONCE, async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  expect(callsOf(w, 'update')).toHaveLength(1)
+})
+
+test('a sidecar another process writes during the wait cancels the start update; the tick re-checks on its own', SLOW, async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  expect(callsOf(w, 'update')).toEqual([])
+  // Another session finished its update while this one waited: read when the wait is over, not when it began.
+  sidecar(w, NOW)
+  await w.clock.advance(START_JITTER_MS)
+  expect(w.calls.map(call => call.command)).toEqual(['recap'])
+  expect(w.logs).toEqual([
+    'recall: another process updated the index just now (pid 4242): this session skips its own updates while it is under 10 min old',
+  ])
+  // By the first tick that update is 10 min old: this session's own runs.
+  await w.clock.advance(10 * 60_000)
+  expect(callsOf(w, 'update')).toHaveLength(1)
+  expect(w.logs).toHaveLength(1)
+})
+
+test('an update another process holds the lock for is said once per session; no retry, the next try is the next tick', SLOW, async ($, on) => {
+  const w = world(on)
+  w.engine.update = () => ({ json: { updated: null, busy: true } })
+  await start($, w)
+  expect(callsOf(w, 'update')).toHaveLength(1)
+  expect(w.logs).toEqual([BUSY_LINE])
+  await w.clock.advance(10 * 60_000)
+  expect(callsOf(w, 'update')).toHaveLength(2)
+  await w.clock.advance(10 * 60_000)
+  expect(callsOf(w, 'update')).toHaveLength(3)
+  expect(w.logs).toEqual([BUSY_LINE])
+  expect(w.toasts).toEqual([])
+  // The band's look-up, the stats check, then one try per tick: nothing in between.
+  expect(w.calls.map(call => call.command)).toEqual(['recap', 'stats', 'update', 'update', 'update'])
+})
+
+test('a first build that finds the lock held says so once in the debug log; /recall reindex tells the person each time', SLOW, async ($, on) => {
+  const w = world(on)
+  w.engine.stats = () => ({ json: { ...STATS, docs: 0 } })
+  w.stream.steps = [{ afterMs: 0, chunk: { stream: 'stdout', text: '{"updated":null,"busy":true}\n' } }]
+  await start($, w)
+  expect(w.spawned).toHaveLength(1)
+  expect(w.logs).toEqual([BUSY_LINE])
+  expect(w.toasts).toEqual([])
+  expect(w.statuses.at(-1)).toBeUndefined()
+  w.engine.update = () => ({ json: { updated: null, busy: true } })
+  await w.clock.advance(10 * 60_000)
+  expect(callsOf(w, 'update')).toHaveLength(1)
+  expect(w.logs).toEqual([BUSY_LINE])
+
+  // The explicit rebuild runs at once, and the lock is news to the person, every time.
+  await recall($, 'reindex')
+  await w.clock.settle()
+  expect(w.spawned).toHaveLength(2)
+  expect(w.toasts).toEqual(['recall: another update holds the index; run /recall reindex again once it is done'])
+  await recall($, 'reindex')
+  await w.clock.settle()
+  expect(w.toasts).toHaveLength(2)
+  expect(w.logs).toEqual([BUSY_LINE])
 })

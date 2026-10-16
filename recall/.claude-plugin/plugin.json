@@ -49,6 +49,12 @@
       "description": "When another session finished an update less than this many minutes ago, this session skips its own automatic update (at the start, on the timer and at the end); /recall reindex always runs. 0 never skips.",
       "default": 10
     },
+    "startJitterSeconds": {
+      "type": "number",
+      "title": "Spread the start update over (seconds)",
+      "description": "The automatic update at a session's start waits a random part of this many seconds, so sessions that start together (after a reboot, say) do not all run it at once; the last-session band does not wait. 0 runs it at once.",
+      "default": 45
+    },
     "relatedBand": {
       "type": "boolean",
       "title": "Related-work band",

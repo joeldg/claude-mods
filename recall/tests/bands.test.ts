@@ -61,13 +61,13 @@ function answerMentions(w: World): void {
 const mountBand = ($: Parameters<typeof band>[0], surface: (typeof SURFACES)[number]) =>
   $.ui.mount({ plugin: 'recall', surface, component: 'AbovePrompt', props: BAND })
 
-test('the last-session band: drawn once the index is checked, on both surfaces; Recap and Dismiss', SLOW, async ($, on) => {
+test('the last-session band: drawn at once, not waiting for the start update, on both surfaces; Recap and Dismiss', SLOW, async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
   expect((await band($)).text).toBe('')
   await w.clock.settle()
-  // Looked for after the index's update, this session left out.
-  expect(w.calls.map(call => call.command)).toEqual(['stats', 'update', 'recap'])
+  // Looked for at once, this session left out; the index's update follows its random wait.
+  expect(w.calls.map(call => call.command)).toEqual(['recap'])
   expect(callsOf(w, 'recap')[0]?.args).toEqual(['--project', ROOT, '--exclude-session', SESSION, '--count', '1', '--routines', 'exclude'])
   for (const surface of SURFACES) {
     expect(await band($, surface)).toEqual({ text: LAST, buttons: ['recap', 'dismiss-last'] })

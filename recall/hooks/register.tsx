@@ -27,6 +27,7 @@ import {
   searchArgs,
   searchInput,
   sidecarPath,
+  startDelayMs,
   timelineArgs,
   updateArgs,
 } from './args'
@@ -151,6 +152,8 @@ let hasOwnStatus = false
 let hasNice: boolean | null = null
 /** True once this process said why it skipped an update. */
 let hasSaidFresh = false
+/** True once this process said that another update holds the index. */
+let hasSaidBusy = false
 /** What this session has settled so far, fed by every row appended to its conversation. */
 let ledger: Ledger = emptyLedger()
 let pending: Pending = emptyPending()
@@ -259,7 +262,7 @@ async function currentSession($: Engine): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Indexing: at the start (with progress the first time), every few minutes, and as the session ends.
+// Indexing: at the start (after a random wait; with progress the first time), every few minutes, and as the session ends.
 
 /** The update another process completed under freshMinutes ago, from the sidecar the engine leaves beside the index. */
 async function freshUpdate($: Engine): Promise<{ ts: number; by: number } | null> {
@@ -290,6 +293,21 @@ async function skipsUpdate($: Engine): Promise<boolean> {
     )
   }
   return true
+}
+
+/**
+ * Another update holds the index. The person's own /recall reindex is told; an automatic update stands down until the
+ * next tick and says so once per process, in the debug log.
+ */
+function indexHeld($: Engine, isExplicit: boolean): void {
+  if (isExplicit) {
+    $.ui.toast('recall: another update holds the index; run /recall reindex again once it is done', { timeoutMs: 8_000 })
+    return
+  }
+  if (!hasSaidBusy) {
+    hasSaidBusy = true
+    $.ui.log('recall: another update holds the index: this session stands down until its next tick (said once per session)', { to: 'debug' })
+  }
 }
 
 /** A full index build or rebuild through `process.spawn`, its progress on the status line. */
@@ -336,7 +354,8 @@ async function buildIndex($: Engine, rebuild: boolean): Promise<void> {
     }
     const outcome = asUpdate(json)
     if (outcome.kind === 'busy') {
-      $.ui.log('recall: another update holds the index, so this one stood down', { to: 'debug' })
+      // A rebuild is the person's own /recall reindex; the first build is automatic.
+      indexHeld($, rebuild)
       return
     }
     const partial = outcome.partial ? '; the rest follows in the background' : ''
@@ -363,7 +382,7 @@ async function quietUpdate($: Engine, seconds: number): Promise<void> {
       return
     }
     if (asUpdate(reply.json).kind === 'busy') {
-      $.ui.log('recall: another update holds the index', { to: 'debug' })
+      indexHeld($, false)
     }
   } finally {
     isUpdating = false
@@ -385,9 +404,9 @@ function ensureTimer($: Engine): void {
   }
 }
 
-/** The first index check: a build with progress when the index is empty, else a quiet update. */
+/** The first index check, after the start's random wait: a build with progress when the index is empty, else a quiet update. */
 async function indexAtStart($: Engine): Promise<void> {
-  // Another session's recent update serves this one too.
+  // Another session's recent update serves this one too: read now that the wait is over, not when it was scheduled.
   if (await skipsUpdate($)) {
     return
   }
@@ -429,9 +448,9 @@ async function prepareLastBand($: Engine): Promise<void> {
   }))
 }
 
+/** What a session's start does at once: the ledger comes back, and this project's last session is looked for. */
 async function startup($: Engine): Promise<void> {
   await loadLedger($)
-  await indexAtStart($)
   await prepareLastBand($)
 }
 
@@ -1415,6 +1434,7 @@ export const register: Register = (on, options) => {
   hasOwnStatus = false
   hasNice = null
   hasSaidFresh = false
+  hasSaidBusy = false
   ledger = emptyLedger()
   pending = emptyPending()
   ledgerTimer = null
@@ -1442,8 +1462,11 @@ export const register: Register = (on, options) => {
       })
       .catch((error: unknown) => $.ui.log(`recall: /remember did not register: ${messageOf(error)}`, { to: 'debug' }))
     ensureTimer($)
-    // Indexing never holds the session's start up: a timer carries it.
+    // Nothing here holds the session's start up: timers carry it. The ledger and the band come at once; the update waits
+    // a random part of startJitterSeconds, so sessions that start together (after a reboot, say) do not all run it at
+    // once, and reads another process's fresh update when it runs, not now.
     $.clock.after(0, () => settle($, startup($)))
+    $.clock.after(startDelayMs(config.startJitterMs, Math.random()), () => settle($, indexAtStart($)))
     return next(e)
   })
 

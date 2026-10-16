@@ -26,6 +26,7 @@ import {
   searchArgs,
   searchInput,
   sidecarPath,
+  startDelayMs,
   timelineArgs,
   updateArgs,
   freeText,
@@ -41,6 +42,7 @@ describe('configFrom', () => {
       includeRoutines: false,
       updateMs: 600_000,
       freshMs: 600_000,
+      startJitterMs: 45_000,
       relatedBand: true,
       lastSessionBand: true,
       maxResults: 8,
@@ -352,6 +354,31 @@ describe('throttled updates and the ledger', () => {
     expect(configFrom({ freshMinutes: -5 }).freshMs).toBe(0)
     expect(configFrom({ freshMinutes: 10_000 }).freshMs).toBe(24 * 60 * 60_000)
     expect(configFrom({ freshMinutes: 'soon' }).freshMs).toBe(600_000)
+  })
+
+  test('startJitterSeconds: 45 by default, 0 runs the start update at once, bounded by an hour', () => {
+    expect(configFrom({}).startJitterMs).toBe(45_000)
+    expect(configFrom({ startJitterSeconds: 10 }).startJitterMs).toBe(10_000)
+    expect(configFrom({ startJitterSeconds: '10' }).startJitterMs).toBe(10_000)
+    expect(configFrom({ startJitterSeconds: 0 }).startJitterMs).toBe(0)
+    expect(configFrom({ startJitterSeconds: -5 }).startJitterMs).toBe(0)
+    expect(configFrom({ startJitterSeconds: 10_000 }).startJitterMs).toBe(60 * 60_000)
+    expect(configFrom({ startJitterSeconds: 'soon' }).startJitterMs).toBe(45_000)
+  })
+
+  test("the start update's wait: two sessions drawing different fractions of the window start apart", () => {
+    expect(startDelayMs(45_000, 0.2)).toBe(9_000)
+    expect(startDelayMs(45_000, 0.8)).toBe(36_000)
+  })
+
+  test("the start update's wait stays inside the window, and is 0 when the window is", () => {
+    expect(startDelayMs(45_000, 0)).toBe(0)
+    expect(startDelayMs(45_000, 0.999999)).toBe(44_999)
+    // A draw at or past 1 (Math.random never gives one) is held under the window; an odd one waits nothing.
+    expect(startDelayMs(45_000, 1)).toBe(44_999)
+    expect(startDelayMs(45_000, -1)).toBe(0)
+    expect(startDelayMs(45_000, NaN)).toBe(0)
+    expect(startDelayMs(0, 0.5)).toBe(0)
   })
 
   test('an update under nice -n 19 when asked', () => {
