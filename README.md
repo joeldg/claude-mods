@@ -283,7 +283,7 @@ The quit request goes out when Claude issues the command, before any permission 
 
 Raises the alarm when a session you walked away from has stalled: a dialog waiting on you, or a turn that died on a login or usage-limit error.
 
-- When a permission prompt or an `AskUserQuestion` has waited for you for 5 minutes (`stallMinutes`), you get a toast and a Mac notification, `Claude has been waiting 5m for your OK: Bash git push origin main`, titled with the project folder so you know which session. While it stays open, it alarms again every 30 minutes (`repeatMinutes`; 0 = once).
+- When a permission prompt or an `AskUserQuestion` has waited for you for 5 minutes (`stallMinutes`), you get a toast and a Mac notification, `Claude has been waiting 5m for your OK: Bash git push origin main`, titled with the project folder so you know which session. While a permission dialog stays open it alarms again every 30 minutes (`repeatMinutes`; 0 = once): it is blocking a goal. A question is quieter, since nothing runs while it waits: it alarms again every 2 hours at most (`questionRepeatMinutes`) and only 3 more times (`questionRepeats`; 0 = once), then stays open quietly, still on the status line.
 - When a turn ends on an error that needs you (OAuth / `/login`, not logged in, usage or rate limit, credit balance, billing, overloaded) you get `Claude stopped: <the error> · run /login` at once. Other errors alarm only with `alarmOnAnyError`.
 - Status line while a wait is past the threshold: `waiting on you 7m`; cleared when the call runs, is refused, or the turn ends.
 - Leaves scheduled routines to routine-watch (`skipRoutines`), so one stall never alarms twice.
@@ -291,7 +291,7 @@ Raises the alarm when a session you walked away from has stalled: a dialog waiti
 - `/stalls` shows the open waits with their ages, the last alarms and the settings; `/stalls off` and `/stalls on` toggle it for the session.
 - Makes no model calls, and runs no process but the notifications.
 
-Settings: `stallMinutes` (5), `repeatMinutes` (30), `notifyMac` (on), `notifyCommand` (empty), `alarmOnAnyError` (off), `skipRoutines` (on).
+Settings: `stallMinutes` (5), `repeatMinutes` (30, permission dialogs), `questionRepeatMinutes` (120), `questionRepeats` (3; 0 = alarm once), `notifyMac` (on), `notifyCommand` (empty), `alarmOnAnyError` (off), `skipRoutines` (on).
 
 ## Loading
 

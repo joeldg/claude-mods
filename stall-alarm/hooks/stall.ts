@@ -121,15 +121,37 @@ const forWhat = (wait: StallWait): string => (wait.kind === 'ok' ? 'your OK' : '
 export const waitMessage = (wait: StallWait, now: number): string =>
   `Claude has been waiting ${formatDuration(now - wait.since)} for ${forWhat(wait)}: ${wait.label}`
 
+/** How a wait alarms again: the period between repeats (0: never), and how many repeats at most (null: no limit). */
+export type Repeat = { everyMs: number; atMost: number | null }
+
+/** When waits alarm: the threshold, then how each kind repeats. */
+export type AlarmPolicy = { stallMs: number; ok: Repeat; question: Repeat }
+
 /**
- * The waits due an alarm at `now`, oldest first: past the threshold and never
- * alarmed, or alarmed a whole repeat period ago (never again when `repeatMs` is 0).
+ * The policy the settings describe. A permission dialog blocks a goal, so it
+ * repeats for as long as it stays open; a question blocks nothing running, so
+ * it repeats less often and a few times only.
  */
-export const dueAlarms = (waiting: Record<string, StallWait>, now: number, stallMs: number, repeatMs: number): string[] =>
+export const alarmPolicy = (settings: StallSettings): AlarmPolicy => ({
+  stallMs: Math.round(settings.stallMinutes * 60_000),
+  ok: { everyMs: Math.round(settings.repeatMinutes * 60_000), atMost: null },
+  question: { everyMs: Math.round(settings.questionRepeatMinutes * 60_000), atMost: settings.questionRepeats },
+})
+
+/** Whether a wait is due an alarm at `now`: its first past the threshold, then one per period while repeats remain. */
+export const isDue = (wait: StallWait, now: number, policy: AlarmPolicy): boolean => {
+  if (wait.alarmedAt === null) {
+    return now - wait.since >= policy.stallMs
+  }
+  const repeat = policy[wait.kind]
+  const hasRepeatsLeft = repeat.atMost === null || wait.alarms - 1 < repeat.atMost
+  return repeat.everyMs > 0 && hasRepeatsLeft && now - wait.alarmedAt >= repeat.everyMs
+}
+
+/** The waits due an alarm at `now`, oldest first. */
+export const dueAlarms = (waiting: Record<string, StallWait>, now: number, policy: AlarmPolicy): string[] =>
   Object.entries(waiting)
-    .filter(([, wait]) =>
-      wait.alarmedAt === null ? now - wait.since >= stallMs : repeatMs > 0 && now - wait.alarmedAt >= repeatMs,
-    )
+    .filter(([, wait]) => isDue(wait, now, policy))
     .sort(([, a], [, b]) => a.since - b.since)
     .map(([id]) => id)
 
@@ -189,11 +211,18 @@ export const errorMessage = (text: string, kind: string | null): string => {
 
 const times = (count: number): string => (count === 1 ? '1 time' : `${count} times`)
 
+/** `OKs repeat every 30m`, `questions repeat every 2h00m, up to 3 times`, or `questions never repeat`. */
+const describeRepeat = (what: string, everyMinutes: number, atMost: number | null): string =>
+  everyMinutes > 0 && (atMost === null || atMost > 0)
+    ? `${what} repeat every ${formatDuration(everyMinutes * 60_000)}${atMost === null ? '' : `, up to ${times(atMost)}`}`
+    : `${what} never repeat`
+
 /** The settings as one line, the push command's text left out (it may carry a private topic). */
 export const describeSettings = (settings: StallSettings): string =>
   [
     `stall after ${formatDuration(settings.stallMinutes * 60_000)}`,
-    settings.repeatMinutes > 0 ? `repeat every ${formatDuration(settings.repeatMinutes * 60_000)}` : 'no repeat',
+    describeRepeat('OKs', settings.repeatMinutes, null),
+    describeRepeat('questions', settings.questionRepeatMinutes, settings.questionRepeats),
     `Mac notifications ${settings.notifyMac ? 'on' : 'off'}`,
     `phone push ${settings.notifyCommand.trim() ? 'on' : 'off'}`,
     `any error ${settings.alarmOnAnyError ? 'on' : 'off'}`,

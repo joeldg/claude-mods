@@ -2,6 +2,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { StallSession, StallSettings, StallWait } from '../types'
 import {
+  alarmPolicy,
   alarmTitle,
   classifyError,
   commandArgv,
@@ -24,6 +25,8 @@ const FRESH: StallSession = { isDecided: false, isRoutine: false, isOff: false, 
 const DEFAULTS: StallSettings = {
   stallMinutes: 5,
   repeatMinutes: 30,
+  questionRepeatMinutes: 120,
+  questionRepeats: 3,
   notifyMac: true,
   notifyCommand: '',
   alarmOnAnyError: false,
@@ -57,11 +60,14 @@ let shownStatus: string | undefined = undefined
 let failed: { isAlarmed: boolean } | null = null
 
 const stallMs = (): number => Math.round(config.stallMinutes * 60_000)
-const repeatMs = (): number => Math.round(config.repeatMinutes * 60_000)
 
 /** A minutes option: a finite number of at least `least`, else the default. */
 const minutesOption = (value: unknown, fallback: number, least: number): number =>
   typeof value === 'number' && Number.isFinite(value) && value >= least ? value : fallback
+
+/** A count option: a finite whole number of at least 0, else the default. */
+const countOption = (value: unknown, fallback: number): number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback
 
 /** Whether this session is left alone: a scheduled routine, which routine-watch watches. */
 const isQuiet = (session: StallSession): boolean => config.skipRoutines && session.isRoutine
@@ -102,9 +108,9 @@ async function save($: Engine, value: StallSession) {
   }
 }
 
-async function showStatus($: Engine) {
+async function showStatus($: Engine, now?: number) {
   const session = await load($)
-  const line = session.isOff || isQuiet(session) ? undefined : statusLine(session.waiting, await $.clock.now(), stallMs())
+  const line = session.isOff || isQuiet(session) ? undefined : statusLine(session.waiting, now ?? (await $.clock.now()), stallMs())
   if (line !== shownStatus) {
     shownStatus = line
     $.ui.status(line)
@@ -158,13 +164,17 @@ async function alarm($: Engine, head: string, message: string) {
   void sendOut($, alarmTitle(head, memory.folder), message)
 }
 
-/** Alarms for each open wait that is due one at `now`: first at the threshold, then once per repeat period. */
+/**
+ * Alarms for each open wait that is due one at `now`: first at the threshold,
+ * then once per repeat period, a dialog's for as long as it stays open and a
+ * question's a few times (`questionRepeats`) only.
+ */
 async function alarmStalls($: Engine, now: number) {
   const session = await load($)
   if (session.isOff) {
     return
   }
-  for (const id of dueAlarms(session.waiting, now, stallMs(), repeatMs())) {
+  for (const id of dueAlarms(session.waiting, now, alarmPolicy(config))) {
     const wait = memory.waiting[id]
     if (!wait) {
       continue
@@ -176,8 +186,9 @@ async function alarmStalls($: Engine, now: number) {
 }
 
 async function tick($: Engine) {
-  await alarmStalls($, await $.clock.now())
-  await showStatus($)
+  const now = await $.clock.now()
+  await alarmStalls($, now)
+  await showStatus($, now)
   if (Object.keys(memory.waiting).length === 0) {
     stopTicker()
   }
@@ -237,6 +248,8 @@ export const register: Register = (on, options) => {
   config = {
     stallMinutes: minutesOption(options.stallMinutes, DEFAULTS.stallMinutes, 0.25),
     repeatMinutes: minutesOption(options.repeatMinutes, DEFAULTS.repeatMinutes, 0),
+    questionRepeatMinutes: minutesOption(options.questionRepeatMinutes, DEFAULTS.questionRepeatMinutes, 0),
+    questionRepeats: countOption(options.questionRepeats, DEFAULTS.questionRepeats),
     notifyMac: options.notifyMac !== false,
     notifyCommand: typeof options.notifyCommand === 'string' ? options.notifyCommand : '',
     alarmOnAnyError: options.alarmOnAnyError === true,

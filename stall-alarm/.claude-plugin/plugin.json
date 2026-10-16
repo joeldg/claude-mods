@@ -1,6 +1,6 @@
 {
   "name": "stall-alarm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Raises the alarm when a long-running session stalls while you are away: a permission dialog or a question that has waited for you past a threshold (toast, Mac notification, optional phone push, repeated while it stays open), and a turn that stopped on a login, usage-limit or billing error, with the fix. Leaves scheduled routines to routine-watch. No model calls.",
   "author": {
     "name": "joeldg"
@@ -15,9 +15,21 @@
     },
     "repeatMinutes": {
       "type": "number",
-      "title": "Minutes between repeat alarms",
-      "description": "While the same dialog or question stays open, alarm again this often. 0: alarm once per wait.",
+      "title": "Minutes between repeat alarms for a permission dialog",
+      "description": "While the same permission dialog stays open, alarm again this often: it blocks a goal. 0: alarm once per dialog.",
       "default": 30
+    },
+    "questionRepeatMinutes": {
+      "type": "number",
+      "title": "Minutes between repeat alarms for a question",
+      "description": "While the same AskUserQuestion stays open, alarm again this often: less often than a dialog, since nothing runs while a question waits. 0: alarm once per question.",
+      "default": 120
+    },
+    "questionRepeats": {
+      "type": "number",
+      "title": "Repeat alarms per question",
+      "description": "How many times at most a question alarms again after its first alarm; then it stays open quietly, still on the status line. 0: alarm once, never repeat.",
+      "default": 3
     },
     "notifyMac": {
       "type": "boolean",

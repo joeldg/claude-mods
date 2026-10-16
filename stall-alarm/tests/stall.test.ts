@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  alarmPolicy,
   alarmTitle,
   appleScriptString,
   classifyError,
@@ -12,6 +13,7 @@ import {
   firstQuestion,
   folderName,
   formatDuration,
+  isDue,
   isRoutinePrompt,
   osascriptArgv,
   statusLine,
@@ -21,16 +23,18 @@ import type { StallSession, StallSettings, StallWait } from '../types'
 
 const MINUTE = 60_000
 const STALL_MS = 5 * MINUTE
-const REPEAT_MS = 30 * MINUTE
 
 const SETTINGS: StallSettings = {
   stallMinutes: 5,
   repeatMinutes: 30,
+  questionRepeatMinutes: 120,
+  questionRepeats: 3,
   notifyMac: true,
   notifyCommand: '',
   alarmOnAnyError: false,
   skipRoutines: true,
 }
+const POLICY = alarmPolicy(SETTINGS)
 
 const wait = (changes: Partial<StallWait> = {}): StallWait => ({
   since: 0,
@@ -135,16 +139,69 @@ test('waitMessage says how long, and for what: an OK or an answer', () => {
   )
 })
 
+test('alarmPolicy turns the settings into milliseconds: dialogs repeat without limit, questions a few times', () => {
+  expect(POLICY).toEqual({
+    stallMs: 5 * MINUTE,
+    ok: { everyMs: 30 * MINUTE, atMost: null },
+    question: { everyMs: 120 * MINUTE, atMost: 3 },
+  })
+})
+
 test('dueAlarms: the first alarm at the threshold, then one per repeat period, none for 0', () => {
   const waiting = { a: wait({ since: 0 }), b: wait({ since: 2 * MINUTE }) }
-  expect(dueAlarms(waiting, 2 * MINUTE, STALL_MS, REPEAT_MS)).toEqual([])
-  expect(dueAlarms(waiting, 5 * MINUTE, STALL_MS, REPEAT_MS)).toEqual(['a'])
-  expect(dueAlarms(waiting, 7 * MINUTE, STALL_MS, REPEAT_MS)).toEqual(['a', 'b'])
+  expect(dueAlarms(waiting, 2 * MINUTE, POLICY)).toEqual([])
+  expect(dueAlarms(waiting, 5 * MINUTE, POLICY)).toEqual(['a'])
+  expect(dueAlarms(waiting, 7 * MINUTE, POLICY)).toEqual(['a', 'b'])
 
   const alarmed = { a: wait({ since: 0, alarmedAt: 5 * MINUTE, alarms: 1 }) }
-  expect(dueAlarms(alarmed, 10 * MINUTE, STALL_MS, REPEAT_MS)).toEqual([])
-  expect(dueAlarms(alarmed, 35 * MINUTE, STALL_MS, REPEAT_MS)).toEqual(['a'])
-  expect(dueAlarms(alarmed, 35 * MINUTE, STALL_MS, 0)).toEqual([])
+  expect(dueAlarms(alarmed, 10 * MINUTE, POLICY)).toEqual([])
+  expect(dueAlarms(alarmed, 35 * MINUTE, POLICY)).toEqual(['a'])
+  expect(dueAlarms(alarmed, 35 * MINUTE, alarmPolicy({ ...SETTINGS, repeatMinutes: 0 }))).toEqual([])
+  // A dialog repeats for as long as it stays open.
+  expect(dueAlarms({ a: wait({ since: 0, alarmedAt: 455 * MINUTE, alarms: 16 }) }, 485 * MINUTE, POLICY)).toEqual(['a'])
+})
+
+test('dueAlarms: a question repeats at its own, longer period, a few times, then no more', () => {
+  const question = (changes: Partial<StallWait>) => wait({ kind: 'question', label: 'Which sources?', ...changes })
+  expect(dueAlarms({ q: question({ since: 0 }) }, 5 * MINUTE, POLICY)).toEqual(['q'])
+
+  const once = { q: question({ since: 0, alarmedAt: 5 * MINUTE, alarms: 1 }) }
+  expect(dueAlarms(once, 35 * MINUTE, POLICY)).toEqual([])
+  expect(dueAlarms(once, 124 * MINUTE, POLICY)).toEqual([])
+  expect(dueAlarms(once, 125 * MINUTE, POLICY)).toEqual(['q'])
+  const thrice = { q: question({ since: 0, alarmedAt: 245 * MINUTE, alarms: 3 }) }
+  expect(dueAlarms(thrice, 365 * MINUTE, POLICY)).toEqual(['q'])
+  const spent = { q: question({ since: 0, alarmedAt: 365 * MINUTE, alarms: 4 }) }
+  expect(dueAlarms(spent, 485 * MINUTE, POLICY)).toEqual([])
+  expect(dueAlarms(spent, 48 * 60 * MINUTE, POLICY)).toEqual([])
+
+  // No repeats, or a period of 0: the first alarm is the only one.
+  expect(dueAlarms(once, 125 * MINUTE, alarmPolicy({ ...SETTINGS, questionRepeats: 0 }))).toEqual([])
+  expect(dueAlarms(once, 125 * MINUTE, alarmPolicy({ ...SETTINGS, questionRepeatMinutes: 0 }))).toEqual([])
+})
+
+test('a question open for ten hours, held against the default policy every 15 s, alarms at 5m, 2h05m, 4h05m and 6h05m only', () => {
+  const alarmedAt: string[] = []
+  let open = wait({ kind: 'question', label: 'Which wrestling takedowns should get the most drilling time?' })
+  for (let now = 0; now <= 10 * 60 * MINUTE; now += 15_000) {
+    if (isDue(open, now, POLICY)) {
+      alarmedAt.push(formatDuration(now))
+      open = { ...open, alarmedAt: now, alarms: open.alarms + 1 }
+    }
+  }
+  expect(alarmedAt).toEqual(['5m', '2h05m', '4h05m', '6h05m'])
+  // A permission dialog held the same way alarms every 30 minutes for as long as it is open: 5m, 35m, 1h05m … 9h35m.
+  const dialogs: string[] = []
+  let dialog = wait()
+  for (let now = 0; now <= 10 * 60 * MINUTE; now += 15_000) {
+    if (isDue(dialog, now, POLICY)) {
+      dialogs.push(formatDuration(now))
+      dialog = { ...dialog, alarmedAt: now, alarms: dialog.alarms + 1 }
+    }
+  }
+  expect(dialogs).toHaveLength(20)
+  expect(dialogs.slice(0, 3)).toEqual(['5m', '35m', '1h05m'])
+  expect(dialogs.at(-1)).toBe('9h35m')
 })
 
 test('statusLine shows the oldest wait once it is past the threshold', () => {
@@ -183,7 +240,7 @@ test('describeStalls shows the open waits with their ages, the last alarms and t
     [
       'No open waits.',
       'No alarms yet.',
-      'Settings: stall after 5m · repeat every 30m · Mac notifications on · phone push off · any error off · routines skipped',
+      'Settings: stall after 5m · OKs repeat every 30m · questions repeat every 2h00m, up to 3 times · Mac notifications on · phone push off · any error off · routines skipped',
     ].join('\n'),
   )
   const busy = session({
@@ -193,7 +250,15 @@ test('describeStalls shows the open waits with their ages, the last alarms and t
     },
     alarms: [{ at: 5 * MINUTE, message: 'Claude has been waiting 5m for your OK: Bash git push origin main' }],
   })
-  const settings = { ...SETTINGS, repeatMinutes: 0, notifyMac: false, notifyCommand: 'curl -d {message} ntfy.sh/secret-topic', alarmOnAnyError: true, skipRoutines: false }
+  const settings = {
+    ...SETTINGS,
+    repeatMinutes: 0,
+    questionRepeats: 0,
+    notifyMac: false,
+    notifyCommand: 'curl -d {message} ntfy.sh/secret-topic',
+    alarmOnAnyError: true,
+    skipRoutines: false,
+  }
   expect(describeStalls(busy, settings, 7 * MINUTE)).toBe(
     [
       'Open waits:',
@@ -201,7 +266,7 @@ test('describeStalls shows the open waits with their ages, the last alarms and t
       '- 1m for your answer: Which sources?',
       'Last alarms:',
       '- 2m ago · Claude has been waiting 5m for your OK: Bash git push origin main',
-      'Settings: stall after 5m · no repeat · Mac notifications off · phone push on · any error on · routines watched too',
+      'Settings: stall after 5m · OKs never repeat · questions never repeat · Mac notifications off · phone push on · any error on · routines watched too',
     ].join('\n'),
   )
   expect(describeStalls(busy, settings, 7 * MINUTE)).not.toContain('secret-topic')

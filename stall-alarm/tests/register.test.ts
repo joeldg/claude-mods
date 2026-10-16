@@ -1,11 +1,14 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { Engine } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 const MINUTE = 60_000
+const HOUR = 60 * MINUTE
 const CWD = '/home/dev/example-app'
 const WAITING = 'Claude is waiting · example-app'
 const STOPPED = 'Claude stopped · example-app'
+const SETTINGS_LINE =
+  'Settings: stall after 5m · OKs repeat every 30m · questions repeat every 2h00m, up to 3 times · Mac notifications on · phone push off · any error off · routines skipped'
 const PUSH = { command: 'git push origin main' }
 const OAUTH = 'OAuth refresh token is no longer valid; run /login to re-authenticate'
 const ROUTINE =
@@ -83,6 +86,22 @@ const begin = async ($: Engine, text = 'keep going until the tests pass', kind: 
 const ask = ($: Engine, tool_use_id: string, input: Record<string, unknown> = PUSH, tool = 'Bash') =>
   $.tool.check({ tool, input, tool_use_id })
 
+/**
+ * An AskUserQuestion the person answers `openForMs` of clock time after it is
+ * asked. The hook holds the clock meanwhile, which the kit allows for ten
+ * seconds of real time: a few hours at most, since the clock passes the 15 s
+ * ticks at about a second an hour while a hook is pending. The eight-hour
+ * sequence is held against the policy itself in stall.test.ts.
+ */
+const questionPending = (on: On, clock: MockClock, openForMs: number): void => {
+  on('tool.call', { tool: 'AskUserQuestion' }, async () => {
+    await clock.sleep(openForMs)
+    return { result: { questions: QUESTIONS, answers: {} }, text: 'The user answered: Wire services' }
+  })
+}
+
+const questionMessage = (age: string): string => `Claude has been waiting ${age} for your answer: Which sources should the digest use?`
+
 const endTurn = ($: Engine, reason: 'answer' | 'error' | 'aborted', answer = '', agentId?: string) =>
   $.turn.complete({ answer, durationMs: 10, isAborted: reason === 'aborted', turnId: 't1', reason, agentId })
 
@@ -118,7 +137,7 @@ test('a dialog answered within the threshold raises no alarm, toast or status', 
     [
       'No open waits.',
       'No alarms yet.',
-      'Settings: stall after 5m · repeat every 30m · Mac notifications on · phone push off · any error off · routines skipped',
+      SETTINGS_LINE,
     ].join('\n'),
   )
 })
@@ -155,7 +174,7 @@ test('a dialog open past the threshold alarms once, shows the wait, then repeats
       'Last alarms:',
       `- 0s ago · ${again}`,
       `- 30m ago · ${first}`,
-      'Settings: stall after 5m · repeat every 30m · Mac notifications on · phone push off · any error off · routines skipped',
+      SETTINGS_LINE,
     ].join('\n'),
   )
 
@@ -199,6 +218,115 @@ test('a question left unanswered alarms; its answer closes the wait', { timeoutM
   expect(w.statuses.at(-1)).toBeUndefined()
   await clock.advance(60 * MINUTE)
   expect(w.toasts).toHaveLength(1)
+})
+
+test('a question alarms again two hours on, not thirty minutes on; /stalls says how often and how many times', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  questionPending(on, clock, 2 * HOUR + 6 * MINUTE)
+  await begin($)
+  const asking = $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
+  await clock.settle()
+
+  await clock.advance(5 * MINUTE)
+  expect(w.toasts).toEqual([questionMessage('5m')])
+  // Where a permission dialog would alarm again, 30 minutes on, a question does not: two hours on it does.
+  await clock.advance(30 * MINUTE)
+  expect(w.toasts).toEqual([questionMessage('5m')])
+  expect(w.statuses.at(-1)).toBe('waiting on you 35m')
+  await clock.advance(HOUR + 29 * MINUTE)
+  expect(w.toasts).toEqual([questionMessage('5m')])
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual([questionMessage('5m'), questionMessage('2h05m')])
+  expect(w.argv).toHaveLength(2)
+  expect((await $.command.run(typed('stalls'))).text).toBe(
+    [
+      'Open waits:',
+      '- 2h05m for your answer: Which sources should the digest use? · alarmed 2 times',
+      'Last alarms:',
+      `- 0s ago · ${questionMessage('2h05m')}`,
+      `- 2h00m ago · ${questionMessage('5m')}`,
+      SETTINGS_LINE,
+    ].join('\n'),
+  )
+  // The answer closes the wait.
+  await clock.advance(MINUTE)
+  await asking
+  expect(w.statuses.at(-1)).toBeUndefined()
+})
+
+test('a permission dialog open for eight hours keeps alarming every 30 minutes', { timeoutMs: 60_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  await begin($)
+  await ask($, 'toolu_1')
+  await clock.advance(8 * HOUR)
+  // 5m, 35m, 1h05m … 7h35m: sixteen alarms, none held back.
+  expect(w.toasts).toHaveLength(16)
+  expect(w.toasts.slice(0, 3)).toEqual([
+    'Claude has been waiting 5m for your OK: Bash git push origin main',
+    'Claude has been waiting 35m for your OK: Bash git push origin main',
+    'Claude has been waiting 1h05m for your OK: Bash git push origin main',
+  ])
+  expect(w.toasts.at(-1)).toBe('Claude has been waiting 7h35m for your OK: Bash git push origin main')
+  expect(w.argv).toHaveLength(16)
+})
+
+test('questionRepeatMinutes and questionRepeats set how often a question alarms again and how many times; then it stays open quietly', { options: { questionRepeatMinutes: 20, questionRepeats: 3 }, timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  questionPending(on, clock, 2 * HOUR + MINUTE)
+  await begin($)
+  const asking = $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
+  await clock.settle()
+  await clock.advance(5 * MINUTE)
+  await clock.advance(20 * MINUTE)
+  await clock.advance(20 * MINUTE)
+  await clock.advance(20 * MINUTE)
+  expect(w.toasts).toEqual([questionMessage('5m'), questionMessage('25m'), questionMessage('45m'), questionMessage('1h05m')])
+
+  // Three repeats are the lot: the question stays open, on the status line, but alarms no more.
+  await clock.advance(55 * MINUTE)
+  expect(w.toasts).toHaveLength(4)
+  expect(w.argv).toHaveLength(4)
+  expect(w.statuses.at(-1)).toBe('waiting on you 2h00m')
+  expect((await $.command.run(typed('stalls'))).text).toBe(
+    [
+      'Open waits:',
+      '- 2h00m for your answer: Which sources should the digest use? · alarmed 4 times',
+      'Last alarms:',
+      `- 55m ago · ${questionMessage('1h05m')}`,
+      `- 1h15m ago · ${questionMessage('45m')}`,
+      `- 1h35m ago · ${questionMessage('25m')}`,
+      `- 1h55m ago · ${questionMessage('5m')}`,
+      'Settings: stall after 5m · OKs repeat every 30m · questions repeat every 20m, up to 3 times · Mac notifications on · phone push off · any error off · routines skipped',
+    ].join('\n'),
+  )
+  await clock.advance(MINUTE)
+  await asking
+  expect(w.statuses.at(-1)).toBeUndefined()
+})
+
+test('with questionRepeats 0 a question alarms once, while a dialog beside it still repeats', { options: { questionRepeats: 0 }, timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  questionPending(on, clock, HOUR + 6 * MINUTE)
+  await begin($)
+  const asking = $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
+  await clock.settle()
+  await ask($, 'toolu_1')
+  await clock.advance(5 * MINUTE)
+  expect(w.toasts).toEqual([questionMessage('5m'), 'Claude has been waiting 5m for your OK: Bash git push origin main'])
+  await clock.advance(HOUR)
+  expect(w.toasts.filter(text => text.includes('for your answer'))).toHaveLength(1)
+  expect(w.toasts.filter(text => text.includes('for your OK'))).toEqual([
+    'Claude has been waiting 5m for your OK: Bash git push origin main',
+    'Claude has been waiting 35m for your OK: Bash git push origin main',
+    'Claude has been waiting 1h05m for your OK: Bash git push origin main',
+  ])
+  expect((await $.command.run(typed('stalls'))).text).toContain('· OKs repeat every 30m · questions never repeat ·')
+  await clock.advance(MINUTE)
+  await asking
 })
 
 test('overlapping dialogs each alarm at their own threshold; the status shows the oldest', { timeoutMs: 30_000 }, async ($, on) => {
@@ -368,7 +496,7 @@ test('stallMinutes and repeatMinutes set the threshold and the period; 0 repeats
   // Past where the default period would have repeated (30m after the alarm).
   await clock.advance(40 * MINUTE)
   expect(w.toasts).toHaveLength(1)
-  expect((await $.command.run(typed('stalls'))).text).toContain('Settings: stall after 2m · no repeat ·')
+  expect((await $.command.run(typed('stalls'))).text).toContain('Settings: stall after 2m · OKs never repeat · questions repeat every 2h00m, up to 3 times ·')
 })
 
 test('the session end clears the status and the waits; the next conversation starts afresh', { timeoutMs: 30_000 }, async ($, on) => {
