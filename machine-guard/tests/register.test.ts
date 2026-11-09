@@ -156,6 +156,15 @@ const shared = (w: World) =>
 
 type Outcome = { deny?: string; isError?: boolean; text?: string }
 
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = Outcome & { result?: string; context?: string[] }
+const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
+
 /** Whether the call was refused, and why: a deny, or the errored result a deny becomes. */
 const refusal = (outcome: Outcome): string | undefined =>
   outcome.deny ?? (outcome.isError === true ? outcome.text : undefined)
@@ -232,12 +241,12 @@ test('refuses a heavy job while memory is critical and lets light commands throu
   const w = world(on, clock)
   w.level = 4
 
-  const refused = refusal(await $.tool.call({ tool: 'Bash', command: HEAVY }))
+  const refused = refusal(await callTool($, { tool: 'Bash', command: HEAVY }))
   expect(refused).toMatch(/memory pressure is critical .*biggest: python 31 GB, Claude 9 GB/)
   expect(refused).toMatch(/\/guard pause 15m/)
   expect(w.toasts).toContain('machine-guard blocked a heavy job: memory is critical')
 
-  await $.tool.call({ tool: 'Bash', command: LIGHT })
+  await callTool($, { tool: 'Bash', command: LIGHT })
   expect(w.ran).toEqual([LIGHT])
   expect(w.statuses.at(-1)).toBe('RAM CRITICAL 40% free · swap 7.8/8G · top python 31G · GPU 91%')
 })
@@ -247,7 +256,7 @@ test('warns the model when memory is tight but runs the job', SLOW, async ($, on
   const w = world(on, clock)
   w.level = 2
 
-  const ran = await $.tool.call({ tool: 'Bash', command: HEAVY })
+  const ran = await callTool($, { tool: 'Bash', command: HEAVY })
   expect(w.ran).toEqual([HEAVY])
   expect(ran.context?.join('\n')).toMatch(/memory is tight .*one at a time/)
 })
@@ -264,13 +273,13 @@ test('/busy blocks heavy jobs until /busy off, whatever the memory', SLOW, async
     setAt: 1_000_000,
   })
 
-  const refused = refusal(await $.tool.call({ tool: 'Bash', command: HEAVY }))
+  const refused = refusal(await callTool($, { tool: 'Bash', command: HEAVY }))
   expect(refused).toMatch(/reserved this Mac for "training a vision model" for 2h00m more/)
   expect(refused).toMatch(/\/busy off/)
   expect(w.ran).toEqual([])
 
   await $.command.run(typed('busy', 'off'))
-  await $.tool.call({ tool: 'Bash', command: HEAVY })
+  await callTool($, { tool: 'Bash', command: HEAVY })
   expect(w.ran).toEqual([HEAVY])
 })
 
@@ -279,9 +288,9 @@ test('a reservation written by another session is honoured, and runs out', SLOW,
   const w = world(on, clock)
   w.files.set(RESERVATION, JSON.stringify({ reason: 'overnight training', until: 600_000, setAt: 0 }))
 
-  expect(refusal(await $.tool.call({ tool: 'Bash', command: HEAVY }))).toBeDefined()
+  expect(refusal(await callTool($, { tool: 'Bash', command: HEAVY }))).toBeDefined()
   await clock.advance(600_001)
-  await $.tool.call({ tool: 'Bash', command: HEAVY })
+  await callTool($, { tool: 'Bash', command: HEAVY })
   expect(w.ran).toEqual([HEAVY])
 })
 
@@ -292,11 +301,11 @@ test('/guard pause lets a heavy job through until it runs out', SLOW, async ($, 
 
   const paused = await $.command.run(typed('guard', 'pause 15m'))
   expect(paused.text).toBe('Guard paused for 15m in this session.')
-  await $.tool.call({ tool: 'Bash', command: HEAVY })
+  await callTool($, { tool: 'Bash', command: HEAVY })
   expect(w.ran).toEqual([HEAVY])
 
   await clock.advance(16 * 60_000)
-  expect(refusal(await $.tool.call({ tool: 'Bash', command: HEAVY }))).toBeDefined()
+  expect(refusal(await callTool($, { tool: 'Bash', command: HEAVY }))).toBeDefined()
 })
 
 test('/guard reports what it sees, taking a process table on demand', SLOW, async ($, on) => {
@@ -553,7 +562,7 @@ test('machine_status gives the model the numbers, the verdict and the biggest ap
   expect(await $.tool.check({ tool: TOOL, input: {} })).toMatchObject({ decision: 'allow' })
   expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })).decision).toBe('ask')
 
-  const first = await $.tool.call({ tool: TOOL })
+  const first = await callTool($, { tool: TOOL })
   expect(first.result).toBe(
     [
       'machine-guard · sampled just now · every 15 s, one sample shared by all sessions',
@@ -571,7 +580,7 @@ test('machine_status gives the model the numbers, the verdict and the biggest ap
 
   // Ten seconds on: the shared sample is fresh, the table is recent; nothing is probed again.
   await clock.advance(10_000)
-  const again = String((await $.tool.call({ tool: TOOL })).result).split('\n')
+  const again = String((await callTool($, { tool: TOOL })).result).split('\n')
   expect(again[0]).toBe('machine-guard · sampled 10 s ago · every 15 s, one sample shared by all sessions')
   expect(again[3]).toBe('GPU: 91% (read 10 s ago)')
   expect(again[6]).toBe('Biggest apps (ps 10 s ago): python 31 GB, Claude 9 GB')
@@ -582,7 +591,7 @@ test('machine_status gives the model the numbers, the verdict and the biggest ap
   w.level = 4
   await clock.advance(5_000)
   expect(w.toasts.at(-1)).toBe('Memory critical: 40% free, swap 7.8/8 GB. Biggest: python 31 GB, Claude 9 GB. Heavy jobs are blocked.')
-  const busy = String((await $.tool.call({ tool: TOOL })).result).split('\n')
+  const busy = String((await callTool($, { tool: TOOL })).result).split('\n')
   expect(busy[5]).toBe('Pressure: critical (kernel level 4)')
   expect(busy[7]).toBe('Verdict: busy — memory is critical: heavy local jobs are blocked (the user can lift this with /guard pause 15m).')
   expect(count(w, 'ps')).toBe(1)
@@ -595,7 +604,7 @@ test('machine_status says how to get a process table when ps does not answer', S
   w.files.set(RESERVATION, JSON.stringify({ reason: 'overnight training', until: 1_600_000, setAt: 1_000_000 }))
   await start($, clock)
 
-  const lines = String((await $.tool.call({ tool: TOOL })).result).split('\n')
+  const lines = String((await callTool($, { tool: TOOL })).result).split('\n')
   expect(count(w, 'ps')).toBe(1)
   expect(lines[6]).toBe(
     'Biggest apps: no process table — ps did not answer within 10 s (tried just now; the Mac is that loaded). machine_status and /guard try again at most once a minute, or run `ps -axo rss=,comm= | sort -rn | head -5` yourself.',
@@ -604,10 +613,10 @@ test('machine_status says how to get a process table when ps does not answer', S
 
   // Asked again within the minute, it does not try again.
   await clock.advance(30_000)
-  await $.tool.call({ tool: TOOL })
+  await callTool($, { tool: TOOL })
   expect(count(w, 'ps')).toBe(1)
   await clock.advance(30_000)
-  await $.tool.call({ tool: TOOL })
+  await callTool($, { tool: TOOL })
   expect(count(w, 'ps')).toBe(2)
 })
 
@@ -653,10 +662,10 @@ test('tells the model when it starts heavy work while the cores are parked', SLO
   w.mask = 15
   await start($, clock)
 
-  const ran = await $.tool.call({ tool: 'Bash', command: HEAVY })
+  const ran = await callTool($, { tool: 'Bash', command: HEAVY })
   expect(w.ran).toEqual([HEAVY])
   expect(ran.context?.join('\n')).toMatch(/scheduling on 4 of 16 CPU cores right now/)
-  const light = await $.tool.call({ tool: 'Bash', command: LIGHT })
+  const light = await callTool($, { tool: 'Bash', command: LIGHT })
   expect(light.context ?? []).toEqual([])
 })
 
@@ -857,7 +866,7 @@ test('toastScope off: neither the cores nor critical memory is toasted, though t
   expect(w.statuses.at(-1)).toBe('RAM CRITICAL 40% free · swap 7.8/8G · top python 31G · GPU 91% · CPU 4/16 cores')
   expect(shared(w)).toMatchObject({ data: { cpuParkedSince: 1_000_000, cpuToastedAt: 1_000_000, memoryToastedAt: 1_000_000 } })
   // The guard's own toasts are not the scope's business.
-  expect(refusal(await $.tool.call({ tool: 'Bash', command: HEAVY }))).toBeDefined()
+  expect(refusal(await callTool($, { tool: 'Bash', command: HEAVY }))).toBeDefined()
   expect(w.toasts).toEqual(['machine-guard blocked a heavy job: memory is critical'])
 })
 
