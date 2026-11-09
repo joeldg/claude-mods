@@ -144,7 +144,15 @@ const start = async ($: Engine, clock: MockClock) => {
 
 const count = (w: World, command: string) => w.probes.filter(probe => probe === command).length
 
-const shared = (w: World) => JSON.parse(w.files.get(SHARED) ?? 'null') as { ts: number; by: string; ttlMs: number; probeMs: number; n: number; data: { at: number; gpuPct: number | null } } | null
+const shared = (w: World) =>
+  JSON.parse(w.files.get(SHARED) ?? 'null') as {
+    ts: number
+    by: string
+    ttlMs: number
+    probeMs: number
+    n: number
+    data: { at: number; pressure: string; gpuPct: number | null; cpuParkedSince: number | null; cpuToastedAt: number | null; memoryToastedAt: number | null }
+  } | null
 
 type Outcome = { deny?: string; isError?: boolean; text?: string }
 
@@ -159,6 +167,65 @@ const typed = (command: string, args: string) => ({
   origin: { kind: 'composer' as const },
   presentation: { isFullscreen: false, columns: 100 },
 })
+
+/** The cores as another session's sample reports them: all sixteen, or the four efficiency cores alone. */
+const ALL = { recommended: 16, mask: 65535, parkedSince: null, cpuToastedAt: null }
+const FOUR = { recommended: 4, mask: 15 }
+
+type Other = {
+  recommended: number
+  mask: number
+  /** Since when the cores have been parked, and the parking the other session has toasted (null: not yet). */
+  parkedSince: number | null
+  cpuToastedAt: number | null
+  /** The kernel's pressure level, and when the other session toasted the critical episode (null: not yet). */
+  level?: number
+  memoryToastedAt?: number | null
+}
+
+/** Another session (sess-b) writes its sample, and its lock, now. */
+const writtenBy = (w: World, clock: MockClock, other: Other) => {
+  const now = clock.now()
+  const level = other.level ?? 1
+  const data = {
+    at: now,
+    pressure: level === 4 ? 'critical' : level === 2 ? 'warn' : 'normal',
+    level,
+    freePct: 21,
+    unusedGB: 10.1,
+    totalGB: 48,
+    compressorGB: 6.9,
+    compressedGB: 28.2,
+    swapUsedGB: 16.7,
+    swapTotalGB: 18,
+    gpuPct: 3,
+    gpuAt: now,
+    cpuTotal: 16,
+    cpuRecommended: other.recommended,
+    cpuMask: other.mask,
+    cpuParkedSince: other.parkedSince,
+    cpuToastedAt: other.cpuToastedAt,
+    memoryToastedAt: other.memoryToastedAt ?? null,
+    top: [],
+    topAt: null,
+    topTriedAt: null,
+  }
+  w.files.set(SHARED, JSON.stringify({ ts: now, by: 'sess-b', ttlMs: 15_000, probeMs: 120, n: 7, data }))
+  w.files.set(LOCK, JSON.stringify({ ts: now, by: 'sess-b' }))
+}
+
+/** This session's next `count` ticks at the 15 s pace, each finding a sample the other session wrote a second before. */
+const follow = async (w: World, clock: MockClock, count: number, other: Other) => {
+  for (let i = 0; i < count; i += 1) {
+    await clock.advance(14_000)
+    writtenBy(w, clock, other)
+    await clock.advance(1_000)
+  }
+}
+
+const parkedToasts = (w: World) => w.toasts.filter(text => text.startsWith('macOS has parked'))
+const backToasts = (w: World) => w.toasts.filter(text => text === 'All 16 CPU cores are back.')
+const memoryToasts = (w: World) => w.toasts.filter(text => text.startsWith('Memory critical'))
 
 test('refuses a heavy job while memory is critical and lets light commands through', SLOW, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -677,4 +744,151 @@ test("following another session's pace is logged once per change of pace, never 
   expect(w.probes).toEqual([])
   expect(w.logs.map(line => line.to)).toEqual(['debug', 'debug'])
   expect(w.statuses.at(-1)).toBe('RAM 21% free · swap 16.7/18G · GPU 3%')
+})
+
+test('a session adopting another session’s sample never toasts the cores: the sampler tells the whole Mac, once', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  const parked = { ...FOUR, parkedSince: 1_000_000, cpuToastedAt: null }
+  writtenBy(w, clock, parked)
+  await start($, clock)
+  expect(w.statuses.at(-1)).toBe('RAM 21% free · swap 16.7/18G · GPU 3% · CPU 4/16 cores')
+
+  // Ten minutes of a parking the sampling session has not toasted yet: a follower says nothing (it used to, after a minute, in every session).
+  await follow(w, clock, 40, parked)
+  expect(w.toasts).toEqual([])
+  // The sampler toasts it (its sample records that), and later the cores' return: nothing here either way.
+  await follow(w, clock, 4, { ...parked, cpuToastedAt: 1_000_000 })
+  await follow(w, clock, 4, ALL)
+  expect(w.toasts).toEqual([])
+  expect(w.probes).toEqual([])
+  expect(w.statuses.at(-1)).toBe('RAM 21% free · swap 16.7/18G · GPU 3%')
+})
+
+test('a sampler taking over mid-episode does not toast a parking already toasted, and toasts the cores’ return once', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  w.mask = 15
+  // The other session toasted this parking (its sample says since when, and that it told) and then went away, its lock left behind.
+  writtenBy(w, clock, { ...FOUR, parkedSince: 900_000, cpuToastedAt: 900_000 })
+  await start($, clock)
+  expect(w.probes).toEqual([])
+
+  // Its sample is stale after 15 s and its lock abandoned after 20 s: from 30 s on this session samples, carrying what was told.
+  await clock.advance(15_000)
+  expect(w.probes).toEqual([])
+  await clock.advance(15_000)
+  expect(w.probes).toEqual(['sysctl', 'cores', 'vm_stat'])
+  expect(shared(w)).toMatchObject({ by: 'sess-a', data: { cpuParkedSince: 900_000, cpuToastedAt: 900_000 } })
+  await clock.advance(15_000)
+  await clock.advance(15_000)
+  expect(w.toasts).toEqual([])
+
+  // The cores come back: toasted once, by this session now, and the record cleared.
+  w.mask = 65535
+  await clock.advance(15_000)
+  expect(w.toasts).toEqual(['All 16 CPU cores are back.'])
+  expect(shared(w)).toMatchObject({ data: { cpuParkedSince: null, cpuToastedAt: null } })
+  await clock.advance(15_000)
+  expect(w.toasts).toEqual(['All 16 CPU cores are back.'])
+})
+
+test('a parking the old sampler had not toasted yet is toasted once by the new one, a minute after the start it recorded', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  w.mask = 15
+  writtenBy(w, clock, { ...FOUR, parkedSince: 980_000, cpuToastedAt: null })
+  await start($, clock)
+  await clock.advance(15_000)
+  await clock.advance(15_000)
+  // Sampling now, 50 s into the parking: not yet.
+  expect(w.probes).toHaveLength(3)
+  expect(w.toasts).toEqual([])
+  await clock.advance(15_000)
+  expect(parkedToasts(w)).toHaveLength(1)
+  expect(shared(w)).toMatchObject({ by: 'sess-a', data: { cpuParkedSince: 980_000, cpuToastedAt: 980_000 } })
+  await clock.advance(15_000)
+  await clock.advance(15_000)
+  expect(parkedToasts(w)).toHaveLength(1)
+})
+
+test('toastScope every: each session toasts the parking and the return once, following or sampling', { ...SLOW, options: { toastScope: 'every' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  const parked = { ...FOUR, parkedSince: 1_000_000, cpuToastedAt: null }
+  writtenBy(w, clock, parked)
+  await start($, clock)
+
+  // Following: nothing until the sampler has toasted the parking; then once, however many samples carry the record; the return once.
+  await follow(w, clock, 4, parked)
+  expect(w.toasts).toEqual([])
+  await follow(w, clock, 4, { ...parked, cpuToastedAt: 1_000_000 })
+  expect(parkedToasts(w)).toHaveLength(1)
+  await follow(w, clock, 2, ALL)
+  expect(backToasts(w)).toHaveLength(1)
+  // Critical memory the sampler toasted is echoed once too.
+  await follow(w, clock, 3, { ...ALL, level: 4, memoryToastedAt: clock.now() })
+  expect(memoryToasts(w)).toEqual(['Memory critical: 21% free, swap 16.7/18 GB. Heavy jobs are blocked.'])
+
+  // Sampling, the other session gone (its lock abandoned 20 s after its last sample): the parking seen then is toasted a minute later, once; the return once.
+  w.mask = 15
+  await clock.advance(15_000)
+  await clock.advance(15_000)
+  expect(w.probes).toHaveLength(3)
+  await clock.advance(45_000)
+  expect(parkedToasts(w)).toHaveLength(1)
+  await clock.advance(15_000)
+  expect(parkedToasts(w)).toHaveLength(2)
+  await clock.advance(15_000)
+  expect(parkedToasts(w)).toHaveLength(2)
+  w.mask = 65535
+  await clock.advance(15_000)
+  expect(backToasts(w)).toHaveLength(2)
+})
+
+test('toastScope off: neither the cores nor critical memory is toasted, though the sample still records what was due', { ...SLOW, options: { toastScope: 'off' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  w.mask = 15
+  w.level = 4
+  await start($, clock)
+  await clock.advance(2 * 60_000)
+  expect(w.toasts).toEqual([])
+  expect(w.statuses.at(-1)).toBe('RAM CRITICAL 40% free · swap 7.8/8G · top python 31G · GPU 91% · CPU 4/16 cores')
+  expect(shared(w)).toMatchObject({ data: { cpuParkedSince: 1_000_000, cpuToastedAt: 1_000_000, memoryToastedAt: 1_000_000 } })
+  // The guard's own toasts are not the scope's business.
+  expect(refusal(await $.tool.call({ tool: 'Bash', command: HEAVY }))).toBeDefined()
+  expect(w.toasts).toEqual(['machine-guard blocked a heavy job: memory is critical'])
+})
+
+test('critical memory is toasted once per episode by the sampler alone: a follower never, a sampler taking over mid-episode not again', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const w = world(on, clock)
+  w.level = 4
+  const critical = { ...ALL, level: 4 }
+  writtenBy(w, clock, critical)
+  await start($, clock)
+  // Following critical samples, toasted by the sampler or not yet: nothing.
+  await follow(w, clock, 4, critical)
+  await follow(w, clock, 4, { ...critical, memoryToastedAt: 1_000_000 })
+  expect(w.toasts).toEqual([])
+
+  // Taking over mid-episode (the other session's lock abandoned): the episode was toasted; this session carries the record and says nothing.
+  await clock.advance(15_000)
+  await clock.advance(15_000)
+  expect(count(w, 'sysctl')).toBe(1)
+  expect(w.toasts).toEqual([])
+  expect(shared(w)).toMatchObject({ by: 'sess-a', data: { pressure: 'critical', memoryToastedAt: 1_000_000 } })
+
+  // Memory recovers, then turns critical again: a new episode, toasted once and recorded.
+  w.level = 1
+  await clock.advance(15_000)
+  expect(shared(w)).toMatchObject({ data: { pressure: 'normal', memoryToastedAt: null } })
+  w.level = 4
+  await clock.advance(15_000)
+  expect(w.toasts).toEqual(['Memory critical: 40% free, swap 7.8/8 GB. Biggest: python 31 GB, Claude 9 GB. Heavy jobs are blocked.'])
+  expect(shared(w)).toMatchObject({ data: { at: 1_180_000, memoryToastedAt: 1_180_000 } })
+  await clock.advance(15_000)
+  await clock.advance(15_000)
+  expect(w.toasts).toHaveLength(1)
 })

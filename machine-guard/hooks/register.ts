@@ -4,8 +4,10 @@ import type { Reservation, SampleLock, SharedSample, Snapshot } from '../types'
 import {
   PROBE_TIMEOUT_MS,
   TOP_GAP_MS,
+  announce,
   biggestApps,
   criticalDenial,
+  echoes,
   formatLeft,
   hasFreshTop,
   isHeavy,
@@ -25,10 +27,8 @@ import {
   statusReport,
   coresContext,
   coresLine,
-  coresToast,
   isParked,
   parseCores,
-  shouldAnnounceParked,
   warnContext,
 } from './probe'
 
@@ -36,8 +36,6 @@ type Engine = EngineInterface
 
 const SNAPSHOT = { plugin: 'machine-guard', key: 'snapshot' } as const
 const PAUSED = { plugin: 'machine-guard', key: 'pausedUntil' } as const
-/** Whether this session has toasted the current parking of the cores, so their return is toasted too. */
-const ANNOUNCED = { plugin: 'machine-guard', key: 'coresAnnounced' } as const
 const TOOL = 'mcp__machine-guard__machine_status'
 /** A guard decision samples afresh when the last reading is older than this. */
 const STALE_MS = 30_000
@@ -55,10 +53,12 @@ const TOOL_DESCRIPTION =
   'Use this instead of running ps, top, vm_stat, memory_pressure or project scripts to check the load before launching heavy work: ' +
   'those take 10–40 s when the Mac is swapping and add to the load, while this reads the shared sample (and takes a process table at most once a minute).'
 
-type Config = { sampleMs: number; blockOnCritical: boolean; busyMs: number; extra: RegExp | null }
+/** Who toasts parked cores and critical memory: the session that took the sample (once for the whole Mac), every session, or none. */
+type ToastScope = 'sampler' | 'every' | 'off'
+type Config = { sampleMs: number; blockOnCritical: boolean; busyMs: number; extra: RegExp | null; toastScope: ToastScope }
 type Probe = { text: string | null; isTimedOut: boolean }
 
-let config: Config = { sampleMs: 15_000, blockOnCritical: true, busyMs: 4 * 3_600_000, extra: null }
+let config: Config = { sampleMs: 15_000, blockOnCritical: true, busyMs: 4 * 3_600_000, extra: null, toastScope: 'sampler' }
 /** The pace now: the configured interval, doubled after slow probes up to the cap. */
 let intervalMs = config.sampleMs
 let timer: { cancel: () => void } | null = null
@@ -192,7 +192,6 @@ const withTable = (snapshot: Snapshot, ps: Probe, now: number): Snapshot => {
   return top.length > 0 ? { ...snapshot, top, topAt: now, topTriedAt: now } : { ...snapshot, topTriedAt: now }
 }
 
-/** Takes a snapshot in: this session's state and status line, and the toast when memory turned critical. */
 /** The cores fields of a sample: the fresh read, else the last sample's; parked since the first parked sample in a row. */
 const coresOf = (read: ReturnType<typeof parseCores>, last: Snapshot | null, at: number) => {
   const cores = read ?? { cpuTotal: last?.cpuTotal ?? null, cpuRecommended: last?.cpuRecommended ?? null, cpuMask: last?.cpuMask ?? null }
@@ -200,26 +199,20 @@ const coresOf = (read: ReturnType<typeof parseCores>, last: Snapshot | null, at:
   return { ...cores, cpuParkedSince: parked ? (last?.cpuParkedSince ?? at) : null }
 }
 
+function toast($: Engine, texts: readonly string[]) {
+  for (const text of texts) {
+    $.ui.toast(text, { timeoutMs: 12_000 })
+  }
+}
+
+/**
+ * Takes a snapshot in: this session's state and status line, and, when every session toasts (toastScope every),
+ * the announcements the sample records that this session has not shown yet.
+ */
 async function adopt($: Engine, snapshot: Snapshot, previous: Snapshot | null, now: number): Promise<Snapshot> {
   await $.state.set(SNAPSHOT, snapshot)
-  if (snapshot.pressure === 'critical' && previous?.pressure !== 'critical') {
-    $.ui.toast(
-      `Memory critical: ${snapshot.freePct ?? '?'}% free, swap ${snapshot.swapUsedGB}/${snapshot.swapTotalGB} GB.` +
-        (snapshot.top.length > 0 ? ` Biggest: ${biggestApps(snapshot)}.` : '') +
-        (config.blockOnCritical ? ' Heavy jobs are blocked.' : ''),
-      { timeoutMs: 12_000 },
-    )
-  }
-  // Parked cores: told once when at least half are parked or the parking has lasted five minutes, and once when they are back.
-  const { value: announced = false } = await $.state.get(ANNOUNCED)
-  if (isParked(snapshot)) {
-    if (!announced && shouldAnnounceParked(snapshot, now)) {
-      await $.state.set(ANNOUNCED, true)
-      $.ui.toast(coresToast(snapshot), { timeoutMs: 12_000 })
-    }
-  } else if (announced && snapshot.cpuTotal !== null) {
-    await $.state.set(ANNOUNCED, false)
-    $.ui.toast(coresToast(snapshot), { timeoutMs: 12_000 })
+  if (config.toastScope === 'every') {
+    toast($, echoes(snapshot, previous, config.blockOnCritical))
   }
   await showStatus($, snapshot, now)
   return snapshot
@@ -282,6 +275,9 @@ async function takeSample($: Engine): Promise<Snapshot | null> {
     top: hasTop && last ? last.top : [],
     topAt: hasTop && last ? last.topAt : null,
     topTriedAt: last?.topTriedAt ?? null,
+    // What the Mac has been toasted of this parking and this critical episode: carried, and decided, by announce() below.
+    cpuToastedAt: null,
+    memoryToastedAt: null,
   }
   // What is eating memory is asked only under pressure, at most once a minute: ps is the slowest probe of all.
   if (snapshot.pressure !== 'normal' && isTopDue(snapshot, at)) {
@@ -293,8 +289,13 @@ async function takeSample($: Engine): Promise<Snapshot | null> {
   const done = await $.clock.now()
   own = { n, probeMs: done - now }
   setPace($, done - now, isTimedOut)
-  await writeShared($, { ts: at, by: me, ttlMs: intervalMs, probeMs: done - now, n, data: snapshot })
-  return adopt($, snapshot, previous, done)
+  // The toasts are the sampler's, once per episode for the whole Mac; the sample records them for whoever samples next.
+  const told = announce(snapshot, last, done, config.blockOnCritical)
+  if (config.toastScope === 'sampler') {
+    toast($, told.toasts)
+  }
+  await writeShared($, { ts: at, by: me, ttlMs: intervalMs, probeMs: done - now, n, data: told.snapshot })
+  return adopt($, told.snapshot, previous, done)
 }
 
 /** The latest reading, one sample at a time: callers while one is under way get that one. */
@@ -380,6 +381,7 @@ export const register: Register = (on, options) => {
     blockOnCritical: options.blockOnCritical !== false,
     busyMs: Math.max(0.1, Number(options.busyHours ?? 4)) * 3_600_000,
     extra,
+    toastScope: options.toastScope === 'every' || options.toastScope === 'off' ? options.toastScope : 'sampler',
   }
   intervalMs = config.sampleMs
   timer = null

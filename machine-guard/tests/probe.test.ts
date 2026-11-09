@@ -3,9 +3,11 @@ import { expect, test } from 'claude-code/testing'
 import type { Snapshot } from '../types'
 import {
   agoText,
+  announce,
   coresContext,
   coresToast,
   criticalDenial,
+  echoes,
   isHeavy,
   isParked,
   memoryOf,
@@ -68,6 +70,8 @@ const SNAPSHOT: Snapshot = {
   cpuRecommended: 16,
   cpuMask: 65535,
   cpuParkedSince: null,
+  cpuToastedAt: null,
+  memoryToastedAt: null,
   top: [
     { name: 'python', gb: 31 },
     { name: 'Claude', gb: 9 },
@@ -142,18 +146,31 @@ test('raises the pressure when free memory and swap say worse', () => {
 test('reads the shared sample and the lock, and treats anything malformed as absent', () => {
   const shared = { ts: 999_000, by: 'sess-b', ttlMs: 15_000, probeMs: 120, n: 7, data: SNAPSHOT }
   expect(parseShared(JSON.stringify(shared))).toEqual(shared)
-  // An older session's record without the newer fields still counts.
+  const told = { ...shared, data: { ...SNAPSHOT, cpuRecommended: 4, cpuMask: 15, cpuParkedSince: 900_000, cpuToastedAt: 900_000, memoryToastedAt: 950_000 } }
+  expect(parseShared(JSON.stringify(told))).toEqual(told)
+  // An older session's record without the newer fields still counts: nothing toasted yet.
   const older = {
     ts: 999_000,
     by: 'sess-b',
     ttlMs: 15_000,
-    data: { ...SNAPSHOT, gpuAt: undefined, topAt: undefined, topTriedAt: undefined, cpuTotal: undefined, cpuRecommended: undefined, cpuMask: undefined, cpuParkedSince: undefined },
+    data: {
+      ...SNAPSHOT,
+      gpuAt: undefined,
+      topAt: undefined,
+      topTriedAt: undefined,
+      cpuTotal: undefined,
+      cpuRecommended: undefined,
+      cpuMask: undefined,
+      cpuParkedSince: undefined,
+      cpuToastedAt: undefined,
+      memoryToastedAt: undefined,
+    },
   }
   expect(parseShared(JSON.stringify(older))).toEqual({
     ...shared,
     probeMs: 0,
     n: 0,
-    data: { ...SNAPSHOT, gpuAt: null, topAt: null, topTriedAt: null, cpuTotal: null, cpuRecommended: null, cpuMask: null, cpuParkedSince: null },
+    data: { ...SNAPSHOT, gpuAt: null, topAt: null, topTriedAt: null, cpuTotal: null, cpuRecommended: null, cpuMask: null, cpuParkedSince: null, cpuToastedAt: null, memoryToastedAt: null },
   })
   expect(parseShared('{"ts":5}')).toBeNull()
   expect(parseShared('not json')).toBeNull()
@@ -335,4 +352,55 @@ test('parked performance cores show on the status line, in the report, and in wh
     'macOS has parked 12 of 16 CPU cores: scheduling on 4 (kern.sched_recommended_cores = 15). CPU-bound work will crawl until it clears — check thermal pressure (sudo powermetrics --samplers thermal -n 1); a sleep/wake or reboot resets a stuck controller.',
   )
   expect(coresToast(SNAPSHOT)).toBe('All 16 CPU cores are back.')
+})
+
+test('the sampler toasts a parking once it has lasted long enough, its end once, and a critical episode once, recording each in the sample', () => {
+  const parked: Snapshot = { ...SNAPSHOT, cpuRecommended: 4, cpuMask: 15, cpuParkedSince: 950_000 }
+  // Fifty seconds in: nothing, and nothing recorded.
+  expect(announce(parked, null, 1_000_000, true)).toEqual({ snapshot: parked, toasts: [] })
+  // A minute in: toasted, and the start recorded as toasted.
+  const told = announce({ ...parked, at: 1_010_000 }, parked, 1_010_000, true)
+  expect(told.toasts).toEqual([coresToast(parked)])
+  expect(told.snapshot.cpuToastedAt).toBe(950_000)
+  // The next sample carries the record, whichever session takes it: nothing more.
+  const later = announce({ ...parked, at: 1_025_000 }, told.snapshot, 1_025_000, true)
+  expect(later).toEqual({ snapshot: { ...parked, at: 1_025_000, cpuToastedAt: 950_000 }, toasts: [] })
+  // The cores back: toasted once, the record cleared; the sample after says nothing.
+  const back = announce({ ...SNAPSHOT, at: 1_040_000 }, later.snapshot, 1_040_000, true)
+  expect(back).toEqual({ snapshot: { ...SNAPSHOT, at: 1_040_000 }, toasts: ['All 16 CPU cores are back.'] })
+  expect(announce({ ...SNAPSHOT, at: 1_055_000 }, back.snapshot, 1_055_000, true).toasts).toEqual([])
+  // A parking that ends before it was toasted ends in silence.
+  expect(announce(SNAPSHOT, parked, 1_000_000, true).toasts).toEqual([])
+
+  // Critical memory: toasted once when the episode starts and recorded; carried while it lasts; cleared on recovery.
+  const critical: Snapshot = { ...SNAPSHOT, pressure: 'critical', level: 4, freePct: 6 }
+  const first = announce(critical, SNAPSHOT, 1_000_000, true)
+  expect(first.toasts).toEqual(['Memory critical: 6% free, swap 9.2/10 GB. Biggest: python 31 GB, Claude 9 GB. Heavy jobs are blocked.'])
+  expect(first.snapshot.memoryToastedAt).toBe(1_000_000)
+  const still = announce({ ...critical, at: 1_015_000 }, first.snapshot, 1_015_000, false)
+  expect(still).toEqual({ snapshot: { ...critical, at: 1_015_000, memoryToastedAt: 1_000_000 }, toasts: [] })
+  expect(announce(SNAPSHOT, still.snapshot, 1_030_000, true)).toEqual({ snapshot: SNAPSHOT, toasts: [] })
+  // Blocking off and no process table: the toast says less.
+  expect(announce({ ...critical, top: [] }, null, 1_000_000, false).toasts).toEqual(['Memory critical: 6% free, swap 9.2/10 GB.'])
+  // A critical episode the last sample does not record as toasted (an older build's, or none) is toasted now.
+  expect(announce(critical, critical, 1_000_000, true).toasts).toHaveLength(1)
+})
+
+test('with toastScope every, a session echoes what the sampler recorded since its own last sample', () => {
+  const parked: Snapshot = { ...SNAPSHOT, cpuRecommended: 4, cpuMask: 15, cpuParkedSince: 950_000 }
+  const toldParked: Snapshot = { ...parked, cpuToastedAt: 950_000 }
+  expect(echoes(parked, null, true)).toEqual([])
+  // A session starting mid-episode, or one whose last sample was untold: the parking; the same record again: nothing.
+  expect(echoes(toldParked, null, true)).toEqual([coresToast(parked)])
+  expect(echoes(toldParked, parked, true)).toEqual([coresToast(parked)])
+  expect(echoes(toldParked, toldParked, true)).toEqual([])
+  // The return, only of a parking that was toasted.
+  expect(echoes(SNAPSHOT, toldParked, true)).toEqual(['All 16 CPU cores are back.'])
+  expect(echoes(SNAPSHOT, parked, true)).toEqual([])
+  expect(echoes(SNAPSHOT, SNAPSHOT, true)).toEqual([])
+  const critical: Snapshot = { ...SNAPSHOT, pressure: 'critical', level: 4, freePct: 6, memoryToastedAt: 1_000_000 }
+  expect(echoes(critical, SNAPSHOT, false)).toEqual(['Memory critical: 6% free, swap 9.2/10 GB. Biggest: python 31 GB, Claude 9 GB.'])
+  expect(echoes(critical, critical, true)).toEqual([])
+  // A new episode, toasted at another time, is echoed again.
+  expect(echoes({ ...critical, memoryToastedAt: 1_100_000 }, critical, true)).toHaveLength(1)
 })

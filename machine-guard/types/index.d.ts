@@ -31,6 +31,14 @@ export type Snapshot = {
   cpuMask: number | null
   /** When the current parking began (the first sample with fewer cores than the Mac has); null while all are in use. */
   cpuParkedSince: number | null
+  /**
+   * What the sampling session has toasted, kept in the shared sample so the whole Mac is told once however the
+   * role passes between sessions: the start of the parking it toasted (cpuParkedSince; null while this parking is
+   * untold), and when it toasted the critical episode under way (null until then, and again once memory recovers).
+   * A sample an older build wrote has neither: nothing toasted yet.
+   */
+  cpuToastedAt: number | null
+  memoryToastedAt: number | null
   /** The apps holding the most memory, helpers summed into their app, from the last process table; [] when none is fresh. */
   top: AppMemory[]
   /** When that table was taken, and when one was last tried: ps runs on demand or under pressure, at most once a minute. */
@@ -53,6 +61,6 @@ export type SampleLock = { ts: number; by: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    'machine-guard': { snapshot: Snapshot | null; pausedUntil: number; coresAnnounced: boolean }
+    'machine-guard': { snapshot: Snapshot | null; pausedUntil: number }
   }
 }

@@ -195,6 +195,8 @@ export const parseShared = (text: string | null): SharedSample | null => {
         cpuRecommended: numberOrNull(data.cpuRecommended),
         cpuMask: numberOrNull(data.cpuMask),
         cpuParkedSince: numberOrNull(data.cpuParkedSince),
+        cpuToastedAt: numberOrNull(data.cpuToastedAt),
+        memoryToastedAt: numberOrNull(data.memoryToastedAt),
         top: Array.isArray(data.top) ? data.top.filter(isAppMemory) : [],
         topAt: numberOrNull(data.topAt),
         topTriedAt: numberOrNull(data.topTriedAt),
@@ -450,3 +452,60 @@ export const coresToast = (snapshot: Snapshot): string =>
 
 export const warnContext = (snapshot: Snapshot): string =>
   `machine-guard: memory is tight on this Mac (${figures(snapshot)}). Avoid starting more heavy jobs in parallel; prefer running one at a time.`
+
+/** The toast when memory turns critical. */
+export const memoryToast = (snapshot: Snapshot, isBlocking: boolean): string =>
+  `Memory critical: ${snapshot.freePct ?? '?'}% free, swap ${snapshot.swapUsedGB}/${snapshot.swapTotalGB} GB.` +
+  (snapshot.top.length > 0 ? ` Biggest: ${biggestApps(snapshot)}.` : '') +
+  (isBlocking ? ' Heavy jobs are blocked.' : '')
+
+/** Whether the sample records its parking as toasted: the start the sampler toasted is this parking's. */
+export const isParkingToasted = (snapshot: Snapshot): boolean =>
+  snapshot.cpuParkedSince !== null && snapshot.cpuToastedAt === snapshot.cpuParkedSince
+
+export type Announcement = { snapshot: Snapshot; toasts: string[] }
+
+/**
+ * What the sampler toasts of a new sample, recorded in the sample itself (cpuToastedAt, memoryToastedAt) so the
+ * whole Mac is told once however the sampler role passes between sessions: a parking once it has lasted long
+ * enough (shouldAnnounceParked), its end once when it was toasted, and a critical episode (critical samples in a
+ * row) once. The records of the last sample carry while their episode lasts, so a sampler taking over mid-episode
+ * toasts nothing twice; a sample without them (an older build's) reads as not toasted yet.
+ */
+export const announce = (snapshot: Snapshot, last: Snapshot | null, now: number, isBlocking: boolean): Announcement => {
+  const toasts: string[] = []
+  let memoryToastedAt = snapshot.pressure === 'critical' && last?.pressure === 'critical' ? (last.memoryToastedAt ?? null) : null
+  if (snapshot.pressure === 'critical' && memoryToastedAt === null) {
+    memoryToastedAt = snapshot.at
+    toasts.push(memoryToast(snapshot, isBlocking))
+  }
+  let cpuToastedAt = last !== null && isParkingToasted(last) && last.cpuParkedSince === snapshot.cpuParkedSince ? snapshot.cpuParkedSince : null
+  if (isParked(snapshot)) {
+    if (cpuToastedAt === null && shouldAnnounceParked(snapshot, now)) {
+      cpuToastedAt = snapshot.cpuParkedSince
+      toasts.push(coresToast(snapshot))
+    }
+  } else if (snapshot.cpuTotal !== null && last !== null && isParkingToasted(last)) {
+    toasts.push(coresToast(snapshot))
+  }
+  return { snapshot: { ...snapshot, cpuToastedAt, memoryToastedAt }, toasts }
+}
+
+/**
+ * The toasts a session shows when every session toasts (toastScope every): the announcements the sample records
+ * that its own last sample did not, the end of a parking it saw recorded included.
+ */
+export const echoes = (snapshot: Snapshot, previous: Snapshot | null, isBlocking: boolean): string[] => {
+  const toasts: string[] = []
+  if (snapshot.memoryToastedAt !== null && snapshot.memoryToastedAt !== previous?.memoryToastedAt) {
+    toasts.push(memoryToast(snapshot, isBlocking))
+  }
+  if (isParkingToasted(snapshot)) {
+    if (snapshot.cpuToastedAt !== previous?.cpuToastedAt) {
+      toasts.push(coresToast(snapshot))
+    }
+  } else if (!isParked(snapshot) && snapshot.cpuTotal !== null && previous !== null && isParkingToasted(previous)) {
+    toasts.push(coresToast(snapshot))
+  }
+  return toasts
+}
