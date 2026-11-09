@@ -1,15 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ModalCache, ModalMeter, ModalProject, ModalShared } from '../types'
+import type { ModalCache, ModalMeter, ModalPoll, ModalProject, ModalShared } from '../types'
 import {
   activeApps,
   alertText,
   cliCandidates,
   dueAlerts,
-  firstLine,
   formatDuration,
-  isAuthProblem,
+  fullReason,
+  inMinutes,
   isCacheEntry,
   isDependencyFile,
   isEnoent,
@@ -25,7 +25,10 @@ import {
   paneNotice,
   parseAppList,
   parseSpend,
+  reasonText,
+  retryText,
   rowText,
+  servesPoll,
   statusText,
   summaryText,
   trackApps,
@@ -60,12 +63,13 @@ const RG_ARGS = ['-l', '-m1', '--glob', '*.py', '--glob', '!.venv/**', '--glob',
 /** The dependency files read when `rg` cannot list the project's own. */
 const DEPENDENCY_FILES = ['pyproject.toml', 'requirements.txt', 'uv.lock', 'poetry.lock']
 
-const EMPTY: ModalMeter = { cli: null, problem: null, apps: [], polledAt: null, spendToday: null, spendNote: null }
+const EMPTY: ModalMeter = { cli: null, problem: null, apps: [], polledAt: null, retryAt: null, spendToday: null, spendNote: null }
 /** What is known before any session has polled: nothing, and `billing report` untried. */
 const UNKNOWN: ModalShared = {
   cli: null,
   problem: null,
   apps: [],
+  retryAt: null,
   spendToday: null,
   spendNote: null,
   spendAskedAt: null,
@@ -80,16 +84,9 @@ const stopping = atom({ plugin: 'modal-meter', key: 'stopping' } as const, null)
 const budgetDay = atom({ plugin: 'modal-meter', key: 'budgetDay' } as const, null)
 const watching = atom({ plugin: 'modal-meter', key: 'watching' } as const, false)
 
-type Config = { command: string; pollMs: number; alertMs: number; budget: number; alwaysPoll: boolean }
+type Config = { command: string; pollMs: number; alertMs: number; budget: number; alwaysPoll: boolean; retryMs: number }
 
-/**
- * Why a poll runs: the timer (`tick`: another session's fresh answer will do, and its live lock
- * is respected), the person's /modal (`asked`: a fresh answer will do, else poll whoever holds
- * the lock), or a stop this session made (`changed`: always poll).
- */
-type Poll = 'tick' | 'asked' | 'changed'
-
-let config: Config = { command: '', pollMs: 60_000, alertMs: 30 * 60_000, budget: 0, alwaysPoll: false }
+let config: Config = { command: '', pollMs: 60_000, alertMs: 30 * 60_000, budget: 0, alwaysPoll: false, retryMs: 60 * 60_000 }
 let timer: { cancel: () => void } | null = null
 /** The poll interval in force: the option, doubled while Modal answers slowly. */
 let intervalMs = 60_000
@@ -167,10 +164,13 @@ function notFound(): string {
     : 'no Modal CLI found (tried `modal` and `python3 -m modal`); set the modalCommand option to the command you run Modal with'
 }
 
-/** Nothing to show: no status line, no rows, the reason kept for /modal and the pane. */
-async function silence($: Engine, problem: string, label: string | null) {
-  await update($, meter, () => ({ ...EMPTY, cli: label, problem }))
-  $.ui.status(undefined)
+/**
+ * Nothing to show: no rows, the reason kept for /modal and the pane. The status line clears, or,
+ * while a CLI's refusal is waited out, says why and for how long (`Modal: Token missing… · retry in 60m`).
+ */
+async function silence($: Engine, problem: string, label: string | null, retryAt: number | null, now: number) {
+  await update($, meter, () => ({ ...EMPTY, cli: label, problem, retryAt }))
+  $.ui.status(retryAt === null ? undefined : retryText(problem, retryAt, now))
 }
 
 async function checkBudget($: Engine, spent: number, now: number) {
@@ -228,11 +228,23 @@ async function readSpend($: Engine, argv: readonly string[], now: number, isForc
   }
   return {
     spendToday: null,
-    spendNote: `\`billing report\` failed: ${firstLine(text)}`,
+    spendNote: `\`billing report\` failed: ${reasonText(text)}`,
     spendAskedAt: now,
     spendWaitMs: SPEND_RETRY_MS,
     billingUnsupportedAt: null,
   }
+}
+
+/**
+ * The CLI ran but gave no apps (no token, a config error, a usage error, no `--json`): the reason
+ * from its error box, and no session runs it again before `retryAt`; a retry in a minute would
+ * only fail the same way. The whole message goes to the debug log, once per refusal.
+ */
+function refuse($: Engine, kept: ModalShared, label: string, output: string, now: number): ModalShared {
+  $.ui.log(`modal-meter: \`${label} app list\` failed; polling again in ${inMinutes(config.retryMs)} or when /modal runs: ${fullReason(output)}`, {
+    to: 'debug',
+  })
+  return { ...kept, problem: reasonText(output), retryAt: now + config.retryMs }
 }
 
 /**
@@ -241,28 +253,22 @@ async function readSpend($: Engine, argv: readonly string[], now: number, isForc
  */
 async function probe($: Engine, argv: readonly string[], shared: ModalShared, now: number, isForced: boolean): Promise<ModalShared> {
   const label = argv.join(' ')
-  const kept: ModalShared = { ...shared, cli: [...argv], problem: null, apps: [] }
+  const kept: ModalShared = { ...shared, cli: [...argv], problem: null, apps: [], retryAt: null }
   const listed = await run($, [...argv, 'app', 'list', '--json'], LIST_TIMEOUT_MS)
   const text = `${listed.stderr}\n${listed.stdout}`
   const apps = listed.started && listed.code === 0 ? parseAppList(listed.stdout) : null
-  adapt($, (await $.clock.now()) - now, isTimeout(listed.stderr), apps !== null)
-  if (!listed.started) {
-    if (isEnoent(listed.stderr)) {
+  const isTimedOut = !listed.started && isTimeout(listed.stderr)
+  adapt($, (await $.clock.now()) - now, isTimedOut, apps !== null)
+  if (isTimedOut || (!listed.started && isEnoent(listed.stderr))) {
+    if (!isTimedOut) {
       // The executable is not on this session's PATH: no retry until /modal asks to look again.
       cli = null
     }
-    return { ...kept, problem: `\`${label} app list\` could not run: ${firstLine(listed.stderr)}` }
-  }
-  if (listed.code !== 0) {
-    return {
-      ...kept,
-      problem: isAuthProblem(text)
-        ? `Modal has no profile or token set up on this machine (run \`${label} setup\`)`
-        : `\`${label} app list\` failed: ${firstLine(text)}`,
-    }
+    // A timeout is Modal being slow, which `adapt` answers; not a refusal.
+    return { ...kept, problem: `\`${label} app list\` could not run: ${reasonText(listed.stderr)}` }
   }
   if (apps === null) {
-    return { ...kept, problem: `\`${label} app list --json\` printed no JSON list` }
+    return refuse($, kept, label, listed.started && listed.code === 0 ? `\`${label} app list --json\` printed no JSON list` : text, now)
   }
   return { ...kept, ...(await readSpend($, argv, now, isForced, spendOf(kept))), apps }
 }
@@ -271,7 +277,7 @@ async function probe($: Engine, argv: readonly string[], shared: ModalShared, no
 async function apply($: Engine, data: ModalShared, polledAt: number, now: number) {
   const label = data.cli?.join(' ') ?? null
   if (data.problem !== null) {
-    await silence($, data.problem, label)
+    await silence($, data.problem, label, data.retryAt, now)
     return
   }
   let next = trackApps(await read($, tracked), data.apps, now)
@@ -289,6 +295,7 @@ async function apply($: Engine, data: ModalShared, polledAt: number, now: number
     problem: null,
     apps: data.apps,
     polledAt,
+    retryAt: null,
     spendToday: data.spendToday,
     spendNote: data.spendNote,
   }))
@@ -329,7 +336,8 @@ async function readCache($: Engine, dir: string | null): Promise<ModalCache | nu
     return memo
   }
   const value = await readJson($, `${dir}/cache.json`)
-  return isCacheEntry(value) ? value : null
+  // A cache modal-meter 0.2 wrote has no retryAt.
+  return isCacheEntry(value) ? { ...value, data: { ...value.data, retryAt: value.data.retryAt ?? null } } : null
 }
 
 async function writeCache($: Engine, dir: string | null, entry: ModalCache) {
@@ -380,11 +388,12 @@ function ensureTimer($: Engine) {
   }
 }
 
-async function pollOnce($: Engine, mode: Poll) {
+async function pollOnce($: Engine, mode: ModalPoll) {
   const now = await $.clock.now()
   const dir = await sharedDir($)
   const cached = await readCache($, dir)
-  if (mode !== 'changed' && cached !== null && now - cached.ts < cached.intervalMs) {
+  // The last answer, this session's or another's: fresh, or a refusal (the CLI's own or another session's) still waited out.
+  if (cached !== null && servesPoll(mode, cached, now)) {
     await apply($, cached.data, cached.ts, now)
     return
   }
@@ -396,7 +405,7 @@ async function pollOnce($: Engine, mode: Poll) {
     if (cached !== null) {
       await apply($, cached.data, cached.ts, now)
     } else {
-      await silence($, notFound(), null)
+      await silence($, notFound(), null, null, now)
     }
     return
   }
@@ -412,7 +421,7 @@ async function pollOnce($: Engine, mode: Poll) {
 }
 
 /** One poll at a time: a call while one runs shares it. */
-function poll($: Engine, mode: Poll): Promise<void> {
+function poll($: Engine, mode: ModalPoll): Promise<void> {
   if (!inflight) {
     inflight = pollOnce($, mode)
       .catch(error => $.ui.log(`modal-meter: poll failed: ${String(error)}`, { to: 'debug' }))
@@ -424,7 +433,7 @@ function poll($: Engine, mode: Poll): Promise<void> {
 }
 
 /** A poll that starts after any running one, so it sees what happened since. */
-async function refresh($: Engine, mode: Poll) {
+async function refresh($: Engine, mode: ModalPoll) {
   if (inflight) {
     await inflight
   }
@@ -525,7 +534,7 @@ async function stopApp($: Engine, id: string) {
   $.ui.toast(
     out.started && out.code === 0
       ? `Stopped Modal app ${name}`
-      : `Could not stop Modal app ${name}: ${firstLine(`${out.stderr}\n${out.stdout}`)}`,
+      : `Could not stop Modal app ${name}: ${reasonText(`${out.stderr}\n${out.stdout}`)}`,
     { timeoutMs: 10_000 },
   )
 }
@@ -542,6 +551,7 @@ export const register: Register = (on, options) => {
     alertMs: positive(options.alertMinutes, 30) * 60_000,
     budget: Math.max(0, Number(options.budgetToday ?? 0) || 0),
     alwaysPoll: options.alwaysPoll === true,
+    retryMs: positive(options.cliRetryMinutes, 60) * 60_000,
   }
   timer = null
   intervalMs = config.pollMs
@@ -588,7 +598,7 @@ export const register: Register = (on, options) => {
     const isWatching = await read($, watching)
     const now = await $.clock.now()
     const apps = activeApps(shown.apps)
-    const notice = paneNotice(shown, isWatching)
+    const notice = paneNotice(shown, isWatching, now)
     // An answer older than two polls: another session holds the lock and is slow, or this one has no CLI.
     const age = shown.polledAt !== null && now - shown.polledAt >= 2 * intervalMs ? now - shown.polledAt : null
     const spend =

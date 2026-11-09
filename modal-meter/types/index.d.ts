@@ -36,6 +36,8 @@ export type ModalMeter = {
   problem: string | null
   apps: ModalApp[]
   polledAt: number | null
+  /** When the CLI is tried again after it refused `app list` (no token, a config error); null while it answers, or when none runs. */
+  retryAt: number | null
   /** Today's spend in USD (Modal's UTC day); null when not known. */
   spendToday: number | null
   /** Why spend is not shown; null while it is (or before it was asked). */
@@ -52,6 +54,8 @@ export type ModalShared = {
   /** Why there are no apps to show; null when `apps` is the answer. */
   problem: string | null
   apps: ModalApp[]
+  /** No session runs `app list` before this: the CLI refused, for the reason in `problem`; null while it answers. */
+  retryAt: number | null
   /** Today's spend in USD (Modal's UTC day); null when not known. */
   spendToday: number | null
   /** Why spend is not shown; null while it is (or before it was asked). */
@@ -72,6 +76,14 @@ export type ModalCache = {
   intervalMs: number
   data: ModalShared
 }
+
+/**
+ * Why a poll runs: the timer (`tick`: another session's fresh answer will do, its live lock is
+ * respected, and a CLI that refused is left alone until its retry time), the person's /modal
+ * (`asked`: a fresh answer will do, else poll whoever holds the lock; a refusal is retried at
+ * once), or a stop this session made (`changed`: always poll).
+ */
+export type ModalPoll = 'tick' | 'asked' | 'changed'
 
 /** The shared lock file: the session polling Modal for everyone, and when it last started a poll. */
 export type ModalLock = {

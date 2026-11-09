@@ -1,7 +1,7 @@
 {
   "name": "modal-meter",
-  "version": "0.2.0",
-  "description": "Watches your Modal apps from the CLI, in projects that use Modal: running apps and containers on the status line, a toast when one has been up too long, today's spend where the CLI reports it, and a pane to stop an app (after you confirm). One session polls for all the open ones. No model calls.",
+  "version": "0.3.0",
+  "description": "Watches your Modal apps from the CLI, in projects that use Modal: running apps and containers on the status line, a toast when one has been up too long, today's spend where the CLI reports it, and a pane to stop an app (after you confirm). One session polls for all the open ones; a CLI that refuses (no token, a config error) is left alone for an hour, with its own reason shown. No model calls.",
   "author": {
     "name": "joeldg"
   },
@@ -36,6 +36,12 @@
       "title": "Watch every project",
       "description": "Read Modal in every project. Off, modal-meter watches only projects whose Python imports modal or whose dependency files name it, and any session once you run /modal or a modal command in it.",
       "default": false
+    },
+    "cliRetryMinutes": {
+      "type": "number",
+      "title": "Retry a refusing CLI after (minutes)",
+      "description": "When `modal app list` fails for a reason other than a timeout (no token, a config error, a usage error), no session runs the Modal CLI again for this long; the status line and the pane show the CLI's own reason and the wait. /modal retries at once.",
+      "default": 60
     }
   }
 }

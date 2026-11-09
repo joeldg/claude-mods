@@ -1,14 +1,15 @@
 import { expect, test } from 'claude-code/testing'
 
-import type { ModalApp, ModalMeter } from '../types'
+import type { ModalApp, ModalCache, ModalMeter, ModalShared } from '../types'
 import {
   activeApps,
   alertText,
   cliCandidates,
+  brief,
   dueAlerts,
-  firstLine,
+  errorBox,
   formatDuration,
-  isAuthProblem,
+  fullReason,
   isCacheEntry,
   isDependencyFile,
   isEnoent,
@@ -25,7 +26,10 @@ import {
   parseAppList,
   parseSpend,
   parseTimestamp,
+  reasonText,
+  retryText,
   rowText,
+  servesPoll,
   splitCommand,
   statusText,
   summaryText,
@@ -79,6 +83,17 @@ const LIST_NEW = JSON.stringify([
     stopped_at: null,
   },
 ])
+
+/** `modal app list --json` with no token, as Modal 1.2 prints it to a pipe: one paragraph wrapped in a Rich error box. */
+const TOKEN_BOX =
+  '╭─ Error ──────────────────────────────────────────────────────────────────────╮\n' +
+  '│ Token missing. Could not authenticate client. If you have token credentials, │\n' +
+  '│ see modal.com/docs/reference/modal.config for setup help. If you are a new   │\n' +
+  '│ user, register an account at modal.com, then run `modal token new`.          │\n' +
+  '╰──────────────────────────────────────────────────────────────────────────────╯\n'
+/** The box's message, unwrapped. */
+const TOKEN_MESSAGE =
+  'Token missing. Could not authenticate client. If you have token credentials, see modal.com/docs/reference/modal.config for setup help. If you are a new user, register an account at modal.com, then run `modal token new`.'
 
 const app = (over: Partial<ModalApp>): ModalApp => ({
   id: 'ap-x',
@@ -136,6 +151,36 @@ test('app list parsing survives missing fields, styling and junk', () => {
   expect(parseAppList('[]')).toEqual([])
   expect(parseAppList('Token missing. Could not authenticate client.')).toBeNull()
   expect(parseAppList('{"not": "a list"}')).toBeNull()
+})
+
+test('the reason in a Rich error box: frame stripped, wrapped lines joined, cut at a sentence end', () => {
+  expect(errorBox(TOKEN_BOX)).toEqual([TOKEN_MESSAGE])
+  expect(reasonText(TOKEN_BOX)).toBe('Token missing. Could not authenticate client.')
+  expect(fullReason(TOKEN_BOX)).toBe(TOKEN_MESSAGE)
+  // With FORCE_COLOR rich colours the frame.
+  const styled = TOKEN_BOX.split('\n')
+    .map(line => line.replace(/^(.)/, '\u001b[31m$1\u001b[0m').replace(/(.)$/, '\u001b[31m$1\u001b[0m'))
+    .join('\n')
+  expect(reasonText(styled)).toBe('Token missing. Could not authenticate client.')
+  // A gRPC error: the status in the title, details in a second paragraph; the usage lines before the box are not the reason.
+  const grpc =
+    "Usage: modal app list [OPTIONS]\nTry 'modal app list -h' for help.\n╭─ Error: Permission denied ─╮\n│ Workspace is suspended.    │\n│                            │\n│ Details: contact support.  │\n╰────────────────────────────╯\n"
+  expect(errorBox(grpc)).toEqual(['Workspace is suspended.', 'Details: contact support.'])
+  expect(reasonText(grpc)).toBe('Workspace is suspended.')
+  expect(fullReason(grpc)).toBe('Workspace is suspended. Details: contact support.')
+  // No box: the first line worth showing, as before, cut the same way.
+  expect(errorBox('Connection refused\n')).toBeNull()
+  expect(reasonText('Connection refused\n')).toBe('Connection refused')
+  expect(reasonText(`${TOKEN_MESSAGE}\n`)).toBe('Token missing. Could not authenticate client.')
+  expect(reasonText('')).toBe('no output')
+  // A traceback's box is not the error; the line after it is.
+  const traceback =
+    '╭─ Traceback (most recent call last) ─╮\n│ File "app.py", line 1              │\n╰─────────────────────────────────────╯\nValueError: bad config\n'
+  expect(reasonText(traceback)).toBe('ValueError: bad config')
+  // Short text stays whole; long text ends at a sentence, or at an ellipsis when it has none.
+  expect(brief('Token not found')).toBe('Token not found')
+  expect(brief('a'.repeat(130))).toBe(`${'a'.repeat(119)}…`)
+  expect(brief(`${'a'.repeat(100)}. ${'b'.repeat(50)}.`)).toBe(`${'a'.repeat(100)}.`)
 })
 
 test('timestamps: Modal JSON, ISO, epoch seconds and ms', () => {
@@ -250,9 +295,7 @@ test('spend from billing report JSON, and the failures told apart', () => {
   expect(lacksBilling("Usage: modal [OPTIONS] COMMAND [ARGS]...\nTry 'modal -h' for help.")).toBe(true)
   expect(lacksBilling('Usage: modal billing report [OPTIONS]\nNo such option: --for')).toBe(false)
   expect(lacksBilling("Usage: modal billing [OPTIONS] COMMAND [ARGS]...\nNo such command 'report'.")).toBe(false)
-  expect(firstLine(noBilling)).toBe("No such command 'billing'.")
-  expect(isAuthProblem('Token missing. Could not authenticate client.')).toBe(true)
-  expect(isAuthProblem('Connection refused')).toBe(false)
+  expect(reasonText(noBilling)).toBe("No such command 'billing'.")
   expect(isMissingModule('/usr/bin/python3: No module named modal')).toBe(true)
   expect(
     wantsYes("Are you sure? [y/N]:\nAborted: no interactive terminal detected. Rerun with --yes (-y) to skip confirmation."),
@@ -267,6 +310,7 @@ test('the /modal summary', () => {
     problem: null,
     apps,
     polledAt: NOW,
+    retryAt: null,
     spendToday: null,
     spendNote: 'this Modal CLI has no `billing report` command',
   }
@@ -285,11 +329,22 @@ test('the /modal summary', () => {
   )
 
   // The pane's notice: the problem, the wait, the reason it is not watching, or no rows.
-  expect(paneNotice({ ...meter, apps: [], problem: 'no Modal CLI found' }, true)).toBe('modal-meter is silent: no Modal CLI found.')
-  expect(paneNotice({ ...meter, polledAt: null }, true)).toBe('Reading Modal…')
-  expect(paneNotice({ ...meter, polledAt: null }, false)).toMatch(/^Not watching Modal: this project does not use it\. \/modal starts watching/)
-  expect(paneNotice({ ...meter, apps: [] }, true)).toBe('No Modal apps running or deployed.')
-  expect(paneNotice(meter, true)).toBeNull()
+  expect(paneNotice({ ...meter, apps: [], problem: 'no Modal CLI found' }, true, NOW)).toBe('modal-meter is silent: no Modal CLI found.')
+  expect(paneNotice({ ...meter, polledAt: null }, true, NOW)).toBe('Reading Modal…')
+  expect(paneNotice({ ...meter, polledAt: null }, false, NOW)).toMatch(/^Not watching Modal: this project does not use it\. \/modal starts watching/)
+  expect(paneNotice({ ...meter, apps: [] }, true, NOW)).toBe('No Modal apps running or deployed.')
+  expect(paneNotice(meter, true, NOW)).toBeNull()
+
+  // The CLI refused: its reason and the wait, counting down, in the pane and on the status line; /modal adds the retry hint.
+  const refused: ModalMeter = { ...meter, apps: [], problem: 'Token missing. Could not authenticate client.', retryAt: NOW + 60 * MIN }
+  expect(retryText('Token missing. Could not authenticate client.', NOW + 60 * MIN, NOW)).toBe(
+    'Modal: Token missing. Could not authenticate client. · retry in 60m',
+  )
+  expect(paneNotice(refused, true, NOW + 59 * MIN + 1)).toBe('Modal: Token missing. Could not authenticate client. · retry in 1m')
+  expect(paneNotice(refused, true, NOW + 61 * MIN)).toBe('Modal: Token missing. Could not authenticate client. · retry in 1m')
+  expect(summaryText(refused, {}, NOW, 0)).toBe(
+    'Modal: Token missing. Could not authenticate client. · retry in 60m (`python3 -m modal app list` failed; /modal retries at once)',
+  )
 })
 
 test('a Bash command that runs modal, and project files that name it', () => {
@@ -333,9 +388,38 @@ test('the poll interval doubles after a slow or timed-out probe, and comes back 
   expect(isEnoent('Token missing.')).toBe(false)
 })
 
+test('the shared cache answers a tick while fresh or while a refusal is waited out; /modal retries a refusal at once; a stop polls', () => {
+  const entry = (over: Partial<Omit<ModalCache, 'data'>> = {}, data: Partial<ModalShared> = {}): ModalCache => ({
+    ts: NOW - 10_000,
+    by: 'sess-b',
+    intervalMs: MIN,
+    ...over,
+    data: { cli: ['modal'], problem: null, apps: [], retryAt: null, spendToday: null, spendNote: null, spendAskedAt: null, spendWaitMs: 5 * MIN, billingUnsupportedAt: null, ...data },
+  })
+  expect(servesPoll('tick', entry(), NOW)).toBe(true)
+  expect(servesPoll('asked', entry(), NOW)).toBe(true)
+  expect(servesPoll('changed', entry(), NOW)).toBe(false)
+  expect(servesPoll('tick', entry({ ts: NOW - 2 * MIN }), NOW)).toBe(false)
+  expect(servesPoll('asked', entry({ ts: NOW - 2 * MIN }), NOW)).toBe(false)
+
+  const refused = entry({ ts: NOW - 2 * MIN }, { problem: 'Token not found', retryAt: NOW + 50 * MIN })
+  expect(servesPoll('tick', refused, NOW)).toBe(true)
+  expect(servesPoll('tick', refused, NOW + 50 * MIN - 1)).toBe(true)
+  expect(servesPoll('tick', refused, NOW + 50 * MIN)).toBe(false)
+  expect(servesPoll('asked', refused, NOW)).toBe(false)
+  expect(servesPoll('changed', refused, NOW)).toBe(false)
+  // Fresh and refused: /modal still retries at once.
+  expect(servesPoll('asked', entry({}, { problem: 'Token not found', retryAt: NOW + 60 * MIN }), NOW)).toBe(false)
+  expect(servesPoll('tick', entry({}, { problem: 'Token not found', retryAt: NOW + 60 * MIN }), NOW)).toBe(true)
+})
+
 test('the shared cache, lock and project records are read defensively', () => {
-  const shared = { cli: ['modal'], problem: null, apps: [], spendToday: null, spendNote: null, spendAskedAt: null, spendWaitMs: 300_000, billingUnsupportedAt: null }
+  const shared = { cli: ['modal'], problem: null, apps: [], spendToday: null, spendNote: null, spendAskedAt: null, spendWaitMs: 300_000, billingUnsupportedAt: null, retryAt: null }
   expect(isCacheEntry({ ts: NOW, by: 'sess-b', intervalMs: MIN, data: shared })).toBe(true)
+  expect(isCacheEntry({ ts: NOW, by: 'sess-b', intervalMs: MIN, data: { ...shared, retryAt: NOW + MIN } })).toBe(true)
+  // A cache written before retryAt existed (modal-meter 0.2) still counts.
+  expect(isCacheEntry({ ts: NOW, by: 'sess-b', intervalMs: MIN, data: { ...shared, retryAt: undefined } })).toBe(true)
+  expect(isCacheEntry({ ts: NOW, by: 'sess-b', intervalMs: MIN, data: { ...shared, retryAt: 'soon' } })).toBe(false)
   expect(isCacheEntry({ ts: NOW, by: 'sess-b', intervalMs: MIN, data: { ...shared, apps: 'nope' } })).toBe(false)
   expect(isCacheEntry({ ts: 'yesterday', by: 'sess-b', intervalMs: MIN, data: shared })).toBe(false)
   expect(isCacheEntry(null)).toBe(false)

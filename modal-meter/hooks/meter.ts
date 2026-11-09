@@ -1,4 +1,4 @@
-import type { ModalApp, ModalAppKind, ModalCache, ModalLock, ModalMeter, ModalProject, ModalTracked } from '../types'
+import type { ModalApp, ModalAppKind, ModalCache, ModalLock, ModalMeter, ModalPoll, ModalProject, ModalTracked } from '../types'
 
 const ANSI = /\u001b\[[0-9;?]*[A-Za-z]/g
 
@@ -290,24 +290,93 @@ export const isTimeout = (output: string): boolean => /still running after/i.tes
 /** The command could not start: the executable is not there. */
 export const isEnoent = (output: string): boolean => /\bENOENT\b|not found in \$?PATH/i.test(output)
 
-/** The CLI could not authenticate: no profile or token set up on this machine. */
-export const isAuthProblem = (output: string): boolean =>
-  /token|authenticat|credential|not logged in|modal setup|no modal profile|profile.*not found/i.test(output)
-
 /** A Modal that runs at all but has no `modal` package behind `python3 -m modal`. */
 export const isMissingModule = (output: string): boolean => /no module named '?modal/i.test(output)
 
 /** `modal app stop` refused to run without a terminal and asked for `--yes` (Modal 1.4.2 on). */
 export const wantsYes = (output: string): boolean => /--yes\b/.test(output)
 
-/** The first line worth showing from a failed command's output. */
-export const firstLine = (output: string): string =>
-  output
-    .replace(ANSI, '')
-    .split('\n')
-    .map(line => line.replace(/^[\s│╭╰─┃|]+|[\s│╮╯─┃|]+$/g, '').trim())
-    .find(line => line && !/^(error|usage:.*|try '.*)$/i.test(line))
-    ?.slice(0, 160) ?? 'no output'
+/** The frame of a rich panel, in its rounded, square, heavy or double box style. */
+const BOX_TOP = /^[╭┌┏╔]/
+const BOX_SIDE = /^[│┃║]/
+const BOX_BOTTOM = /^[╰└┗╚]/
+
+type Panel = { title: string; paragraphs: string[] }
+
+/** The paragraphs of a panel's inner lines: `│ text │` stripped, the lines rich wrapped joined again, a blank line between paragraphs. */
+const boxParagraphs = (lines: readonly string[]): string[] => {
+  const paragraphs: string[] = []
+  let paragraph: string[] = []
+  for (const line of lines) {
+    const text = line.replace(/^[│┃║]|[│┃║]$/g, '').trim()
+    if (text !== '') {
+      paragraph.push(text)
+    } else if (paragraph.length > 0) {
+      paragraphs.push(paragraph.join(' '))
+      paragraph = []
+    }
+  }
+  return paragraph.length > 0 ? [...paragraphs, paragraph.join(' ')] : paragraphs
+}
+
+/**
+ * The rich panels in a command's output (`╭─ Error ─╮`, lines between `│`, `╰─╯`), each as its
+ * title and its paragraphs, and the lines outside any panel. A panel cut short (truncated output)
+ * still counts.
+ */
+const panels = (output: string): { boxes: Panel[]; rest: string[] } => {
+  const lines = output.replace(ANSI, '').split('\n').map(line => line.trim())
+  const boxes: Panel[] = []
+  const rest: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? ''
+    if (!BOX_TOP.test(line)) {
+      rest.push(line)
+      continue
+    }
+    let end = i + 1
+    while (end < lines.length && !BOX_BOTTOM.test(lines[end] ?? '')) {
+      end++
+    }
+    const title = line.replace(/^[╭┌┏╔─━═\s]+|[╮┐┓╗─━═\s]+$/g, '')
+    boxes.push({ title, paragraphs: boxParagraphs(lines.slice(i + 1, end).filter(one => BOX_SIDE.test(one))) })
+    i = end
+  }
+  return { boxes, rest }
+}
+
+/** The paragraphs of the error box in a failed command's output, the first that is not a traceback's; null when there is none. */
+export const errorBox = (output: string): string[] | null =>
+  panels(output).boxes.find(box => box.paragraphs.length > 0 && !/traceback/i.test(box.title))?.paragraphs ?? null
+
+/** The first line outside any box worth showing: not blank, not a bare `Error`, a usage line or a `Try …` hint. */
+const plainLine = (output: string): string | undefined =>
+  panels(output)
+    .rest.map(line => line.replace(/^[\s│╭╰─┃|]+|[\s│╮╯─┃|]+$/g, '').trim())
+    .find(line => line && !/^(error|usage:.*|try '.*|traceback.*)$/i.test(line))
+
+/** A reason shown on the status line, in a toast or in the pane is cut past this many characters. */
+export const REASON_MAX = 120
+
+/** `text` whole when it fits `max` characters; else its sentences that fit; else its first characters and an ellipsis. */
+export const brief = (text: string, max = REASON_MAX): string => {
+  if (text.length <= max) {
+    return text
+  }
+  const head = text.slice(0, max + 1)
+  const end = Math.max(head.lastIndexOf('. '), head.lastIndexOf('! '), head.lastIndexOf('? '))
+  return end > 0 ? head.slice(0, end + 1) : `${text.slice(0, max - 1).trimEnd()}…`
+}
+
+/**
+ * Why a command failed, short enough to show: its error box's first paragraph (`Token missing.
+ * Could not authenticate client.` from the box Modal prints with no token, never the frame's own
+ * lines), else the first line worth showing.
+ */
+export const reasonText = (output: string): string => brief(errorBox(output)?.[0] ?? plainLine(output) ?? 'no output')
+
+/** Everything a failed command said about it, for the debug log: the box's paragraphs in one line, else the first line worth showing. */
+export const fullReason = (output: string): string => errorBox(output)?.join(' ') ?? plainLine(output) ?? 'no output'
 
 /** The UTC day of `ms`, `2026-10-07`: the day Modal's `--for today` reports. */
 export const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10)
@@ -315,10 +384,16 @@ export const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0
 export const NOT_WATCHING =
   'Not watching Modal: this project does not use it. /modal starts watching for this session; the alwaysPoll option watches every project.'
 
+/** `60m`, `1m`: the minutes left until `ms` have passed, rounded up, never below one. */
+export const inMinutes = (ms: number): string => `${Math.max(1, Math.ceil(ms / 60_000))}m`
+
+/** `Modal: Token missing. Could not authenticate client. · retry in 60m`: the CLI's refusal and the wait left, for the status line and the pane. */
+export const retryText = (problem: string, retryAt: number, now: number): string => `Modal: ${problem} · retry in ${inMinutes(retryAt - now)}`
+
 /** The pane's one-line notice: why there are no rows, or that they are on their way; null when there are rows to show. */
-export const paneNotice = (meter: ModalMeter, isWatching: boolean): string | null => {
+export const paneNotice = (meter: ModalMeter, isWatching: boolean, now: number): string | null => {
   if (meter.problem !== null) {
-    return `modal-meter is silent: ${meter.problem}.`
+    return meter.retryAt !== null ? retryText(meter.problem, meter.retryAt, now) : `modal-meter is silent: ${meter.problem}.`
   }
   if (meter.polledAt === null) {
     return isWatching ? 'Reading Modal…' : NOT_WATCHING
@@ -334,7 +409,9 @@ export const summaryText = (
   budget: number,
 ): string => {
   if (meter.problem !== null) {
-    return `modal-meter is silent: ${meter.problem}.`
+    return meter.retryAt !== null
+      ? `${retryText(meter.problem, meter.retryAt, now)} (\`${meter.cli ?? 'modal'} app list\` failed; /modal retries at once)`
+      : `modal-meter is silent: ${meter.problem}.`
   }
   if (meter.polledAt === null) {
     return 'modal-meter has not read Modal yet.'
@@ -367,6 +444,21 @@ export const nextInterval = (current: number, configured: number, elapsedMs: num
     return Math.max(configured, Math.min(current * 2, MAX_INTERVAL_MS))
   }
   return isOk ? configured : current
+}
+
+/**
+ * Whether the shared cache answers a poll instead of the CLI: a tick takes it while it is fresh
+ * (younger than its writer's interval) or while a CLI's refusal is waited out (`retryAt` ahead);
+ * the person's /modal takes a fresh answer unless it is that refusal, which it retries at once;
+ * a stop this session made always polls.
+ */
+export const servesPoll = (mode: ModalPoll, cached: ModalCache, now: number): boolean => {
+  const isFresh = now - cached.ts < cached.intervalMs
+  const isWaiting = cached.data.retryAt !== null && now < cached.data.retryAt
+  if (mode === 'tick') {
+    return isFresh || isWaiting
+  }
+  return mode === 'asked' && isFresh && !isWaiting
 }
 
 /** Words that run the word after them, so `python3 -m modal`, `uv run modal` and `sudo modal` count as modal. */
@@ -420,7 +512,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> => typeof va
 const isNumberOrNull = (value: unknown): boolean => value === null || typeof value === 'number'
 const isStringOrNull = (value: unknown): boolean => value === null || typeof value === 'string'
 
-/** The shared cache file read back: `{ ts, by, intervalMs, data }` in the shapes the meter writes. */
+/** The shared cache file read back: `{ ts, by, intervalMs, data }` in the shapes the meter writes (`retryAt` missing before 0.3). */
 export const isCacheEntry = (value: unknown): value is ModalCache =>
   isRecord(value) &&
   typeof value.ts === 'number' &&
@@ -434,7 +526,8 @@ export const isCacheEntry = (value: unknown): value is ModalCache =>
   isStringOrNull(value.data.spendNote) &&
   isNumberOrNull(value.data.spendAskedAt) &&
   typeof value.data.spendWaitMs === 'number' &&
-  isNumberOrNull(value.data.billingUnsupportedAt)
+  isNumberOrNull(value.data.billingUnsupportedAt) &&
+  (value.data.retryAt === undefined || isNumberOrNull(value.data.retryAt))
 
 /** The shared lock file read back: `{ ts, by }`. */
 export const isLock = (value: unknown): value is ModalLock => isRecord(value) && typeof value.ts === 'number' && typeof value.by === 'string'

@@ -78,6 +78,17 @@ const APPS = (): Row[] => [
 const NO_BILLING =
   "Usage: python -m modal [OPTIONS] COMMAND [ARGS]...\nTry 'python -m modal -h' for help.\n╭─ Error ─────────────────────╮\n│ No such command 'billing'.  │\n╰─────────────────────────────╯\n"
 
+/** `modal app list --json` with no token, as Modal 1.2 prints it to a pipe: one paragraph wrapped in a Rich error box. */
+const TOKEN_BOX =
+  '╭─ Error ──────────────────────────────────────────────────────────────────────╮\n' +
+  '│ Token missing. Could not authenticate client. If you have token credentials, │\n' +
+  '│ see modal.com/docs/reference/modal.config for setup help. If you are a new   │\n' +
+  '│ user, register an account at modal.com, then run `modal token new`.          │\n' +
+  '╰──────────────────────────────────────────────────────────────────────────────╯\n'
+/** The box's message, unwrapped. */
+const TOKEN_MESSAGE =
+  'Token missing. Could not authenticate client. If you have token credentials, see modal.com/docs/reference/modal.config for setup help. If you are a new user, register an account at modal.com, then run `modal token new`.'
+
 /** The same apps as another session's poll left them in the shared cache. */
 const SHARED: ModalShared = {
   cli: ['modal'],
@@ -91,6 +102,7 @@ const SHARED: ModalShared = {
   spendAskedAt: NOW - 60 * MIN,
   spendWaitMs: 5 * MIN,
   billingUnsupportedAt: NOW - 60 * MIN,
+  retryAt: null,
 }
 
 /** The shared cache file: written ten seconds ago by another session, unless said otherwise. */
@@ -438,24 +450,115 @@ test('with no Modal CLI the meter stays silent, and /modal says why', { timeoutM
   await ui.unmount()
 })
 
-test('with no Modal profile or token the meter stays silent', { timeoutMs: 30_000 }, async ($, on) => {
+test('a CLI that refuses app list shows the reason from its error box, logs it once, and is left alone for an hour', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = world(on)
-  w.list = {
-    exitCode: 1,
-    stderr:
-      'Token missing. Could not authenticate client. If you have token credentials, see modal.com/docs/reference/modal.config for setup help.\n',
-  }
-  w.apps = w.apps.map(row => ({ ...row, Tasks: '9', 'Created at': '2026-10-06 00:00:00-07:00' }))
+  w.list = { exitCode: 1, stderr: TOKEN_BOX }
   await $.session.start(START)
   await clock.settle()
-  await clock.advance(5 * MIN)
 
-  expect(w.statuses.every(text => text === undefined)).toBe(true)
+  // The message, not the frame's first line, on the status line and in the pane; the whole box once in the debug log.
+  expect(ran(w, 'modal app list --json')).toBe(1)
+  expect(w.statuses.at(-1)).toBe('Modal: Token missing. Could not authenticate client. · retry in 60m')
+  expect(w.logs.filter(line => line.includes('app list` failed'))).toEqual([
+    `modal-meter: \`modal app list\` failed; polling again in 60m or when /modal runs: ${TOKEN_MESSAGE}`,
+  ])
+  expect(written(w).data).toMatchObject({ problem: 'Token missing. Could not authenticate client.', retryAt: NOW + 60 * MIN, apps: [] })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: 'modal-meter', surface, component: 'Pane', requestId: 'modal-meter', props: PANE_PROPS })
+    expect(await ui.find({ type: 'Text', text: 'Modal: Token missing. Could not authenticate client. · retry in 60m' })).toBeDefined()
+    expect(await ui.findAll({ type: 'Button' })).toEqual([])
+    await ui.unmount()
+  }
+
+  // Fifty-nine minutes of ticks: the status counts down, the CLI is not run again, nothing is logged again.
+  await clock.advance(59 * MIN)
+  expect(ran(w, 'modal app list --json')).toBe(1)
+  expect(w.statuses.at(-1)).toBe('Modal: Token missing. Could not authenticate client. · retry in 1m')
+  expect(w.logs.filter(line => line.includes('app list` failed'))).toHaveLength(1)
   expect(w.toasts).toEqual([])
-  expect((await $.command.run(typed('modal', ''))).text).toBe(
-    'modal-meter is silent: Modal has no profile or token set up on this machine (run `modal setup`).',
+
+  // The hour over, the next tick tries again; a token set up since, the apps are back.
+  w.list = null
+  await clock.advance(MIN)
+  expect(ran(w, 'modal app list --json')).toBe(2)
+  expect(w.statuses.at(-1)).toBe('Modal: 1 running (2 containers) · 1 deployed')
+  expect(written(w).data.retryAt).toBeNull()
+})
+
+test('/modal retries a refusing CLI at once, and the hour starts over', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  w.list = { exitCode: 1, stderr: TOKEN_BOX }
+  await $.session.start(START)
+  await clock.settle()
+  expect(ran(w, 'modal app list --json')).toBe(1)
+
+  // Half a minute on the cache is fresh, but the person asked: the CLI runs again, refuses again, and the wait starts over.
+  await clock.advance(30_000)
+  const shown = await $.command.run(typed('modal', ''))
+  expect(ran(w, 'modal app list --json')).toBe(2)
+  expect(shown.text).toBe('Modal: Token missing. Could not authenticate client. · retry in 60m (`modal app list` failed; /modal retries at once)')
+  expect(written(w).data.retryAt).toBe(NOW + 30_000 + 60 * MIN)
+  expect(w.opened).toEqual(['modal-meter'])
+
+  // Ticks wait; /modal again, with a token set up since, brings the apps back.
+  await clock.advance(5 * MIN)
+  expect(ran(w, 'modal app list --json')).toBe(2)
+  w.list = null
+  const again = await $.command.run(typed('modal', ''))
+  expect(ran(w, 'modal app list --json')).toBe(3)
+  expect(again.text?.split('\n')[0]).toBe('Modal: 1 running (2 containers) · 1 deployed (read with `modal`)')
+  expect(w.statuses.at(-1)).toBe('Modal: 1 running (2 containers) · 1 deployed')
+  expect(written(w).data.retryAt).toBeNull()
+})
+
+test("another session's refusal in the shared cache is shown here, and the CLI is not run before its retry time", { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  w.files.set(
+    CACHE,
+    cacheFile({ ts: NOW - 2 * MIN }, { problem: 'Token missing. Could not authenticate client.', apps: [], retryAt: NOW + 58 * MIN }),
   )
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(cliRuns(w)).toEqual([])
+  expect(w.statuses.at(-1)).toBe('Modal: Token missing. Could not authenticate client. · retry in 58m')
+  expect(w.logs.some(line => line.includes('app list` failed'))).toBe(false)
+  const ui = await $.ui.mount({ plugin: 'modal-meter', surface: 'terminal', component: 'Pane', requestId: 'modal-meter', props: PANE_PROPS })
+  expect(await ui.find({ type: 'Text', text: 'Modal: Token missing. Could not authenticate client. · retry in 58m' })).toBeDefined()
+  expect(await ui.findAll({ type: 'Button' })).toEqual([])
+  await ui.unmount()
+
+  await clock.advance(10 * MIN)
+  expect(cliRuns(w)).toEqual([])
+  expect(w.statuses.at(-1)).toBe('Modal: Token missing. Could not authenticate client. · retry in 48m')
+
+  // At the retry time this session polls, with the CLI the cache named.
+  await clock.advance(48 * MIN)
+  expect(cliRuns(w)).toEqual(['modal app list --json'])
+  expect(w.statuses.at(-1)).toBe('Modal: 1 running (2 containers) · 1 deployed')
+})
+
+test('cliRetryMinutes sets the wait; a failure without a box shows its first line, no JSON says so', { options: { cliRetryMinutes: 5 }, timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  w.list = { exitCode: 1, stderr: 'Connection refused\n' }
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.statuses.at(-1)).toBe('Modal: Connection refused · retry in 5m')
+
+  await clock.advance(4 * MIN)
+  expect(ran(w, 'modal app list --json')).toBe(1)
+  expect(w.statuses.at(-1)).toBe('Modal: Connection refused · retry in 1m')
+
+  // An exit of 0 with no JSON list is a refusal too.
+  w.list = 'nothing to see\n'
+  await clock.advance(MIN)
+  expect(ran(w, 'modal app list --json')).toBe(2)
+  expect(w.statuses.at(-1)).toBe('Modal: `modal app list --json` printed no JSON list · retry in 5m')
+  expect(w.logs.filter(line => line.includes('app list` failed'))).toHaveLength(2)
 })
 
 test('falls back from modal to python3 -m modal', { timeoutMs: 30_000 }, async ($, on) => {
@@ -764,6 +867,8 @@ test('a timed-out app list doubles the interval too, and says so once', { timeou
   expect(ran(w, 'modal app list --json')).toBe(1)
   expect(w.statuses.at(-1)).toBeUndefined()
   expect(w.logs.filter(line => line.includes('polling'))).toEqual(['modal-meter: polling every 2m (app list timed out)'])
+  // Slow is not refusing: the interval doubles, and no hour's wait is started.
+  expect(written(w).data.retryAt).toBeNull()
 
   w.list = null
   await clock.advance(MIN)
