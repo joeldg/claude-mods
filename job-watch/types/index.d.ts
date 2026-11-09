@@ -25,6 +25,13 @@ export type Job = {
   baseline: { at: number; done: number } | null
   /** This job's own stall threshold (jobs_watch quietMinutes); null uses the setting. */
   stallMs: number | null
+  /**
+   * When a stall of this job was last toasted: its first, a reminder while that silence went on, or
+   * the stall again after it wrote and lapsed. Null until the first. Stall toasts are at least
+   * stallReminderMinutes apart (after the first, none with 0), so a job that writes a line every 25
+   * minutes is told of once an hour, not once per lapse.
+   */
+  stallToastAt: number | null
   state: JobState
   finishedAt: number | null
   /** The exit code a background task's output file ends with (`[exited with code N]`); null until then. */

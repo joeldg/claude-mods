@@ -636,3 +636,132 @@ test('a wait loop that ps would show never goes stalled, and costs no ps probe',
     /^Wait until about 1:46 to check the Gemi… \[t2\]: finished \d+s ago \(exit 0\) · timer/,
   )
 })
+
+/**
+ * A downloader as a background task: its process alive and one line in its log, added at the clock's
+ * zero. Left alone it is silent: the first tick reads the log, so its silence counts from 10 s and it
+ * is stalled from 10m20s.
+ */
+const startDownload = async ($: any, on: On, w: World): Promise<void> => {
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'd1' },
+    text: 'Command running in background with ID: d1. Output is being written to: /tmp/s/tasks/d1.output.',
+  }))
+  w.ps = ' 4242 python fetch.py --all\n'
+  w.log = 'fetching archive part 3\n'
+  w.size = 24
+  await $.tool.call({ tool: 'Bash', command: 'python fetch.py --all', run_in_background: true, description: 'download the archive' })
+}
+
+test('a job silent for hours is toasted once when it stalls, then reminded hourly: not once per poll, nor per ps flap', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  await startDownload($, on, w)
+
+  await clock.advance(600_000)
+  expect(w.toasts).toEqual([])
+  expect(w.statuses.at(-1)).toBe('jobs: 1 running')
+  await clock.advance(30_000)
+  expect(w.toasts).toEqual(['download the archive has written nothing for 10m'])
+  expect(w.statuses.at(-1)).toBe('jobs: 1 stalled')
+
+  // ps times out for ten minutes: with no process to check the job shows quiet; when ps answers again
+  // it shows stalled, with no second toast: the silence is the same one.
+  w.psFails = true
+  await clock.advance(600_000)
+  expect(w.statuses.at(-1)).toBe('jobs: 1 quiet')
+  w.psFails = false
+  await clock.advance(600_000)
+  expect(w.statuses.at(-1)).toBe('jobs: 1 stalled')
+  expect(w.toasts).toHaveLength(1)
+
+  // An hour after the first toast a reminder says how long the silence has lasted; another an hour on.
+  await clock.advance(2_370_000)
+  expect(w.toasts).toHaveLength(1)
+  await clock.advance(30_000)
+  expect(w.toasts.at(-1)).toBe('download the archive still silent after 70m')
+  await clock.advance(3_600_000)
+  expect(w.toasts).toEqual([
+    'download the archive has written nothing for 10m',
+    'download the archive still silent after 70m',
+    'download the archive still silent after 2h10m',
+  ])
+
+  // Three hours in, jobs_list and the status line still say stalled, and for how long.
+  await clock.advance(2_970_000)
+  expect(w.toasts).toHaveLength(3)
+  expect(await tool($, 'jobs_list')).toMatch(
+    /^download the archive \[d1\]: stalled \(no output for 10m\) · last output 3h00m ago\n  log \/tmp\/s\/tasks\/d1\.output\n/,
+  )
+  expect(w.statuses.at(-1)).toBe('jobs: 1 stalled')
+
+  // Its finish is announced as ever.
+  w.ps = ''
+  await clock.advance(10_000)
+  expect(w.toasts.at(-1)).toBe('download the archive finished after 3h00m: fetching archive part 3')
+  expect(w.statuses.at(-1)).toBeUndefined()
+})
+
+test('a line ends the silence; a job that lapses again within the hour of its toast is told of at the hour, not at once', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  await startDownload($, on, w)
+  await clock.advance(630_000)
+  expect(w.toasts).toEqual(['download the archive has written nothing for 10m'])
+
+  // At 40 min it writes a line: running again, with nothing to say.
+  await clock.advance(1_770_000)
+  w.log = 'fetching archive part 4\n'
+  w.size = 48
+  await clock.advance(10_000)
+  expect(w.statuses.at(-1)).toBe('jobs: 1 running')
+  expect(w.toasts).toHaveLength(1)
+
+  // Silent from there: stalled from 50m20s, but toasted an hour after the first toast, at 70m20s, with
+  // how long this silence has lasted; then the hourly reminder.
+  await clock.advance(1_790_000)
+  expect(w.statuses.at(-1)).toBe('jobs: 1 stalled')
+  expect(w.toasts).toHaveLength(1)
+  await clock.advance(30_000)
+  expect(w.toasts.at(-1)).toBe('download the archive has written nothing for 30m')
+  await clock.advance(6_570_000)
+  expect(w.toasts).toEqual([
+    'download the archive has written nothing for 10m',
+    'download the archive has written nothing for 30m',
+    'download the archive still silent after 1h30m',
+  ])
+})
+
+test('with stallReminderMinutes 0 a job is toasted for its first stall only, however long or often it is silent', { ...SLOW, options: { stallReminderMinutes: 0 } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  await startDownload($, on, w)
+  await clock.advance(2_400_000)
+  expect(w.toasts).toEqual(['download the archive has written nothing for 10m'])
+  // A line at 40 min, then silence to the third hour: no reminder, and the lapse is not news either.
+  w.log = 'fetching archive part 4\n'
+  w.size = 48
+  await clock.advance(8_400_000)
+  expect(w.toasts).toHaveLength(1)
+  expect(w.statuses.at(-1)).toBe('jobs: 1 stalled')
+  // A finish is still announced.
+  w.ps = ''
+  await clock.advance(10_000)
+  expect(w.toasts.at(-1)).toBe('download the archive finished after 3h00m: fetching archive part 4')
+})
+
+test('a job that writes a line every 25 minutes is toasted for its first stall, then at most hourly, not once per lapse', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  await startDownload($, on, w)
+  // One more line every 25 minutes, as a downloader prints one per large file: silent for 15 of every 25.
+  Object.defineProperty(w, 'size', { get: () => 24 + Math.floor(clock.now() / 1_500_000) })
+  await clock.advance(10_800_000)
+  // Seven lapses in three hours (at 10, 35, 60, 85, 110, 135 and 160 min), three toasts: the first, then
+  // the first stalled tick an hour or more after the last toast (70m20s and 135m10s).
+  expect(w.toasts).toEqual([
+    'download the archive has written nothing for 10m',
+    'download the archive has written nothing for 20m',
+    'download the archive has written nothing for 10m',
+  ])
+})

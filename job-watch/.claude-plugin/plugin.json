@@ -1,6 +1,6 @@
 {
   "name": "job-watch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Live pane of long-running jobs (training, downloads, extractions): progress, ETA, stalls and finishes, read from their logs with no model calls; jobs_list / jobs_watch / jobs_unwatch tools so Claude follows jobs instead of polling them.",
   "author": {
     "name": "joeldg"
@@ -12,6 +12,12 @@
       "title": "Stall after (minutes)",
       "description": "A job whose log has not grown for this long is flagged as stalled (if its process is alive) or quiet.",
       "default": 10
+    },
+    "stallReminderMinutes": {
+      "type": "number",
+      "title": "Stall reminder every (minutes)",
+      "description": "After a job's first stall toast, the least time before it is toasted about again: a reminder while it stays silent (\"still silent after 2h10m\"), or its stall once more after it wrote a line and went quiet again. 0 toasts each job's first stall only.",
+      "default": 60
     },
     "pollSeconds": {
       "type": "number",

@@ -98,13 +98,22 @@ const shorten = (text: string, max: number): string =>
 
 type Config = {
   stallMs: number
+  /** The least time between one job's stall toasts after its first; 0 toasts the first stall only. */
+  stallReminderMs: number
   pollMs: number
   keepDoneMs: number
   autoOpen: boolean
   wantedDisks: string[]
 }
 
-let config: Config = { stallMs: 600_000, pollMs: 10_000, keepDoneMs: 7_200_000, autoOpen: true, wantedDisks: [] }
+let config: Config = {
+  stallMs: 600_000,
+  stallReminderMs: 3_600_000,
+  pollMs: 10_000,
+  keepDoneMs: 7_200_000,
+  autoOpen: true,
+  wantedDisks: [],
+}
 let timer: { cancel: () => void } | null = null
 /** The pass over the jobs now running, shared by whoever asks for one meanwhile. */
 let inflight: Promise<void> | null = null
@@ -211,6 +220,7 @@ const normalize = (job: Job): Job => ({
   ...job,
   pid: job.pid ?? null,
   stallMs: job.stallMs ?? null,
+  stallToastAt: job.stallToastAt ?? null,
   exitCode: job.exitCode ?? null,
   isTimer: job.isTimer ?? false,
 })
@@ -304,14 +314,19 @@ async function readJob($: Engine, job: Job, now: number, ps: string | null): Pro
 }
 
 /**
- * Toasts a finish or a stall the tick it first shows; false for a quick command, which leaves
- * unannounced. A timer is kept but never announced: its end is Claude's cue, not the person's.
+ * Toasts a finish the tick it first shows, and a stall when the log first falls silent past the
+ * threshold. From then on the job's stall toasts come at most every stallReminderMs (never, with 0):
+ * `still silent after 2h10m` while that silence goes on, `has written nothing for 20m` once it has
+ * written a line and lapsed again. So a downloader that prints one line per file, every 25 minutes,
+ * is told of once an hour, not once per lapse; and a `ps` that fails for a while (the job shows quiet,
+ * then stalled again) re-toasts nothing. Null for a quick command, which leaves unannounced. A timer
+ * is kept but never announced: its end is Claude's cue, not the person's.
  */
-function announce($: Engine, was: Job, job: Job, now: number): boolean {
+function announce($: Engine, was: Job, job: Job, now: number): Job | null {
   if (job.state === 'done' && was.state !== 'done') {
     const lived = now - job.addedAt
     if (lived < SHORT_MS) {
-      return false
+      return null
     }
     if (!job.isTimer) {
       $.ui.toast(`${job.label} finished after ${formatDuration(lived / 1000)}: ${shorten(job.lastLine, 80)}`, {
@@ -319,12 +334,24 @@ function announce($: Engine, was: Job, job: Job, now: number): boolean {
       })
     }
   }
-  if (job.state === 'stalled' && was.state !== 'stalled' && !job.isTimer) {
-    $.ui.toast(`${job.label} has written nothing for ${formatDuration((job.stallMs ?? config.stallMs) / 1000)}`, {
-      timeoutMs: 10_000,
-    })
+  if (job.state !== 'stalled' || job.isTimer) {
+    return job
   }
-  return true
+  const isReminderDue =
+    job.stallToastAt !== null && config.stallReminderMs > 0 && now - job.stallToastAt >= config.stallReminderMs
+  if (job.stallToastAt !== null && !isReminderDue) {
+    return job
+  }
+  const quietFor = formatDuration((now - Math.max(job.changedAt, job.addedAt)) / 1000)
+  // Nothing written since the last toast: the same silence goes on. Else it wrote, and has lapsed again.
+  const text =
+    job.stallToastAt === null
+      ? `has written nothing for ${formatDuration((job.stallMs ?? config.stallMs) / 1000)}`
+      : job.changedAt < job.stallToastAt
+        ? `still silent after ${quietFor}`
+        : `has written nothing for ${quietFor}`
+  $.ui.toast(`${job.label} ${text}`, { timeoutMs: 10_000 })
+  return { ...job, stallToastAt: now }
 }
 
 /** Whether a finished or quiet job has stayed its keepDoneMinutes (a timer, its minute) and leaves the list. */
@@ -347,8 +374,8 @@ async function pass($: Engine) {
 
   const fresh: Job[] = []
   for (const job of list) {
-    const next = await readJob($, job, now, ps)
-    if (announce($, job, next, now) && !isExpired(next, now)) {
+    const next = announce($, job, await readJob($, job, now, ps), now)
+    if (next && !isExpired(next, now)) {
       fresh.push(next)
     }
   }
@@ -397,6 +424,7 @@ async function addJob($: Engine, job: NewJob) {
     ...job,
     pid: job.pid ?? null,
     stallMs: job.stallMs ?? null,
+    stallToastAt: null,
     isTimer: job.isTimer ?? false,
     seenAlive: false,
     addedAt: now,
@@ -633,6 +661,7 @@ function timerRow($: Engine, { Box, Text, Button }: Kit, job: Job, now: number) 
 export const register: Register = (on, options) => {
   config = {
     stallMs: Math.max(1, Number(options.stallMinutes ?? 10)) * 60_000,
+    stallReminderMs: Math.max(0, Number(options.stallReminderMinutes ?? 60)) * 60_000,
     pollMs: Math.max(2, Number(options.pollSeconds ?? 10)) * 1000,
     keepDoneMs: Math.max(1, Number(options.keepDoneMinutes ?? 120)) * 60_000,
     autoOpen: options.autoOpen !== false,
