@@ -1,12 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelCompleteResult, PluginOptions, Register } from 'claude-code'
 
-import type { DocsAudit, DocsAuditFile, DocsAuditItem, DocsFinding, DocsItemState } from '../types'
+import type { DocsAudit, DocsAuditFile, DocsAuditItem, DocsCacheEntry, DocsCorpusCache, DocsFinding, DocsItemState, DocsParagraphDigest } from '../types'
 import {
   DAY_MS,
   MAX_LOOKUPS,
   datedSeries,
   deadReferences,
+  duplicateDigests,
   duplicateParagraphs,
   findReferences,
   finishedPlan,
@@ -15,6 +16,7 @@ import {
   orphanCandidates,
   orphanFinding,
   oversized,
+  paragraphDigests,
   parseBlame,
   sortFindings,
   splitLines,
@@ -60,6 +62,8 @@ const STALE_AUDIT_MS = 15 * 60_000
 const LOOKUP_CHUNK = 200
 /** How many entries a walk of the tree (when rg is missing) reads at most. */
 const WALK_CAP = 50_000
+/** How long the write-time cache trusts its list of the docs before listing them again. */
+const RELIST_MS = 10 * 60_000
 
 const CONTEXT_TEXT = [
   'Docs here are gardened (docs-gardener): reference docs describe the current state of the project, nothing more.',
@@ -109,6 +113,7 @@ export function configFrom(options: PluginOptions): Config {
 }
 
 const audit = atom({ plugin: 'docs-gardener', key: 'audit' } as const, null)
+const corpusCache = atom({ plugin: 'docs-gardener', key: 'corpus' } as const, null)
 
 let config: Config = DEFAULTS
 /** Whether an identifier occurs in the code, by `root\0identifier`, with when it was looked up. */
@@ -401,6 +406,45 @@ async function checkPath($: Engine, raw: string): Promise<string> {
   return describeFindings(found, targetName(target))
 }
 
+/**
+ * The paragraph digests of every doc in scope, for a write's duplicate check, from the per-repo cache: the docs
+ * are listed again every RELIST_MS, a doc is read again only when its mtime or size changed since it was
+ * digested, and the written doc's entry comes from the text just written. The audit reads the docs itself.
+ */
+async function corpusDigests($: Engine, root: string, written: Doc, now: number): Promise<Map<string, readonly DocsParagraphDigest[]>> {
+  const known = await read($, corpusCache)
+  const cached: DocsCorpusCache = known !== null && known.root === root ? known : { root, listedAt: 0, files: [], entries: {} }
+  const isListed = cached.listedAt > 0 && now - cached.listedAt < RELIST_MS
+  const listedAt = isListed ? cached.listedAt : now
+  let files = isListed ? cached.files : await listDocs($, root)
+  if (!files.includes(written.file)) {
+    files = [...files, written.file].sort()
+  }
+  const entries: Record<string, DocsCacheEntry> = {}
+  for (const file of files) {
+    if (file === written.file) {
+      continue
+    }
+    const stat = await $.fs.stat(`${root}/${file}`).catch(() => null)
+    if (stat === null || stat.kind !== 'file') {
+      continue
+    }
+    const old = cached.entries[file]
+    if (old !== undefined && old.mtimeMs === stat.mtimeMs && old.size === stat.size) {
+      entries[file] = old
+      continue
+    }
+    const text = await readText($, `${root}/${file}`)
+    if (text !== null) {
+      entries[file] = { mtimeMs: stat.mtimeMs, size: stat.size, paragraphs: paragraphDigests(text) }
+    }
+  }
+  const own = await $.fs.stat(`${root}/${written.file}`).catch(() => null)
+  entries[written.file] = { mtimeMs: own?.mtimeMs ?? 0, size: own?.size ?? written.text.length, paragraphs: paragraphDigests(written.text) }
+  await update($, corpusCache, () => ({ root, listedAt, files, entries }))
+  return new Map(files.map(file => [file, entries[file]?.paragraphs ?? []]))
+}
+
 /** The note for Claude after a Write or Edit of a doc in scope: dead references, duplicates, stale markers. */
 async function writeNote($: Engine, filePath: string, content: string | null): Promise<string | null> {
   const root = await repoRoot($)
@@ -414,9 +458,9 @@ async function writeNote($: Engine, filePath: string, content: string | null): P
     return null
   }
   const doc: Doc = { file: rel, text }
-  const corpus = [...(await loadCorpus($, root)).filter(other => other.file !== rel), doc].sort(byFile)
   const now = await $.clock.now()
-  const found = [...(await deadReferencesOf($, root, doc)), ...duplicateParagraphs(corpus, rel), ...(await staleMarkersOf($, root, doc, now))]
+  const digests = await corpusDigests($, root, doc, now)
+  const found = [...(await deadReferencesOf($, root, doc)), ...duplicateDigests(digests, rel), ...(await staleMarkersOf($, root, doc, now))]
   return contextNote(rel, found, config.staleDays)
 }
 

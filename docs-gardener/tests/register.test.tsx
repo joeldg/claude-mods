@@ -1,13 +1,18 @@
 import { expect, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 
 import {
   CLAUDE_MD,
   DIGEST_DAYS,
+  DOCS,
   GUIDE,
   MODEL,
+  NOW,
+  PARAGRAPH,
   README,
   ROLLUP,
   ROOT,
+  RUNBOOK,
   SURFACES,
   docs,
   mountPane,
@@ -18,6 +23,15 @@ import {
 
 const SLOW = { timeoutMs: 30_000 }
 const TOOL = 'mcp__docs-gardener__docs_check'
+
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: string; context?: string[] }
+const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
 
 const README_NOTE =
   'docs-gardener: README.md references scripts/build_data.sh, which no longer exists (line 3); runs make lint, which the Makefile has no target for (line 4); names load_widgets, which is not found in the code (line 5); the "Known issues" paragraph duplicates docs/runbook.md:7; 1 TODO is older than 30 days.'
@@ -48,7 +62,7 @@ const AUDIT_STARTED =
 test('a Write of a doc in scope gets a context note with what the checks found; the write itself stands', SLOW, async ($, on) => {
   const w = world(on)
   await start($)
-  const ran = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
+  const ran = await callTool($, { tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
   expect(ran.deny).toBeUndefined()
   expect(ran.context).toEqual([README_NOTE])
   expect(w.files.get('README.md')).toBe(README)
@@ -60,7 +74,7 @@ test('a Write of a doc in scope gets a context note with what the checks found; 
 test('an Edit is checked on the file as it stands after the edit', SLOW, async ($, on) => {
   const w = world(on)
   await start($)
-  const ran = await $.tool.call({
+  const ran = await callTool($, {
     tool: 'Edit',
     file_path: `${ROOT}/docs/guide.md`,
     old_string: 'Back to',
@@ -73,11 +87,11 @@ test('an Edit is checked on the file as it stands after the edit', SLOW, async (
 test('a clean doc, a doc out of scope and a file that is not markdown get no note', SLOW, async ($, on) => {
   const w = world(on)
   await start($)
-  const clean = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/CLAUDE.md`, content: CLAUDE_MD })
+  const clean = await callTool($, { tool: 'Write', file_path: `${ROOT}/CLAUDE.md`, content: CLAUDE_MD })
   expect(clean.context ?? []).toEqual([])
-  const vendored = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/node_modules/pkg/README.md`, content: 'See `scripts/missing.sh`.\n' })
+  const vendored = await callTool($, { tool: 'Write', file_path: `${ROOT}/node_modules/pkg/README.md`, content: 'See `scripts/missing.sh`.\n' })
   expect(vendored.context ?? []).toEqual([])
-  const code = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/src/x.py`, content: '# `scripts/missing.sh`\n' })
+  const code = await callTool($, { tool: 'Write', file_path: `${ROOT}/src/x.py`, content: '# `scripts/missing.sh`\n' })
   expect(code.context ?? []).toEqual([])
   expect(w.writes).toEqual([])
   // Only the clean doc was checked at all: one listing of the docs, and nothing to look up in it.
@@ -85,10 +99,49 @@ test('a clean doc, a doc out of scope and a file that is not markdown get no not
   expect(w.ran.filter(line => line.startsWith('rg --no-filename') || line.startsWith('git blame'))).toEqual([])
 })
 
+test('the write-time check keeps a corpus cache: unchanged docs are not read again, changed ones once', SLOW, async ($, on) => {
+  const w = world(on)
+  await start($)
+  const docsRead = () => w.reads.filter(path => path.endsWith('.md'))
+  const listings = () => w.ran.filter(line => line.startsWith('rg --files')).length
+  // The first write reads every other doc in scope once.
+  const first = await callTool($, { tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
+  expect(first.context).toEqual([README_NOTE])
+  expect(docsRead().sort()).toEqual(Object.keys(DOCS).filter(path => path !== 'README.md').sort())
+  expect(listings()).toBe(1)
+  // The second write reads none of them: their mtimes are what the cache saw.
+  w.reads.length = 0
+  const second = await callTool($, { tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
+  expect(second.context).toEqual([README_NOTE])
+  expect(docsRead()).toEqual([])
+  expect(listings()).toBe(1)
+  // A doc edited elsewhere is read again once its mtime changed, and the note follows it.
+  w.files.set('docs/runbook.md', RUNBOOK.replace(PARAGRAPH, 'The runbook paragraph was rewritten.'))
+  w.mtimes['docs/runbook.md'] = NOW + 5_000
+  w.reads.length = 0
+  const third = await callTool($, { tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
+  expect(docsRead()).toEqual(['docs/runbook.md'])
+  expect(third.context).toEqual([README_NOTE.replace('; the "Known issues" paragraph duplicates docs/runbook.md:7', '')])
+  // A write updates the doc's own entry: README without the paragraph, then the runbook duplicates nothing.
+  await callTool($, { tool: 'Write', file_path: `${ROOT}/README.md`, content: README_WITHOUT_DUPLICATE })
+  w.reads.length = 0
+  const runbook = await callTool($, { tool: 'Write', file_path: `${ROOT}/docs/runbook.md`, content: RUNBOOK })
+  expect(docsRead()).toEqual([])
+  expect(runbook.context ?? []).toEqual([])
+  // After ten minutes the docs are listed again, and a doc added meanwhile is read and seen.
+  w.files.set('docs/new.md', `# New\n\n${PARAGRAPH}\n`)
+  w.reads.length = 0
+  await w.clock.advance(10 * 60_000)
+  const fourth = await callTool($, { tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
+  expect(listings()).toBe(2)
+  expect(docsRead()).toEqual(['docs/new.md'])
+  expect(fourth.context?.[0]).toContain('the "Known issues" paragraph duplicates docs/new.md:3')
+})
+
 test('writeTimeChecks off: writes are left alone', { ...SLOW, options: { writeTimeChecks: false } }, async ($, on) => {
   const w = world(on)
   await start($)
-  const ran = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
+  const ran = await callTool($, { tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
   expect(ran.context ?? []).toEqual([])
   expect(w.ran).toEqual([])
 })
@@ -105,7 +158,7 @@ test('the docs_check tool is registered in front, allowed without asking, and li
   w.denied = [TOOL]
   expect(await $.tool.check({ tool: TOOL, input: { path: 'README.md' } })).toMatchObject({ decision: 'deny', reason: 'denied in settings' })
 
-  const file = await $.tool.call({ tool: TOOL, path: 'README.md' })
+  const file = await callTool($, { tool: TOOL, path: 'README.md' })
   expect(file.result).toBe(
     [
       'docs-gardener: 4 findings in README.md',
@@ -115,16 +168,16 @@ test('the docs_check tool is registered in front, allowed without asking, and li
       '  L14 stale-marker: TODO open for 45 days: - TODO: document the retry policy — Do it and record the outcome, or drop the line.',
     ].join('\n'),
   )
-  const folder = String((await $.tool.call({ tool: TOOL, path: `${ROOT}/docs` })).result)
+  const folder = String((await callTool($, { tool: TOOL, path: `${ROOT}/docs` })).result)
   expect(folder.split('\n')[0]).toBe('docs-gardener: 5 findings in docs/')
   expect(folder).toContain('docs/runbook.md\n  L7 duplicate-paragraph: the "Known issues" paragraph duplicates README.md:9')
   expect(folder).toContain('docs/old-design.md\n  orphan: no doc links to it; untouched for 95 days while src/config.py changed')
   expect(folder).toContain('docs/plans/2026-09-plan.md\n  L2 finished-plan: a finished plan (status: done) — git mv docs/plans/2026-09-plan.md docs/archive/2026-09-plan.md')
   expect(folder).toContain('docs/digests/\n  dated-series: 12 dated files, 2026-10-01 to 2026-10-12 — Roll them up into docs/digests/ROLLUP-2026-42.md and keep the dailies.')
   expect(folder).toContain('docs/big.md\n  oversized: 450 lines, over the 400-line limit')
-  expect((await $.tool.call({ tool: TOOL, path: 'CLAUDE.md' })).result).toBe('docs-gardener: nothing to fix in CLAUDE.md.')
-  expect((await $.tool.call({ tool: TOOL, path: 'docs/nope.md' })).result).toBe('docs-gardener: docs/nope.md is not a markdown file or folder in scope.')
-  expect((await $.tool.call({ tool: TOOL, path: 'node_modules/pkg/README.md' })).result).toBe(
+  expect((await callTool($, { tool: TOOL, path: 'CLAUDE.md' })).result).toBe('docs-gardener: nothing to fix in CLAUDE.md.')
+  expect((await callTool($, { tool: TOOL, path: 'docs/nope.md' })).result).toBe('docs-gardener: docs/nope.md is not a markdown file or folder in scope.')
+  expect((await callTool($, { tool: TOOL, path: 'node_modules/pkg/README.md' })).result).toBe(
     'docs-gardener: node_modules/pkg/README.md is not a markdown file or folder in scope.',
   )
   expect(w.completes).toEqual([])

@@ -1,4 +1,4 @@
-import type { DocsFinding, DocsFindingKind } from '../types'
+import type { DocsFinding, DocsFindingKind, DocsParagraphDigest } from '../types'
 import { ENTRY_DOCS, baseName, datedName, folderOf, joinPath, normalisePath, rollupPath } from './scope'
 
 /** One doc as the checks read it: its path relative to the repo root and its text. */
@@ -290,6 +290,27 @@ export function paragraphs(text: string): Paragraph[] {
 /** Emphasis marks dropped, whitespace collapsed, case folded: two renderings of one paragraph compare equal. */
 export const normaliseParagraph = (text: string): string => text.toLowerCase().replace(/[`*_~]/g, '').replace(/\s+/g, ' ').trim()
 
+/** A stable hash of a normalised paragraph: two FNV-1a-style streams over the text, as 16 hex characters. */
+export function hashOf(text: string): string {
+  let a = 0x811c9dc5
+  let b = 0x5bd1e995
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    a = Math.imul(a ^ code, 0x01000193) >>> 0
+    b = Math.imul(b ^ code, 0x27d4eb2f) >>> 0
+  }
+  return `${a.toString(16).padStart(8, '0')}${b.toString(16).padStart(8, '0')}`
+}
+
+export type ParagraphDigest = DocsParagraphDigest
+
+/** The doc's paragraphs long enough to count as duplicates, each as the hash of its normalised text. */
+export function paragraphDigests(text: string): ParagraphDigest[] {
+  return paragraphs(text)
+    .filter(paragraph => paragraph.text.length >= MIN_PARAGRAPH)
+    .map(paragraph => ({ hash: hashOf(normaliseParagraph(paragraph.text)), line: paragraph.start, heading: paragraph.heading }))
+}
+
 type Occurrence = { file: string; line: number; heading: string | null }
 
 const duplicate = (hit: Occurrence, other: Occurrence): DocsFinding =>
@@ -302,19 +323,15 @@ const duplicate = (hit: Occurrence, other: Occurrence): DocsFinding =>
   )
 
 /**
- * Paragraphs of MIN_PARAGRAPH characters or more that another file has too. Over a corpus each copy after
- * the first (in the docs' order) is flagged against the first; for `only`, that file's copies are flagged
- * against whichever other file has them.
+ * Paragraphs another file has too, over digests by file (the map in the docs' order). Each copy after the
+ * first is flagged against the first; for `only`, that file's copies are flagged against whichever other
+ * file has them.
  */
-export function duplicateParagraphs(docs: readonly Doc[], only?: string): DocsFinding[] {
+export function duplicateDigests(byFile: ReadonlyMap<string, readonly ParagraphDigest[]>, only?: string): DocsFinding[] {
   const groups = new Map<string, Occurrence[]>()
-  for (const doc of docs) {
-    for (const paragraph of paragraphs(doc.text)) {
-      if (paragraph.text.length < MIN_PARAGRAPH) {
-        continue
-      }
-      const key = normaliseParagraph(paragraph.text)
-      groups.set(key, [...(groups.get(key) ?? []), { file: doc.file, line: paragraph.start, heading: paragraph.heading }])
+  for (const [file, digests] of byFile) {
+    for (const digest of digests) {
+      groups.set(digest.hash, [...(groups.get(digest.hash) ?? []), { file, line: digest.line, heading: digest.heading }])
     }
   }
   const out: DocsFinding[] = []
@@ -339,6 +356,11 @@ export function duplicateParagraphs(docs: readonly Doc[], only?: string): DocsFi
     }
   }
   return sortFindings(out)
+}
+
+/** Paragraphs of MIN_PARAGRAPH characters or more that another doc has too, over the docs' texts. */
+export function duplicateParagraphs(docs: readonly Doc[], only?: string): DocsFinding[] {
+  return duplicateDigests(new Map(docs.map(doc => [doc.file, paragraphDigests(doc.text)])), only)
 }
 
 /** The in-repo targets of the doc's `](path)` links, resolved from its folder, anchors dropped. */

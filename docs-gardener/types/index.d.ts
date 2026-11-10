@@ -72,9 +72,28 @@ export type DocsAudit = {
   isApplyAll: boolean
 }
 
+/** One paragraph of a doc as the write-time cache keeps it: a hash of its normalised text, its line and heading. */
+export type DocsParagraphDigest = { hash: string; line: number; heading: string | null }
+
+/** One doc's long paragraphs, with the stat its text was read at. */
+export type DocsCacheEntry = { mtimeMs: number; size: number; paragraphs: DocsParagraphDigest[] }
+
+/**
+ * The write-time cache of the docs in scope: the docs are listed again every ten minutes, a doc is read
+ * again only when its mtime or size changed, and a write of a doc fills its own entry from the text written.
+ */
+export type DocsCorpusCache = {
+  root: string
+  /** When the docs were last listed, in `$.clock.now()` milliseconds. */
+  listedAt: number
+  /** The docs in scope as last listed, relative to the root, sorted. */
+  files: string[]
+  entries: Record<string, DocsCacheEntry>
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'docs-gardener': { audit: DocsAudit | null }
+    'docs-gardener': { audit: DocsAudit | null; corpus: DocsCorpusCache | null }
   }
   /** The mod's own tool, named here so its hooks and tests type before the engine's table lists it. */
   interface McpToolInputs {

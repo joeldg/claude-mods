@@ -79,6 +79,10 @@ export type World = {
   files: Map<string, string>
   /** Every path written, relative to the root, in order. */
   writes: string[]
+  /** Every path read through `$.fs.read`, relative to the root, in order. */
+  reads: string[]
+  /** Each file's modification time; NOW when unlisted. A write (the plugin's or the engine's) moves it on. */
+  mtimes: Record<string, number>
   /** Every process run, as `argv.join(' ')`. */
   ran: string[]
   /** `git blame` ages in days by file and 1-based line; 1 day when unlisted; null for a line not committed yet. */
@@ -151,6 +155,8 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
     clock,
     files: new Map(Object.entries({ ...docs, ...CODE })),
     writes: [],
+    reads: [],
+    mtimes: {},
     ran: [],
     blame: { 'README.md': { 13: 3, 14: 45 } },
     touched: { 'docs/old-design.md': NOW - 95 * DAY },
@@ -180,8 +186,12 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
   on('prompt.context', (_$, e) => ({ blocks: e.blocks }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
 
+  const touched = (rel: string): void => {
+    w.mtimes[rel] = (w.mtimes[rel] ?? NOW) + 1_000
+  }
   on('fs.read', (_$, e) => {
     const text = w.files.get(relOf(e.path))
+    w.reads.push(relOf(e.path))
     return text === undefined ? { deny: `ENOENT: no such file or directory, open '${e.path}'` } : { value: text }
   })
   on('fs.exists', (_$, e) => {
@@ -191,7 +201,7 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
   on('fs.stat', (_$, e) => {
     const rel = relOf(e.path).replace(/\/$/, '')
     if (w.files.has(rel)) {
-      return { value: { kind: 'file' as const, size: (w.files.get(rel) ?? '').length, mtimeMs: NOW, isLink: false } }
+      return { value: { kind: 'file' as const, size: (w.files.get(rel) ?? '').length, mtimeMs: w.mtimes[rel] ?? NOW, isLink: false } }
     }
     return isDirOf(w.files, rel) ? { value: { kind: 'dir' as const, size: 0, mtimeMs: NOW, isLink: false } } : { deny: `ENOENT: ${e.path}` }
   })
@@ -215,6 +225,7 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
   on('fs.write', (_$, e) => {
     w.files.set(relOf(e.path), e.text)
     w.writes.push(relOf(e.path))
+    touched(relOf(e.path))
     return { value: undefined }
   })
 
@@ -316,6 +327,7 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
       const text = w.files.get(rel) ?? ''
       w.files.set(rel, e.replace_all ? text.split(e.old_string).join(e.new_string) : text.replace(e.old_string, e.new_string))
     }
+    touched(rel)
     return { result: {}, text: `wrote ${e.file_path}` }
   })
 
