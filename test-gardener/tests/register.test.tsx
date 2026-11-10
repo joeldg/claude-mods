@@ -9,7 +9,7 @@ const LEDGER_ROOT = '/home/dev/ledger'
 const TOOL = 'mcp__test-gardener__tests_neighbourhood'
 
 const BAND = {
-  hasSurvey: false,
+  isCollapsed: false, hasSurvey: false,
   isWorking: false,
   maxRows: 10,
   bodyColumns: 120,
