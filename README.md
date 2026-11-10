@@ -324,12 +324,25 @@ Keeps a project's markdown true to the project: docs describe the current state,
 
 Settings: `model` (`claude-haiku-5-5`), `maxModelFiles` (20), `staleDays` (30), `orphanDays` (60), `seriesRollupAt` (10), `maxLines` (400), `excludeGlobs` (empty), `writeTimeChecks` (on).
 
+## test-gardener
+
+Makes Claude consolidate tests instead of appending them: suites were growing by near-copies (same body, one constant changed), dump files, and new files for modules that already had one.
+
+- After Claude writes or edits a test file (Python `test_*.py`, `*_test.py` or anything under `tests/`/`test/`; JS/TS `*.test.*`, `*.spec.*`, `__tests__/`; Go `_test.go`; Ruby `_spec.rb`; Rust `tests/`), the write goes through and Claude then reads a note on what it did to the suite, e.g. `test-gardener: tests/test_meshes.py already covers mesh_build with 19 tests (also tests/test_mesh_build_resume.py, 6). New test test_build_resume_twice is a near-duplicate of test_build_resume in tests/test_meshes.py (0.85) — parametrize them. This file now has 41 tests (guideline 40): split by concern or extend an existing file instead of starting another.` Nothing on a clean write. It never blocks and never edits a test.
+- The module under test comes from the file name (`test_foo.py` → foo, `foo.test.ts` → foo, `foo_test.go` → foo) and the file's imports; the files covering it are those named after it or importing it. Near-duplicates: each body normalised (comments dropped, strings and numbers replaced, identifiers kept), 5-token shingles, Jaccard similarity of 0.6 or more (`nearDuplicate`); 0.9 is a clone; two tests of one file identical once normalised are a parametrize candidate. New tests are compared only against the file's own tests and its neighbours', bodies cut at 400 tokens.
+- Before writing tests, Claude has a `tests_neighbourhood` tool (in the prompt's tool list, allowed without asking): `module` or `path` → the files covering the module and what they test, or that none does and where the test files live. A three-line block in the first message tells it to call the tool first and to extend or parametrize rather than append.
+- `/tests audit [path]` is the consolidation report: clones and near-duplicates (`ripwire <tests dir> --clones` when ripwire is on PATH, merged with the mod's own findings; else its own pairwise pass over files of the same module), parametrize candidates, files over 40 tests (`maxTestsPerFile`), skipped/xfail tests, tests whose module no longer exists. The Tab suggestion asks Claude to run the suite, do the top consolidations, and run it again.
+- A band above the prompt when the branch adds more than 25 tests (`bigBranchTests`) or 800 lines of tests (`bigBranchLines`) against the default branch: `38 tests · +1,204 lines of tests on this branch → /tests audit`, with Hide; refreshed after a turn at most every 2 minutes; only in git repositories.
+- The scan (test names, modules, imports) is cached in `~/.claude/test-gardener/<repo-hash>.json` by path and mtime; files are listed with `rg --files` (gitignore honoured). Makes no model calls (`modelReview` is reserved, not yet implemented).
+
+Settings: `nearDuplicate` (0.6), `maxTestsPerFile` (40), `bigBranchTests` (25), `bigBranchLines` (800), `modelReview` (off; not yet).
+
 ## Loading
 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`. Put mod-monitor first so it sees the others; `CLAUDE_CODE_PLUGIN_DIR_WATCH` makes desktop sessions pick up edits and show mod failures:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1", "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/mod-monitor:~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall:~/Projects/claude-mods/stall-alarm:~/Projects/claude-mods/usage-meter:~/Projects/claude-mods/docs-gardener" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1", "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/mod-monitor:~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall:~/Projects/claude-mods/stall-alarm:~/Projects/claude-mods/usage-meter:~/Projects/claude-mods/docs-gardener:~/Projects/claude-mods/test-gardener" } }
   ```
 
 ## Checking
@@ -355,5 +368,6 @@ claude plugin validate mod-monitor && claude plugin test mod-monitor
 claude plugin validate stall-alarm && claude plugin test stall-alarm
 claude plugin validate usage-meter && claude plugin test usage-meter
 claude plugin validate docs-gardener && claude plugin test docs-gardener
+claude plugin validate test-gardener && claude plugin test test-gardener
 (cd recall/engine && /usr/bin/python3 -m unittest)
 ```
