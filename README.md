@@ -309,12 +309,27 @@ A machine-wide meter of the plan's rolling 5-hour usage, so the burn shows befor
 
 Settings: `windowHours` (5), `refreshSeconds` (30), `warnAt` (80).
 
+## docs-gardener
+
+Keeps a project's markdown true to the project: docs describe the current state, and dead references, stale notes, duplicated and stray text are gardened out. **Only `/docs audit` calls a model** (one Haiku call per flagged file); everything else is deterministic.
+
+- **Scope:** every `.md` under the repo root (`rg --files`, hidden folders included, gitignored files skipped; a walk of the tree when rg is missing) minus `node_modules`, `third_party`, `vendor`, `.venv`, `venv`, `site-packages`, `dist`, `build`, `.git` and anything in `excludeGlobs`. `CLAUDE.md` and `AGENTS.md` are docs too.
+- **The checks:** `dead-reference` (a backticked path that exists neither from the root nor from the doc's folder, a `make` target the Makefile lacks, a backticked identifier of 6+ characters that `rg -w` finds nowhere in the code; 40 lookups per doc, answers cached 10 minutes per repo), `stale-marker` (`TODO`/`FIXME`/`TBD`/`XXX` lines and unchecked `- [ ]` items whose last commit, by `git blame`, is `staleDays` old), `duplicate-paragraph` (200+ characters shared with another doc, formatting aside), `orphan` (no doc links to it, untouched for `orphanDays` while a path it references changed since), `dated-series` (a folder with more than `seriesRollupAt` files named with a date), `oversized` (over `maxLines`), `finished-plan` (a front-matter `status: done` or an "Outcome" section).
+- **As Claude writes:** after each `Write` or `Edit` of a doc in scope, Claude reads what the checks found on the new text: `docs-gardener: README.md references scripts/build_data.sh, which no longer exists (line 3); the "Known issues" paragraph duplicates docs/runbook.md:7; 1 TODO is older than 30 days.` Never blocks, never edits (`writeTimeChecks`).
+- **For Claude:** the `docs_check` tool (in the prompt's tool list, no permission prompt) lists the findings for a file or folder, and a three-line context block says the docs are gardened, to call `docs_check` before editing a doc, and to keep passing thoughts in the notes file rather than in reference docs.
+- **`/docs audit [path|--changed] [--apply]`:** the checks over the scope (`--changed`: the docs changed on the branch against the default branch plus the working tree; on the default branch itself, the last 7 days), then one model call per flagged or changed file (`model`, at most `maxModelFiles` per run, the most flagged first; never called when nothing is flagged) with the file, its findings and a fact sheet (repo name, top-level folders, last 20 commit subjects, default branch), asking for a JSON edit plan: per section a verdict `current|update|stray|duplicate|delete`, a reason and the replacement text; malformed items are ignored. The **Docs audit** pane lists each file's findings and plan items with **Apply** and **Skip** per item and **Apply all** per file. Apply rewrites or removes exactly that section (a heading's section or a line range, found again by its first line if earlier edits moved it) and writes the file; the diff of each applied change goes to the debug log. `--apply` applies every item as it arrives, without the pane, and leaves a summary line in the transcript, for a scheduled run.
+- **Series and archive policy:** a dated series gets a roll-up written to `<folder>/ROLLUP-<yyyy-ww>.md` beside the dailies, which are never deleted (the pane says so); a finished plan is suggested for `docs/archive/` as a `git mv` command in the findings and the plan, never moved by the mod. Deletions happen only through a plan item you apply.
+- `/docs check <path>` prints the findings alone, `/docs show` reopens the last audit, `/docs help`.
+- A weekly routine on the default branch can run `/docs audit --changed --apply`: the docs changed in the last 7 days plus the working tree get the checks and the model plan, every item is applied unattended, the summary lands in the transcript and the diffs in the debug log.
+
+Settings: `model` (`claude-haiku-5-5`), `maxModelFiles` (20), `staleDays` (30), `orphanDays` (60), `seriesRollupAt` (10), `maxLines` (400), `excludeGlobs` (empty), `writeTimeChecks` (on).
+
 ## Loading
 
 - **One session from a terminal:** pass `--plugin-dir` once per mod, e.g. `claude --plugin-dir ~/Projects/claude-mods/job-watch --plugin-dir ~/Projects/claude-mods/pr-autopilot`
 - **Every session, including the desktop app:** add to `~/.claude/settings.json`. Put mod-monitor first so it sees the others; `CLAUDE_CODE_PLUGIN_DIR_WATCH` makes desktop sessions pick up edits and show mod failures:
   ```json
-  { "env": { "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1", "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/mod-monitor:~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall:~/Projects/claude-mods/stall-alarm:~/Projects/claude-mods/usage-meter" } }
+  { "env": { "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1", "CLAUDE_CODE_PLUGIN_DIRS": "~/Projects/claude-mods/mod-monitor:~/Projects/claude-mods/job-watch:~/Projects/claude-mods/machine-guard:~/Projects/claude-mods/repo-brief:~/Projects/claude-mods/slicer-handoff:~/Projects/claude-mods/pr-autopilot:~/Projects/claude-mods/routine-watch:~/Projects/claude-mods/modal-meter:~/Projects/claude-mods/second-opinion:~/Projects/claude-mods/downloads-drop:~/Projects/claude-mods/dev-servers:~/Projects/claude-mods/standing-orders:~/Projects/claude-mods/effort-router:~/Projects/claude-mods/secret-guard:~/Projects/claude-mods/recall:~/Projects/claude-mods/stall-alarm:~/Projects/claude-mods/usage-meter:~/Projects/claude-mods/docs-gardener" } }
   ```
 
 ## Checking
@@ -339,5 +354,6 @@ claude plugin validate recall && claude plugin test recall
 claude plugin validate mod-monitor && claude plugin test mod-monitor
 claude plugin validate stall-alarm && claude plugin test stall-alarm
 claude plugin validate usage-meter && claude plugin test usage-meter
+claude plugin validate docs-gardener && claude plugin test docs-gardener
 (cd recall/engine && /usr/bin/python3 -m unittest)
 ```

@@ -1,0 +1,59 @@
+{
+  "name": "docs-gardener",
+  "version": "0.1.0",
+  "description": "Keeps a project's markdown true to the project: deterministic checks (dead references, stale TODOs, duplicated paragraphs, orphans, dated series, oversized files, finished plans) at write time and from a docs_check tool, and /docs audit, which adds a model edit plan you apply item by item from a pane, or all at once for a scheduled run. Only /docs audit calls a model (one Haiku call per flagged file by default).",
+  "author": {
+    "name": "joeldg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Audit model",
+      "description": "The model /docs audit asks for an edit plan, one call per flagged or changed file, billed to your usage. Nothing else in the mod calls a model.",
+      "default": "claude-haiku-5-5"
+    },
+    "maxModelFiles": {
+      "type": "number",
+      "title": "Files per audit sent to the model",
+      "description": "The most files one /docs audit asks the model about; the rest keep their deterministic findings only.",
+      "default": 20
+    },
+    "staleDays": {
+      "type": "number",
+      "title": "Days before a TODO is stale",
+      "description": "A TODO, FIXME, TBD, XXX line or an unchecked - [ ] item whose last commit (git blame) is older than this is flagged.",
+      "default": 30
+    },
+    "orphanDays": {
+      "type": "number",
+      "title": "Days before an unlinked doc is an orphan",
+      "description": "A doc no other doc links to is flagged when it has not been touched for this long while a path it references changed since.",
+      "default": 60
+    },
+    "seriesRollupAt": {
+      "type": "number",
+      "title": "Dated files per folder before a roll-up",
+      "description": "A folder holding more than this many files named with a date (2026-10-07) is offered a roll-up; the dailies are never deleted.",
+      "default": 10
+    },
+    "maxLines": {
+      "type": "number",
+      "title": "Lines before a doc is oversized",
+      "description": "A doc with more lines than this is flagged as oversized: split it by topic or move the reference material out.",
+      "default": 400
+    },
+    "excludeGlobs": {
+      "type": "string",
+      "title": "Extra paths to leave alone",
+      "description": "Globs relative to the repo root, separated by commas, such as docs/generated/**, CHANGELOG.md. node_modules, third_party, vendor, .venv, venv, site-packages, dist, build and .git are always left out.",
+      "default": ""
+    },
+    "writeTimeChecks": {
+      "type": "boolean",
+      "title": "Check docs as Claude writes them",
+      "description": "After each Write or Edit of a markdown file in scope, run the deterministic checks on it and tell Claude what they found. Never blocks or edits.",
+      "default": true
+    }
+  }
+}
