@@ -64,6 +64,8 @@ const LOOKUP_CHUNK = 200
 const WALK_CAP = 50_000
 /** How long the write-time cache trusts its list of the docs before listing them again. */
 const RELIST_MS = 10 * 60_000
+/** Docs per `git ls-files` call. */
+const LS_FILES_CHUNK = 500
 
 const CONTEXT_TEXT = [
   'Docs here are gardened (docs-gardener): reference docs describe the current state of the project, nothing more.',
@@ -114,6 +116,7 @@ export function configFrom(options: PluginOptions): Config {
 
 const audit = atom({ plugin: 'docs-gardener', key: 'audit' } as const, null)
 const corpusCache = atom({ plugin: 'docs-gardener', key: 'corpus' } as const, null)
+const blameFailed = atom({ plugin: 'docs-gardener', key: 'blameFailed' } as const, null)
 
 let config: Config = DEFAULTS
 /** Whether an identifier occurs in the code, by `root\0identifier`, with when it was looked up. */
@@ -121,7 +124,7 @@ let lookups = new Map<string, { has: boolean; at: number }>()
 /** The repo root per working directory. */
 let roots = new Map<string, string>()
 
-type Ran = { ok: boolean; out: string; err: string }
+type Ran = { ok: boolean; out: string; err: string; isTruncated: boolean }
 type Request = { path: string | null; isChanged: boolean; isApply: boolean }
 /** A path the person or Claude named, placed in the repo: a doc, or a folder (`''` for the root). */
 type Target = { rel: string; isFolder: boolean }
@@ -142,9 +145,9 @@ function debug($: Engine, line: string): void {
 async function run($: Engine, argv: readonly string[], cwd: string, timeoutMs: number): Promise<Ran> {
   try {
     const out = await $.process.run(argv, { cwd, timeoutMs })
-    return { ok: out.exitCode === 0, out: out.stdout, err: out.stderr }
+    return { ok: out.exitCode === 0, out: out.stdout, err: out.stderr, isTruncated: out.isStdoutTruncated }
   } catch (error) {
-    return { ok: false, out: '', err: messageOf(error) }
+    return { ok: false, out: '', err: messageOf(error), isTruncated: false }
   }
 }
 
@@ -220,6 +223,20 @@ async function loadCorpus($: Engine, root: string): Promise<Doc[]> {
   return docs.filter((doc): doc is Doc => doc !== null).sort(byFile)
 }
 
+/** Records one rg's answer for a chunk: each identifier found is cached and passes; output cut short proves nothing of the rest, which pass uncached. */
+function recordLookups(root: string, chunk: readonly string[], ran: Ran, now: number, found: Set<string>): void {
+  const hits = new Set(trimmedLines(ran.out))
+  for (const identifier of chunk) {
+    const has = hits.has(identifier)
+    if (has || !ran.isTruncated) {
+      lookups.set(`${root}\0${identifier}`, { has, at: now })
+    }
+    if (has || ran.isTruncated) {
+      found.add(identifier)
+    }
+  }
+}
+
 /** Which of the identifiers occur in the code: from the cache, else one batched rg lookup. */
 async function identifiersInCode($: Engine, root: string, wanted: readonly string[]): Promise<Set<string>> {
   const now = await $.clock.now()
@@ -246,14 +263,7 @@ async function identifiersInCode($: Engine, root: string, wanted: readonly strin
       }
       continue
     }
-    const hits = new Set(trimmedLines(ran.out))
-    for (const identifier of chunk) {
-      const has = hits.has(identifier)
-      lookups.set(`${root}\0${identifier}`, { has, at: now })
-      if (has) {
-        found.add(identifier)
-      }
-    }
+    recordLookups(root, chunk, ran, now, found)
   }
   return found
 }
@@ -296,23 +306,52 @@ async function deadReferencesOf($: Engine, root: string, doc: Doc): Promise<Docs
   return deadReferences(doc, lookup)
 }
 
-/** When each line of a doc was last committed, from git blame; nothing is known without git. */
+/** Which of the docs git tracks, the ones blame can date: one `git ls-files` per LS_FILES_CHUNK docs; none when git cannot say. */
+async function trackedDocs($: Engine, root: string, files: readonly string[]): Promise<Set<string>> {
+  const out = new Set<string>()
+  for (let i = 0; i < files.length; i += LS_FILES_CHUNK) {
+    const listed = await git($, root, ['ls-files', '-z', '--', ...files.slice(i, i + LS_FILES_CHUNK)])
+    if (!listed.ok) {
+      debug($, `git could not say which docs it tracks (${listed.err.trim().slice(0, 200)}); no marker is called stale`)
+      break
+    }
+    for (const path of listed.out.split('\0')) {
+      if (path !== '') {
+        out.add(normalisePath(path))
+      }
+    }
+  }
+  return out
+}
+
+/** A blame that fails leaves the doc's markers fresh; the debug log hears of it once a session. */
+async function noteBlameFailure($: Engine, rel: string, err: string): Promise<void> {
+  if ((await read($, blameFailed)) !== null) {
+    return
+  }
+  await update($, blameFailed, () => rel)
+  debug($, `git blame could not read ${rel} (${err.trim().slice(0, 200)}); its markers count as fresh (later blame failures this session are not logged)`)
+}
+
+/** When each line of a doc was last committed, from git blame; nothing is known when blame cannot read it. */
 async function lineAges($: Engine, root: string, rel: string): Promise<LineAge> {
   const blame = await git($, root, ['blame', '--line-porcelain', '--', `${root}/${rel}`])
   if (!blame.ok) {
+    await noteBlameFailure($, rel, blame.err)
     return () => null
   }
   const ages = parseBlame(blame.out)
   return line => ages.get(line) ?? null
 }
 
-async function staleMarkersOf($: Engine, root: string, doc: Doc, now: number): Promise<DocsFinding[]> {
-  return hasMarkers(doc.text) ? staleMarkers(doc, await lineAges($, root, doc.file), now, config.staleDays) : []
+/** The stale markers of a doc git tracks; a doc it does not track has no history, so none of its markers is stale. */
+async function staleMarkersOf($: Engine, root: string, doc: Doc, now: number, isTracked: boolean): Promise<DocsFinding[]> {
+  return isTracked && hasMarkers(doc.text) ? staleMarkers(doc, await lineAges($, root, doc.file), now, config.staleDays) : []
 }
 
 /** One doc's own findings: dead references, stale markers, size, a finished plan (duplicates are the corpus's). */
-async function checkDoc($: Engine, root: string, doc: Doc, now: number): Promise<DocsFinding[]> {
-  const found = [...(await deadReferencesOf($, root, doc)), ...(await staleMarkersOf($, root, doc, now))]
+async function checkDoc($: Engine, root: string, doc: Doc, now: number, isTracked: boolean): Promise<DocsFinding[]> {
+  const found = [...(await deadReferencesOf($, root, doc)), ...(await staleMarkersOf($, root, doc, now, isTracked))]
   const over = oversized(doc, config.maxLines)
   if (over !== null) {
     found.push(over)
@@ -349,9 +388,12 @@ async function checkScope($: Engine, root: string, corpus: readonly Doc[], selec
   if (identifiers.length > 0) {
     await identifiersInCode($, root, identifiers)
   }
+  // One git ls-files for the docs with markers: only a tracked doc is blamed.
+  const marked = chosen.filter(doc => hasMarkers(doc.text)).map(doc => doc.file)
+  const tracked = marked.length > 0 ? await trackedDocs($, root, marked) : new Set<string>()
   const found: DocsFinding[] = []
   for (const doc of chosen) {
-    found.push(...(await checkDoc($, root, doc, now)))
+    found.push(...(await checkDoc($, root, doc, now, tracked.has(doc.file))))
   }
   found.push(...duplicateParagraphs(corpus).filter(one => selected.has(one.file)))
   for (const candidate of orphanCandidates(corpus)) {
@@ -406,20 +448,25 @@ async function checkPath($: Engine, raw: string): Promise<string> {
   return describeFindings(found, targetName(target))
 }
 
+type Corpus = { digests: Map<string, readonly DocsParagraphDigest[]>; tracked: ReadonlySet<string> }
+
 /**
- * The paragraph digests of every doc in scope, for a write's duplicate check, from the per-repo cache: the docs
- * are listed again every RELIST_MS, a doc is read again only when its mtime or size changed since it was
- * digested, and the written doc's entry comes from the text just written. The audit reads the docs itself.
+ * The paragraph digests of every doc in scope, for a write's duplicate check, and which docs git tracks, from the
+ * per-repo cache: the docs are listed (and asked of git) again every RELIST_MS, a doc is read again only when its
+ * mtime or size changed since it was digested, and the written doc's entry comes from the text just written. The
+ * audit reads the docs itself.
  */
-async function corpusDigests($: Engine, root: string, written: Doc, now: number): Promise<Map<string, readonly DocsParagraphDigest[]>> {
+async function corpusDigests($: Engine, root: string, written: Doc, now: number): Promise<Corpus> {
   const known = await read($, corpusCache)
-  const cached: DocsCorpusCache = known !== null && known.root === root ? known : { root, listedAt: 0, files: [], entries: {} }
-  const isListed = cached.listedAt > 0 && now - cached.listedAt < RELIST_MS
+  const cached: DocsCorpusCache = known !== null && known.root === root ? known : { root, listedAt: 0, files: [], tracked: [], entries: {} }
+  // A cache written before 0.3.1 has no tracked list: its docs are listed again.
+  const isListed = cached.listedAt > 0 && now - cached.listedAt < RELIST_MS && cached.tracked !== undefined
   const listedAt = isListed ? cached.listedAt : now
   let files = isListed ? cached.files : await listDocs($, root)
   if (!files.includes(written.file)) {
     files = [...files, written.file].sort()
   }
+  const tracked = isListed && cached.tracked !== undefined ? cached.tracked : [...(await trackedDocs($, root, files))].sort()
   const entries: Record<string, DocsCacheEntry> = {}
   for (const file of files) {
     if (file === written.file) {
@@ -441,8 +488,8 @@ async function corpusDigests($: Engine, root: string, written: Doc, now: number)
   }
   const own = await $.fs.stat(`${root}/${written.file}`).catch(() => null)
   entries[written.file] = { mtimeMs: own?.mtimeMs ?? 0, size: own?.size ?? written.text.length, paragraphs: paragraphDigests(written.text) }
-  await update($, corpusCache, () => ({ root, listedAt, files, entries }))
-  return new Map(files.map(file => [file, entries[file]?.paragraphs ?? []]))
+  await update($, corpusCache, () => ({ root, listedAt, files, tracked, entries }))
+  return { digests: new Map(files.map(file => [file, entries[file]?.paragraphs ?? []])), tracked: new Set(tracked) }
 }
 
 /** The note for Claude after a Write or Edit of a doc in scope: dead references, duplicates, stale markers. */
@@ -459,8 +506,12 @@ async function writeNote($: Engine, filePath: string, content: string | null): P
   }
   const doc: Doc = { file: rel, text }
   const now = await $.clock.now()
-  const digests = await corpusDigests($, root, doc, now)
-  const found = [...(await deadReferencesOf($, root, doc)), ...duplicateDigests(digests, rel), ...(await staleMarkersOf($, root, doc, now))]
+  const corpus = await corpusDigests($, root, doc, now)
+  const found = [
+    ...(await deadReferencesOf($, root, doc)),
+    ...duplicateDigests(corpus.digests, rel),
+    ...(await staleMarkersOf($, root, doc, now, corpus.tracked.has(rel))),
+  ]
   return contextNote(rel, found, config.staleDays)
 }
 

@@ -88,12 +88,19 @@ export type DocsCorpusCache = {
   listedAt: number
   /** The docs in scope as last listed, relative to the root, sorted. */
   files: string[]
+  /** Those of `files` git tracks (`git ls-files`), the ones blame can date; absent in a cache written before 0.3.1. */
+  tracked?: string[]
   entries: Record<string, DocsCacheEntry>
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    'docs-gardener': { audit: DocsAudit | null; corpus: DocsCorpusCache | null }
+    'docs-gardener': {
+      audit: DocsAudit | null
+      corpus: DocsCorpusCache | null
+      /** The first doc whose `git blame` failed this session, so the debug log hears of it once; null until one does. */
+      blameFailed: string | null
+    }
   }
   /** The mod's own tool, named here so its hooks and tests type before the engine's table lists it. */
   interface McpToolInputs {

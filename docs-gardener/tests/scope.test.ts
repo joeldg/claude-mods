@@ -93,7 +93,9 @@ test('the rg command lines list markdown with the exclusions, and look identifie
   expect(files).toContain('!docs/generated/**')
   expect(files.at(-1)).toBe('/home/dev/widgets')
   const idents = rgIdentifiersArgv('/home/dev/widgets', ['parse_config', 'load_widgets'], [])
-  expect(idents.slice(0, 7)).toEqual(['rg', '--no-filename', '-o', '-w', '-F', '-m', '1'])
+  // Every match is printed (no -m 1: a file naming two identifiers must yield both) and hidden folders are searched.
+  expect(idents.slice(0, 6)).toEqual(['rg', '--no-filename', '-o', '-w', '-F', '--hidden'])
+  expect(idents).not.toContain('-m')
   expect(idents).toContain('-e')
   expect(idents[idents.indexOf('-e') + 1]).toBe('parse_config')
   expect(idents).toContain('!*.md')

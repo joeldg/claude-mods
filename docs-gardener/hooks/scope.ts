@@ -112,7 +112,10 @@ export function rgFilesArgv(root: string, excludeGlobs: readonly string[]): stri
   return ['rg', '--files', '-g', '*.md', '--hidden', ...excludeArgs(excludeGlobs), root]
 }
 
-/** One `rg` that prints which of the identifiers occur whole-word in the code (anything but markdown). */
+/**
+ * One `rg` that prints every whole-word occurrence of the identifiers in the code (anything but markdown, hidden
+ * folders included): with `-m 1` a file naming two of them would yield the first alone.
+ */
 export function rgIdentifiersArgv(root: string, identifiers: readonly string[], excludeGlobs: readonly string[]): string[] {
   return [
     'rg',
@@ -120,8 +123,7 @@ export function rgIdentifiersArgv(root: string, identifiers: readonly string[], 
     '-o',
     '-w',
     '-F',
-    '-m',
-    '1',
+    '--hidden',
     ...identifiers.flatMap(identifier => ['-e', identifier]),
     '-g',
     '!*.md',

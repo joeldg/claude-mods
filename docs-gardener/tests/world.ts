@@ -94,7 +94,10 @@ export type World = {
   branch: string
   branchFiles: string[]
   dirtyFiles: string[]
+  /** Files git does not track: `ls-files --others` lists them, `ls-files --` does not, and `blame` fails on them. */
   untracked: string[]
+  /** Tracked docs whose `git blame` still exits 128 (git dying, a path moved in the index since it was listed). */
+  blameFails: string[]
   recentFiles: string[]
   /** The model's reply by the file or folder the prompt names; `[]` when unlisted. */
   plans: Record<string, string>
@@ -141,10 +144,28 @@ function blameOf(w: World, rel: string): string {
     .join('\n')
 }
 
-/** Whole-word matches of the identifiers in the code (anything but markdown). */
-function identifiersInCode(w: World, idents: string[]): string[] {
-  const code = [...w.files.entries()].filter(([path]) => !path.endsWith('.md')).map(([, text]) => text)
-  return idents.filter(ident => code.some(text => new RegExp(`\\b${ident}\\b`).test(text)))
+/**
+ * What `rg -o -w -F` prints for the identifiers over the code (anything but markdown): each whole-word match, in
+ * hidden folders only with `--hidden`, and with `-m 1` from the first matching line of each file alone.
+ */
+function identifiersInCode(w: World, idents: string[], isHidden: boolean, isFirstLineOnly: boolean): string[] {
+  const out: string[] = []
+  for (const [path, text] of w.files) {
+    if (path.endsWith('.md') || (!isHidden && path.split('/').some(segment => segment.startsWith('.')))) {
+      continue
+    }
+    for (const line of text.split('\n')) {
+      const hits = idents.filter(ident => new RegExp(`\\b${ident}\\b`).test(line))
+      if (hits.length === 0) {
+        continue
+      }
+      out.push(...hits)
+      if (isFirstLineOnly) {
+        break
+      }
+    }
+  }
+  return out
 }
 
 /** Answers the host beneath the plugin: the repo's files, git and rg, the model, the tools and the screen. */
@@ -165,6 +186,7 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
     branchFiles: [],
     dirtyFiles: [],
     untracked: [],
+    blameFails: [],
     recentFiles: [],
     plans: {},
     completes: [],
@@ -240,7 +262,7 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
     }
     if (exe === 'rg') {
       const idents = args.flatMap((arg, i) => (arg === '-e' ? [args[i + 1] ?? ''] : []))
-      const found = identifiersInCode(w, idents)
+      const found = identifiersInCode(w, idents, args.includes('--hidden'), args.includes('-m'))
       return ok(found.map(ident => `${ident}\n`).join(''), found.length ? 0 : 1)
     }
     if (exe !== 'git') {
@@ -251,7 +273,15 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
       return ok(`${ROOT}\n`)
     }
     if (args[0] === 'blame') {
-      return ok(blameOf(w, relOf(args[args.length - 1] ?? '')))
+      const rel = relOf(args[args.length - 1] ?? '')
+      if (w.untracked.includes(rel) || w.blameFails.includes(rel)) {
+        return ok('', 128, `fatal: no such path '${rel}' in HEAD\n`)
+      }
+      return ok(blameOf(w, rel))
+    }
+    if (args[0] === 'ls-files' && args[1] === '-z' && args[2] === '--') {
+      const tracked = args.slice(3).filter(path => w.files.has(path) && !w.untracked.includes(path))
+      return ok(tracked.map(path => `${path}\0`).join(''))
     }
     if (key.startsWith('log -1 --format=%ct -- ')) {
       const rel = relOf(args[4] ?? '')

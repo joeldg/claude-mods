@@ -5,7 +5,7 @@ import { ENTRY_DOCS, baseName, datedName, folderOf, joinPath, normalisePath, rol
 export type Doc = { file: string; text: string }
 
 export const DAY_MS = 86_400_000
-/** The most existence and code lookups one doc may cost. */
+/** The most references (paths and identifiers) one doc looks up. */
 export const MAX_LOOKUPS = 40
 /** A paragraph shorter than this is never a duplicate: boilerplate repeats. */
 export const MIN_PARAGRAPH = 200
@@ -54,6 +54,8 @@ export function inlineCode(text: string): { token: string; line: number }[] {
 
 export type Reference = { kind: 'path' | 'make' | 'identifier'; token: string; line: number }
 
+/** A slash command with its arguments, `/servers` or `/guard pause 15m`: one segment after the slash, no extension. */
+const COMMAND = /^\/[A-Za-z][\w-]*(?:\s.*)?$/
 /** Characters that mark a span as a command, a template, a URL or prose rather than a path. */
 const NOT_A_PATH = /[\s<>{}*$=@()\\|"']|:\/\//
 /** Suffixes that are domains, not file extensions. */
@@ -68,7 +70,7 @@ function classify(token: string): { kind: Reference['kind']; token: string } | n
   if (make && make[1] !== undefined && !make[1].startsWith('-')) {
     return { kind: 'make', token: make[1] }
   }
-  if (NOT_A_PATH.test(token) || token.startsWith('-') || token.startsWith('~')) {
+  if (COMMAND.test(token) || NOT_A_PATH.test(token) || token.startsWith('-') || token.startsWith('~')) {
     return null
   }
   if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(token)) {
@@ -116,13 +118,56 @@ export type DeadReferenceLookups = {
   makeTargets: ReadonlySet<string> | null
 }
 
+/** The folders a token is tried from: the root, then the doc's own. */
+const basesOf = (file: string): string[] => [...new Set(['', folderOf(file)])]
+
+/** Whether a path climbs out of the root. */
+const isAboveRoot = (path: string): boolean => path === '..' || path.startsWith('../')
+
 /** The paths tried for a token: from the root, and from the doc's folder. */
 export const pathCandidates = (file: string, token: string): string[] =>
-  [...new Set([normalisePath(token.replace(/^\//, '')), joinPath(folderOf(file), token)])].filter(candidate => candidate !== '')
+  [...new Set(basesOf(file).map(base => joinPath(base, token.replace(/^\//, ''))))].filter(candidate => candidate !== '')
 
 /**
- * References to what is not there: a path that exists neither from the root nor from the doc's folder,
- * a make target the Makefile lacks, an identifier the code does not have (the first MAX_LOOKUPS lookups).
+ * What must exist for a missing candidate to be a claim about this repo: the token's first folder below the base,
+ * `scripts` for `scripts/x.sh` from the root; null when the base itself, the root or the doc's folder, holds it.
+ */
+function anchorOf(base: string, candidate: string): string | null {
+  const below = base === '' ? candidate : candidate.startsWith(`${base}/`) ? candidate.slice(base.length + 1) : null
+  if (below === null) {
+    // The token climbed out of the doc's folder with `..`: its first folder from the root must be here.
+    return candidate.includes('/') ? candidate.slice(0, candidate.indexOf('/')) : null
+  }
+  return below.includes('/') ? joinPath(base, below.slice(0, below.indexOf('/'))) : null
+}
+
+/**
+ * Whether a path reference is dead: it exists neither from the root nor from the doc's folder, while a folder it
+ * claims is here. A path into a folder that is not here, `.claude/launch.json` without `.claude/`, may be another
+ * project's.
+ */
+async function isDeadPath(file: string, token: string, exists: DeadReferenceLookups['exists']): Promise<boolean> {
+  let isHere = false
+  for (const base of basesOf(file)) {
+    const candidate = joinPath(base, token.replace(/^\//, ''))
+    if (candidate === '' || isAboveRoot(candidate)) {
+      continue
+    }
+    if (await exists(candidate)) {
+      return false
+    }
+    const anchor = anchorOf(base, candidate)
+    if (anchor === null || (await exists(anchor))) {
+      isHere = true
+    }
+  }
+  return isHere
+}
+
+/**
+ * References to what is not there: a dead path, a make target the Makefile lacks, an identifier the code does
+ * not have (the first MAX_LOOKUPS lookups). A bare file name, `package.json`, may be another project's and is
+ * never dead.
  */
 export async function deadReferences(doc: Doc, lookups: DeadReferenceLookups): Promise<DocsFinding[]> {
   const out: DocsFinding[] = []
@@ -132,6 +177,9 @@ export async function deadReferences(doc: Doc, lookups: DeadReferenceLookups): P
       if (!lookups.makeTargets?.has(ref.token)) {
         out.push(finding(doc.file, ref.line, 'dead-reference', `runs make ${ref.token}, which the Makefile has no target for`, 'Name a current make target or remove it.'))
       }
+      continue
+    }
+    if (ref.kind === 'path' && !ref.token.includes('/')) {
       continue
     }
     if (left <= 0) {
@@ -146,14 +194,7 @@ export async function deadReferences(doc: Doc, lookups: DeadReferenceLookups): P
       }
       continue
     }
-    let isFound = false
-    for (const candidate of pathCandidates(doc.file, ref.token)) {
-      if (await lookups.exists(candidate)) {
-        isFound = true
-        break
-      }
-    }
-    if (!isFound) {
+    if (await isDeadPath(doc.file, ref.token, lookups.exists)) {
       out.push(finding(doc.file, ref.line, 'dead-reference', `references ${ref.token}, which no longer exists`, 'Point it at the current path or remove the reference.'))
     }
   }

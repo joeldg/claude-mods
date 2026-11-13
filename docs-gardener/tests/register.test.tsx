@@ -441,3 +441,66 @@ test('an audit already running is not started twice; /garden check and /garden h
   expect(await docs($, 'prune')).toMatch(/Usage:/)
   expect(w.completes).toHaveLength(6)
 })
+
+test('a doc git does not track is not blamed: its TODOs and unchecked items count as fresh; a tracked doc is blamed as before', SLOW, async ($, on) => {
+  const w = world(on)
+  const handoff = '# Handoff\n\n- TODO: write the labelling guide\n- [ ] check the counts\n'
+  w.files.set('labelling/HANDOFF.md', handoff)
+  w.untracked = ['labelling/HANDOFF.md']
+  await start($)
+  const written = await callTool($, { tool: 'Write', file_path: `${ROOT}/labelling/HANDOFF.md`, content: handoff })
+  expect(written.context ?? []).toEqual([])
+  expect((await callTool($, { tool: TOOL, path: 'labelling/HANDOFF.md' })).result).toBe('docs-gardener: nothing to fix in labelling/HANDOFF.md.')
+  expect(w.ran.filter(line => line.startsWith('git blame'))).toEqual([])
+  expect(w.debug).toEqual([])
+  const readme = await callTool($, { tool: TOOL, path: 'README.md' })
+  expect(String(readme.result)).toContain('L14 stale-marker: TODO open for 45 days')
+  expect(w.ran.filter(line => line.startsWith('git blame'))).toEqual([`git blame --line-porcelain -- ${ROOT}/README.md`])
+  // Which docs git tracks is asked once per write (kept with the corpus cache) and once per check, one call each.
+  expect(w.ran.filter(line => line.startsWith('git ls-files -z -- '))).toHaveLength(3)
+})
+
+test('a blame that fails counts as no history: the markers are fresh, and the debug log hears of it once a session', SLOW, async ($, on) => {
+  const w = world(on)
+  w.blameFails = ['README.md']
+  await start($)
+  const checked = await callTool($, { tool: TOOL, path: 'README.md' })
+  expect(String(checked.result)).toMatch(/^docs-gardener: 3 findings in README\.md\n/)
+  expect(String(checked.result)).not.toContain('stale-marker')
+  const written = await callTool($, { tool: 'Write', file_path: `${ROOT}/README.md`, content: README })
+  expect(written.context).toEqual([README_NOTE.replace('; 1 TODO is older than 30 days', '')])
+  expect(w.ran.filter(line => line.startsWith('git blame'))).toHaveLength(2)
+  expect(w.debug).toEqual([
+    "docs-gardener: git blame could not read README.md (fatal: no such path 'README.md' in HEAD); its markers count as fresh (later blame failures this session are not logged)",
+  ])
+})
+
+test('slash commands, bare file names and names anywhere in the code are not dead references; a missing file under a folder here is', SLOW, async ($, on) => {
+  const w = world(on)
+  w.files.set(
+    '.claude-plugin/plugin.json',
+    ['{', '  "name": "guard",', '  "userConfig": {', '    "subagentEffort": { "type": "string" },', '    "toastScope": { "type": "string" },', '    "stallReminderMinutes": { "type": "number" }', '  }', '}', ''].join('\n'),
+  )
+  w.files.set('hooks/register.ts', ["const TOOL = 'machine_status'", "const dirs = $.env.get('CLAUDE_CODE_PLUGIN_DIRS')", ''].join('\n'))
+  w.files.set(
+    'docs/guard.md',
+    [
+      '# Guard',
+      '',
+      'Run `/servers`, `/guard pause 15m` or `/mods report 7d`; the tool is `machine_status`.',
+      'Settings: `subagentEffort`, `toastScope` and `stallReminderMinutes`; set `CLAUDE_CODE_PLUGIN_DIRS` in `settings.json`.',
+      'Other projects keep a `package.json`, a `lock.json` or a `.claude/launch.json`.',
+      'Then run `scripts/x.sh`.',
+      '',
+    ].join('\n'),
+  )
+  await start($)
+  expect((await callTool($, { tool: TOOL, path: 'docs/guard.md' })).result).toBe(
+    ['docs-gardener: 1 finding in docs/guard.md', '  L6 dead-reference: references scripts/x.sh, which no longer exists — Point it at the current path or remove the reference.'].join('\n'),
+  )
+  // One rg over every file but markdown, hidden folders included, printing every match rather than the first per file.
+  const lookups = w.ran.filter(line => line.startsWith('rg --no-filename'))
+  expect(lookups).toHaveLength(1)
+  expect(lookups[0]).toContain(' --hidden ')
+  expect(lookups[0]).not.toContain(' -m 1 ')
+})

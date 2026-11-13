@@ -40,7 +40,7 @@ test('findReferences: paths, make targets and identifiers out of inline code, fe
     'Run `scripts/build.sh` or `./scripts/run.sh`, read `docs/guide.md#setup` and `src/a.ts:12`.',
     'Use `make deploy` and `make lint`; call `parse_config`, `loadWidgets` and `MAX_RETRIES`.',
     'Not references: `foo`, `short`, `README`, `https://example.com/x.md`, `--flag`, `1.2.3`, `v1.2`, `e.g.`, `i.e`,',
-    '`obj.method()`, `{name}.md`, `*.md`, `$HOME/x`, `@scope/pkg`, `example.com`, `a b/c`.',
+    '`obj.method()`, `{name}.md`, `*.md`, `$HOME/x`, `@scope/pkg`, `example.com`, `a b/c`, `/servers`, `/guard pause 15m`.',
     '```',
     'inside `fenced/code.sh` nothing counts',
     '```',
@@ -61,7 +61,7 @@ test('findReferences: paths, make targets and identifiers out of inline code, fe
 
 test('dead-reference: a missing path, a missing make target and an identifier the code does not have', async () => {
   const calls: string[] = []
-  const found = await deadReferences(readme, lookups(['scripts/run_tests.sh', 'Makefile'], ['parse_config'], ['deploy', 'test'], calls))
+  const found = await deadReferences(readme, lookups(['scripts', 'scripts/run_tests.sh', 'Makefile'], ['parse_config'], ['deploy', 'test'], calls))
   expect(found).toEqual([
     {
       file: 'README.md',
@@ -101,6 +101,23 @@ test('dead-reference: a path is tried from the root and from the doc folder; no 
       suggestion: 'Name a current make target or remove it.',
     },
   ])
+})
+
+test('dead-reference: a bare file name or a path into a folder not here is never dead; a missing file under a folder here is', async () => {
+  const doc: Doc = {
+    file: 'docs/guide.md',
+    text: 'Keep `package.json` and `.claude/launch.json`; run `scripts/x.sh`, `../scripts/y.sh`, `./z.sh` and `/servers`.\n',
+  }
+  const calls: string[] = []
+  const found = await deadReferences(doc, lookups(['scripts', 'docs', 'scripts/run_tests.sh'], [], null, calls))
+  expect(found.map(one => `${one.line} ${one.text}`)).toEqual([
+    '1 references scripts/x.sh, which no longer exists',
+    '1 references ../scripts/y.sh, which no longer exists',
+    '1 references ./z.sh, which no longer exists',
+  ])
+  // A bare name is never looked up; a folder is, and `.claude/` not being here clears its file.
+  expect(calls.filter(call => call.includes('package.json'))).toEqual([])
+  expect(calls).toContain('exists .claude')
 })
 
 test('dead-reference: at most 40 lookups per file, the first ones', async () => {
