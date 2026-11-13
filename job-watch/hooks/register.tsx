@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type {
   BoxProps,
   ButtonProps,
+  Color,
   ElementConstructor,
   EngineInterface,
   ProcessRunResult,
@@ -19,6 +20,7 @@ import {
   formatDuration,
   isAlive,
   isPidAlive,
+  isServiceTask,
   isTimerTask,
   launchFromCommand,
   matchToken,
@@ -54,12 +56,18 @@ const DF_MS = 60_000
 const LOG_GAP_MS = 300_000
 /** How long a finished timer (a bare `sleep` of Claude's) stays listed before it is dropped. */
 const TIMER_KEEP_MS = 60_000
+/** Where dev-servers keeps its last scan of the machine's listening processes, under HOME, for every session to read. */
+const SCAN_CACHE = '.claude/dev-servers/scan-cache.json'
+/** A scan older than this says nothing about what listens now. */
+const SCAN_STALE_MS = 600_000
+/** How often the scan cache is re-read while a live job's port is unknown. */
+const SCAN_MS = 60_000
 
 const TOOLS = ['mcp__job-watch__jobs_list', 'mcp__job-watch__jobs_watch', 'mcp__job-watch__jobs_unwatch'] as const
 
 const LIST_DESCRIPTION = [
   'List the long-running jobs job-watch follows: background Bash tasks, detached nohup launches, and anything added with jobs_watch.',
-  'For each: its state (running, quiet, stalled, or finished with its exit code), how long since it last wrote output, progress and ETA when its log shows them, its last log line and its log path.',
+  'For each: its state (running, serving with its port, quiet, stalled, or finished with its exit code), how long since it last wrote output, progress and ETA when its log shows them, its last log line and its log path.',
   'Call this to follow or wait for long-running work instead of writing `until … sleep` / `while … sleep` loops or running `ps`: background Bash jobs (run_in_background: true) are picked up automatically the moment they start.',
 ].join(' ')
 
@@ -82,6 +90,9 @@ const CONTEXT = [
   'mcp__job-watch__jobs_watch adds a pid or log file started elsewhere; mcp__job-watch__jobs_unwatch removes one.',
 ].join('\n')
 
+/** How the pane colours a job's state. */
+const STATE_COLORS: Record<JobState, Color> = { running: 'green', serving: 'cyan', stalled: 'red', quiet: 'yellow', done: 'gray' }
+
 const jobs = atom({ plugin: 'job-watch', key: 'jobs' } as const, [])
 const disks = atom({ plugin: 'job-watch', key: 'disks' } as const, [])
 
@@ -100,6 +111,8 @@ type Config = {
   stallMs: number
   /** The least time between one job's stall toasts after its first; 0 toasts the first stall only. */
   stallReminderMs: number
+  /** How many reminders one silence gets after its stall toast; then it goes unmentioned until the job writes again. */
+  stallReminders: number
   pollMs: number
   keepDoneMs: number
   autoOpen: boolean
@@ -109,6 +122,7 @@ type Config = {
 let config: Config = {
   stallMs: 600_000,
   stallReminderMs: 3_600_000,
+  stallReminders: 3,
   pollMs: 10_000,
   keepDoneMs: 7_200_000,
   autoOpen: true,
@@ -155,6 +169,7 @@ const paceOf = (name: string, baseMs: number): Pace => {
 
 let psPace = paceOf('ps', config.pollMs)
 let dfPace = paceOf('df', DF_MS)
+let scanPace = paceOf('scan', SCAN_MS)
 
 /** Counts a tick for the probe: true when it is due to run again. */
 const isDue = (pace: Pace): boolean => {
@@ -208,6 +223,7 @@ function summary(list: readonly Job[]): string | undefined {
   const counted = list.filter(job => !job.isTimer)
   const count = (state: JobState) => counted.filter(job => job.state === state).length
   const parts = [
+    count('serving') && `${count('serving')} serving`,
     count('running') && `${count('running')} running`,
     count('stalled') && `${count('stalled')} stalled`,
     count('quiet') && `${count('quiet')} quiet`,
@@ -221,9 +237,76 @@ const normalize = (job: Job): Job => ({
   pid: job.pid ?? null,
   stallMs: job.stallMs ?? null,
   stallToastAt: job.stallToastAt ?? null,
+  stallReminded: job.stallReminded ?? 0,
   exitCode: job.exitCode ?? null,
   isTimer: job.isTimer ?? false,
+  isService: job.isService ?? false,
+  port: job.port ?? null,
 })
+
+/** A process dev-servers saw listening: its pid, ports, command line and start, as its scan cache keeps them. */
+type Listener = { pid: number; ports: number[]; commandLine: string; startedAt: number | null }
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+/** The listeners a scan cache's text holds; null when it is misshapen or stale at `now`. Entries it cannot read are dropped. */
+function parseListeners(text: string, now: number): Listener[] | null {
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (!isRecord(value) || typeof value.ts !== 'number' || !isRecord(value.data) || !Array.isArray(value.data.listeners)) {
+    return null
+  }
+  if (!(value.ts <= now && now - value.ts < SCAN_STALE_MS)) {
+    return null
+  }
+  return value.data.listeners.flatMap((one: unknown): Listener[] => {
+    if (!isRecord(one) || typeof one.pid !== 'number' || !Array.isArray(one.ports)) {
+      return []
+    }
+    const detail = isRecord(one.detail) ? one.detail : null
+    const commandLine = typeof detail?.commandLine === 'string' ? detail.commandLine : typeof one.command === 'string' ? one.command : ''
+    const ports = one.ports.filter((port): port is number => Number.isInteger(port) && (port as number) > 0)
+    return [{ pid: one.pid, ports, commandLine, startedAt: typeof detail?.startedAt === 'number' ? detail.startedAt : null }]
+  })
+}
+
+/**
+ * The listeners dev-servers last scanned, read at most every SCAN_MS while a live job's port is
+ * unknown (a server not yet listening, a watched pid that may be one); null when none is wanted
+ * now, or the cache is missing, misshapen or stale.
+ */
+async function listeners($: Engine, list: readonly Job[], now: number): Promise<Listener[] | null> {
+  const isWanted = list.some(job => job.state !== 'done' && !job.isTimer && job.port === null)
+  if (!isWanted || !isDue(scanPace)) {
+    return null
+  }
+  const home = await $.env.get('HOME').catch(() => undefined)
+  if (!home) {
+    return null
+  }
+  const text = await $.fs.read(`${home}/${SCAN_CACHE}`).catch(() => null)
+  return text === null ? null : parseListeners(text, now)
+}
+
+/**
+ * The job as the listeners show it: serving on its lowest port once its pid, or the command line
+ * its token names (the newest such process, when two run), is listening. Itself when none is its own.
+ */
+function adoptListener(job: Job, found: readonly Listener[] | null): Job {
+  if (found === null || job.state === 'done' || job.isTimer || job.port !== null) {
+    return job
+  }
+  const own = found
+    .filter(one => (job.pid !== null ? one.pid === job.pid : job.match !== null && one.commandLine.includes(job.match)))
+    .sort((a, b) => (b.startedAt ?? -1) - (a.startedAt ?? -1))
+  const ports = own[0]?.ports ?? []
+  return ports.length === 0 ? job : { ...job, isService: true, port: Math.min(...ports) }
+}
 
 async function refreshDisks($: Engine) {
   if (!isDue(dfPace)) {
@@ -282,8 +365,17 @@ async function readLog($: Engine, job: Job, now: number): Promise<Job> {
 const aliveIn = (ps: string | null, job: Job): boolean | null =>
   ps === null ? null : job.pid !== null ? isPidAlive(ps, job.pid) : job.match !== null ? isAlive(ps, job.match) : null
 
-/** Running, or quiet / stalled once the log has been silent past the job's threshold; a pid alone never stalls. */
+/**
+ * Running, or quiet / stalled once the log has been silent past the job's threshold; a pid alone
+ * never stalls. A timer is silent by nature, and a service while idle: neither is ever quiet or stalled.
+ */
 const quietState = (job: Job, now: number, alive: boolean | null): JobState => {
+  if (job.isTimer) {
+    return 'running'
+  }
+  if (job.isService) {
+    return 'serving'
+  }
   const quietFor = now - Math.max(job.changedAt, job.addedAt)
   if (job.log === '' || quietFor <= (job.stallMs ?? config.stallMs)) {
     return 'running'
@@ -307,20 +399,57 @@ async function readJob($: Engine, job: Job, now: number, ps: string | null): Pro
   }
   // A pid never seen in two polls is a process that is not running, whatever it was.
   const isGone = alive === false && (next.seenAlive || (isUnseen && next.pid !== null))
-  // A timer is silent by nature: it runs until it ends, never quiet or stalled.
-  const state: JobState =
-    isGone || next.exitCode !== null ? 'done' : next.isTimer ? 'running' : quietState(next, now, alive)
+  const state: JobState = isGone || next.exitCode !== null ? 'done' : quietState(next, now, alive)
   return state === 'done' ? { ...next, state, finishedAt: now, etaSeconds: null, etaAt: null } : { ...next, state }
 }
 
 /**
- * Toasts a finish the tick it first shows, and a stall when the log first falls silent past the
- * threshold. From then on the job's stall toasts come at most every stallReminderMs (never, with 0):
- * `still silent after 2h10m` while that silence goes on, `has written nothing for 20m` once it has
- * written a line and lapsed again. So a downloader that prints one line per file, every 25 minutes,
- * is told of once an hour, not once per lapse; and a `ps` that fails for a while (the job shows quiet,
- * then stalled again) re-toasts nothing. Null for a quick command, which leaves unannounced. A timer
- * is kept but never announced: its end is Claude's cue, not the person's.
+ * Toasts the end of a job that has just shown done: a service's exit with its code, any other job's
+ * finish. A timer is kept but never announced: its end is Claude's cue, not the person's.
+ */
+function announceEnd($: Engine, job: Job, lived: number): void {
+  const after = `after ${formatDuration(lived / 1000)}`
+  if (job.isService) {
+    const code = job.exitCode !== null ? ` with code ${job.exitCode}` : ''
+    const last = job.lastLine ? `: ${shorten(job.lastLine, 80)}` : ''
+    $.ui.toast(`${job.label} exited${code} ${after}${last}`, { timeoutMs: 10_000 })
+  } else if (!job.isTimer) {
+    $.ui.toast(`${job.label} finished ${after}: ${shorten(job.lastLine, 80)}`, { timeoutMs: 10_000 })
+  }
+}
+
+/**
+ * Toasts a stall when the log first falls silent past the threshold. From then on the job's stall
+ * toasts come at most every stallReminderMs (never, with 0): `still silent after 2h10m` while that
+ * silence goes on, at most stallReminders times, then nothing more of it; `has written nothing for
+ * 20m` once it has written a line and lapsed again. So a downloader that prints one line per file,
+ * every 25 minutes, is told of once an hour, not once per lapse; and a `ps` that fails for a while
+ * (the job shows quiet, then stalled again) re-toasts nothing.
+ */
+function announceStall($: Engine, job: Job, now: number): Job {
+  // Nothing written since the last toast: the same silence goes on. Else it wrote, and has lapsed again.
+  const isSameSilence = job.stallToastAt !== null && job.changedAt < job.stallToastAt
+  if (job.stallToastAt !== null) {
+    const isReminderDue = config.stallReminderMs > 0 && now - job.stallToastAt >= config.stallReminderMs
+    // Reminded stallReminders times of this silence: the person has heard enough of it.
+    if (!isReminderDue || (isSameSilence && job.stallReminded >= config.stallReminders)) {
+      return job
+    }
+  }
+  const quietFor = formatDuration((now - Math.max(job.changedAt, job.addedAt)) / 1000)
+  const text =
+    job.stallToastAt === null
+      ? `has written nothing for ${formatDuration((job.stallMs ?? config.stallMs) / 1000)}`
+      : isSameSilence
+        ? `still silent after ${quietFor}`
+        : `has written nothing for ${quietFor}`
+  $.ui.toast(`${job.label} ${text}`, { timeoutMs: 10_000 })
+  return { ...job, stallToastAt: now, stallReminded: isSameSilence ? job.stallReminded + 1 : 0 }
+}
+
+/**
+ * Announces what this tick changed: an end the tick it first shows, a stall as announceStall
+ * paces them. Null for a quick command, which leaves unannounced. A timer and a service never stall.
  */
 function announce($: Engine, was: Job, job: Job, now: number): Job | null {
   if (job.state === 'done' && was.state !== 'done') {
@@ -328,30 +457,9 @@ function announce($: Engine, was: Job, job: Job, now: number): Job | null {
     if (lived < SHORT_MS) {
       return null
     }
-    if (!job.isTimer) {
-      $.ui.toast(`${job.label} finished after ${formatDuration(lived / 1000)}: ${shorten(job.lastLine, 80)}`, {
-        timeoutMs: 10_000,
-      })
-    }
+    announceEnd($, job, lived)
   }
-  if (job.state !== 'stalled' || job.isTimer) {
-    return job
-  }
-  const isReminderDue =
-    job.stallToastAt !== null && config.stallReminderMs > 0 && now - job.stallToastAt >= config.stallReminderMs
-  if (job.stallToastAt !== null && !isReminderDue) {
-    return job
-  }
-  const quietFor = formatDuration((now - Math.max(job.changedAt, job.addedAt)) / 1000)
-  // Nothing written since the last toast: the same silence goes on. Else it wrote, and has lapsed again.
-  const text =
-    job.stallToastAt === null
-      ? `has written nothing for ${formatDuration((job.stallMs ?? config.stallMs) / 1000)}`
-      : job.changedAt < job.stallToastAt
-        ? `still silent after ${quietFor}`
-        : `has written nothing for ${quietFor}`
-  $.ui.toast(`${job.label} ${text}`, { timeoutMs: 10_000 })
-  return { ...job, stallToastAt: now }
+  return job.state === 'stalled' ? announceStall($, job, now) : job
 }
 
 /** Whether a finished or quiet job has stayed its keepDoneMinutes (a timer, its minute) and leaves the list. */
@@ -371,10 +479,11 @@ async function pass($: Engine) {
   }
   const now = await $.clock.now()
   const ps = await processes($, list)
+  const found = await listeners($, list, now)
 
   const fresh: Job[] = []
   for (const job of list) {
-    const next = announce($, job, await readJob($, job, now, ps), now)
+    const next = announce($, job, await readJob($, adoptListener(job, found), now, ps), now)
     if (next && !isExpired(next, now)) {
       fresh.push(next)
     }
@@ -416,7 +525,7 @@ function ensureTimer($: Engine) {
   }
 }
 
-type NewJob = Pick<Job, 'id' | 'label' | 'log' | 'match'> & Partial<Pick<Job, 'pid' | 'stallMs' | 'isTimer'>>
+type NewJob = Pick<Job, 'id' | 'label' | 'log' | 'match'> & Partial<Pick<Job, 'pid' | 'stallMs' | 'isTimer' | 'isService'>>
 
 async function addJob($: Engine, job: NewJob) {
   const now = await $.clock.now()
@@ -425,7 +534,10 @@ async function addJob($: Engine, job: NewJob) {
     pid: job.pid ?? null,
     stallMs: job.stallMs ?? null,
     stallToastAt: null,
+    stallReminded: 0,
     isTimer: job.isTimer ?? false,
+    isService: job.isService ?? false,
+    port: null,
     seenAlive: false,
     addedAt: now,
     size: -1,
@@ -459,7 +571,9 @@ async function watchJob($: Engine, want: Watch): Promise<Job | string> {
   }
   const id = log !== '' ? hashOf(log) : `pid-${want.pid}`
   const label = shorten(want.label || (log !== '' ? log.split('/').pop() || log : `pid ${want.pid}`), 40)
-  await addJob($, { id, label, log, match: null, pid: want.pid, stallMs: want.stallMs })
+  // Its name is all that says what it is: `the dev server` is a service, a listening pid becomes one.
+  const isService = isServiceTask('', want.label ?? '')
+  await addJob($, { id, label, log, match: null, pid: want.pid, stallMs: want.stallMs, isService })
   // A fresh `ps` on a pass that sees this job, so a pid is judged now rather than from the last listing.
   if (inflight) {
     await inflight
@@ -484,18 +598,28 @@ async function removeJobs($: Engine, what: string): Promise<{ removed: number; k
   return { removed: before.length - kept.length, kept }
 }
 
+/** A job's state as jobs_list words it: when it finished and how, the port it serves on, or how long a silence counts. */
+function stateText(job: Job, now: number): string {
+  switch (job.state) {
+    case 'done':
+      return (
+        `finished ${formatDuration((now - (job.finishedAt ?? now)) / 1000)} ago` +
+        (job.exitCode !== null ? ` (exit ${job.exitCode})` : '')
+      )
+    case 'running':
+      return 'running'
+    case 'serving':
+      return `serving${job.port !== null ? ` on port ${job.port}` : ''}`
+    default:
+      return `${job.state} (no output for ${formatDuration((job.stallMs ?? config.stallMs) / 1000)})`
+  }
+}
+
 /** One job as jobs_list prints it: a line of figures, then its log path and last line indented. */
 function describeJob(job: Job, now: number): string {
   const age = formatDuration((now - Math.max(job.changedAt, job.addedAt)) / 1000)
-  const state =
-    job.state === 'done'
-      ? `finished ${formatDuration((now - (job.finishedAt ?? now)) / 1000)} ago` +
-        (job.exitCode !== null ? ` (exit ${job.exitCode})` : '')
-      : job.state === 'running'
-        ? 'running'
-        : `${job.state} (no output for ${formatDuration((job.stallMs ?? config.stallMs) / 1000)})`
   const parts = [
-    state,
+    stateText(job, now),
     job.isTimer && 'timer',
     job.pid !== null && `pid ${job.pid}`,
     job.progress && progressText(job.progress),
@@ -523,6 +647,9 @@ async function listTool($: Engine): Promise<string> {
     `quiet = no output for ${formatDuration(config.stallMs / 1000)} with no process to check · ` +
     `stalled = the process is alive but has written nothing for that long · ` +
     `finished jobs stay listed for ${formatDuration(config.keepDoneMs / 1000)}; jobs_unwatch removes one.` +
+    (list.some(job => job.isService)
+      ? ' · serving = a server or daemon, silent while idle, so never stalled: listed until it exits.'
+      : '') +
     (list.some(job => job.isTimer)
       ? ' · timer = a wait of yours (sleep …): listed while it runs and for a minute after it ends, never announced.'
       : '')
@@ -552,10 +679,18 @@ function watchInput(e: Json): Watch | string {
 
 /** jobs_watch's answer: where the job is read from, and what changes its state. */
 function watchedText(job: Job): string {
-  const where = [job.pid !== null && `pid ${job.pid}`, job.log !== '' && `log ${job.log}`].filter(Boolean).join(', ')
+  const where = [
+    job.pid !== null && `pid ${job.pid}`,
+    job.log !== '' && `log ${job.log}`,
+    job.port !== null && `listening on port ${job.port}`,
+  ]
+    .filter(Boolean)
+    .join(', ')
   const quietText = `after ${formatDuration((job.stallMs ?? config.stallMs) / 1000)} without output`
   const counts = [
-    job.log !== '' && (job.pid !== null ? `stalled ${quietText}` : `quiet ${quietText} (no process to check)`),
+    job.isService
+      ? 'serving (a server is silent while idle, never stalled)'
+      : job.log !== '' && (job.pid !== null ? `stalled ${quietText}` : `quiet ${quietText} (no process to check)`),
     job.pid !== null && 'finished when the process exits',
   ].filter(Boolean)
   return `Watching ${job.label} [${job.id}]: ${where}. Call jobs_list to check on it: it counts as ${counts.join(' and as ')}.`
@@ -662,6 +797,7 @@ export const register: Register = (on, options) => {
   config = {
     stallMs: Math.max(1, Number(options.stallMinutes ?? 10)) * 60_000,
     stallReminderMs: Math.max(0, Number(options.stallReminderMinutes ?? 60)) * 60_000,
+    stallReminders: Math.max(0, Math.round(Number(options.stallReminders ?? 3))),
     pollMs: Math.max(2, Number(options.pollSeconds ?? 10)) * 1000,
     keepDoneMs: Math.max(1, Number(options.keepDoneMinutes ?? 120)) * 60_000,
     autoOpen: options.autoOpen !== false,
@@ -675,6 +811,7 @@ export const register: Register = (on, options) => {
   hasOpened = false
   psPace = paceOf('ps', config.pollMs)
   dfPace = paceOf('df', DF_MS)
+  scanPace = paceOf('scan', SCAN_MS)
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'jobs', description: 'Open the Jobs pane (long-running jobs and disk space)' })
@@ -719,6 +856,7 @@ export const register: Register = (on, options) => {
             log: output,
             match: isTimer ? null : match,
             isTimer,
+            isService: !isTimer && isServiceTask(e.command, e.description),
           })
         }
         return ran
@@ -738,6 +876,7 @@ export const register: Register = (on, options) => {
             log,
             match: isTimer ? null : match,
             isTimer,
+            isService: !isTimer && isServiceTask(launch.segment, e.description),
           })
         }
       }
@@ -790,8 +929,6 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     const columns = e.viewport?.columns ?? 60
     const barWidth = Math.max(8, Math.min(24, columns - 40))
-    const color = (state: JobState) =>
-      state === 'running' ? 'green' : state === 'stalled' ? 'red' : state === 'quiet' ? 'yellow' : 'gray'
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -815,11 +952,10 @@ export const register: Register = (on, options) => {
                   ? `  ${formatCount(job.progress.done)}/${formatCount(job.progress.total)}`
                   : '')
               : ''
-            const eta = etaText(job, now)
             const timing =
               job.state === 'done'
                 ? `finished ${formatDuration((now - (job.finishedAt ?? now)) / 1000)} ago`
-                : `${eta ? `${eta} · ` : ''}log ${age} ago`
+                : [etaText(job, now), job.port !== null && `port ${job.port}`, `log ${age} ago`].filter(Boolean).join(' · ')
             return (
               <Box key={`job-${job.id}`} flexDirection="column">
                 <Box flexDirection="row" justifyContent="space-between">
@@ -827,7 +963,7 @@ export const register: Register = (on, options) => {
                     {job.label}
                   </Text>
                   <Box flexDirection="row" gap={1}>
-                    <Text color={color(job.state)}>{job.state}</Text>
+                    <Text color={STATE_COLORS[job.state]}>{job.state}</Text>
                     <Button
                       key={`rm-${job.id}`}
                       label="×"

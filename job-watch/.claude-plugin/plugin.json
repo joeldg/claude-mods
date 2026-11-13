@@ -1,7 +1,7 @@
 {
   "name": "job-watch",
-  "version": "0.4.0",
-  "description": "Live pane of long-running jobs (training, downloads, extractions): progress, ETA, stalls and finishes, read from their logs with no model calls; jobs_list / jobs_watch / jobs_unwatch tools so Claude follows jobs instead of polling them.",
+  "version": "0.5.0",
+  "description": "Live pane of long-running jobs (training, downloads, extractions) and the servers Claude starts: progress, ETA, stalls, exits and finishes, read from their logs with no model calls; jobs_list / jobs_watch / jobs_unwatch tools so Claude follows jobs instead of polling them.",
   "author": {
     "name": "joeldg"
   },
@@ -18,6 +18,12 @@
       "title": "Stall reminder every (minutes)",
       "description": "After a job's first stall toast, the least time before it is toasted about again: a reminder while it stays silent (\"still silent after 2h10m\"), or its stall once more after it wrote a line and went quiet again. 0 toasts each job's first stall only.",
       "default": 60
+    },
+    "stallReminders": {
+      "type": "number",
+      "title": "Stall reminders per silence",
+      "description": "How many reminders (\"still silent after 2h10m\") a job gets while one silence goes on, after its first stall toast; then that silence goes unmentioned until the job writes a line and lapses again. 0 gives none.",
+      "default": 3
     },
     "pollSeconds": {
       "type": "number",

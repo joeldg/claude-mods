@@ -175,6 +175,103 @@ export const isTimerTask = (command: string, description = ''): boolean => {
   return isPureTimer || isDescribedWait
 }
 
+/** What a description calls a service: a dev server, a listener, a daemon, or serving something. */
+const SERVICE_WORDS = /\b(dev server|server|serve|serving|listener|daemon)\b/i
+/** Runners whose own name says nothing: the command after them is what runs. */
+const RUNNERS = new Set(['npx', 'bunx', 'pnpx', 'bundle'])
+const SERVICE_SKIPPED = new Set([...SKIPPED, ...RUNNERS])
+/** Programs that are servers whatever their arguments; `http.server` for `python -m http.server`. */
+const SERVER_PROGRAMS = new Set([
+  'vite', 'nuxt', 'webpack-dev-server', 'uvicorn', 'gunicorn', 'caddy', 'nginx', 'redis-server', 'postgres',
+  'http.server', 'http-server', 'live-server', 'json-server', 'serve',
+])
+const PYTHON = /^python\d*(?:\.\d+)?$/
+const PYTHON_RUNNERS = new Set(['uv', 'poetry', 'pipenv'])
+const SCRIPT_RUNNERS = new Set(['npm', 'pnpm', 'yarn', 'bun'])
+const NODE_RUNNERS = new Set(['node', 'nodemon', 'tsx', 'ts-node', 'bun', 'deno'])
+/** A package script that serves: `dev`, `start`, `serve`, `preview`, or one of their `dev:web` kind. */
+const SERVE_SCRIPT = /^(?:dev|start|serve|preview)(?::|$)/
+/** A redirection with its target (`> log`, `2>&1`, `< /dev/null`), so a log named `server.log` is no server. */
+const REDIRECTED = /(?:\d*[<>]+&?\d*|&>>?)\s*(?:"[^"]*"|'[^']*'|[^\s&;|]*)/g
+/** The programs that serve with the right arguments: what those are, by program. */
+const SERVER_RULES = new Map<string, (args: readonly string[]) => boolean>([
+  ['next', args => args[0] === 'dev' || args[0] === 'start'],
+  ['astro', args => args[0] === 'dev' || args[0] === 'preview'],
+  ['webpack', args => args[0] === 'serve'],
+  ['ng', args => args[0] === 'serve'],
+  ['ollama', args => args[0] === 'serve'],
+  ['modal', args => args[0] === 'serve'],
+  ['fastapi', args => args[0] === 'dev' || args[0] === 'run'],
+  ['flask', args => args.includes('run')],
+  ['rails', args => args[0] === 's' || args[0] === 'server'],
+  ['php', args => args[0] === '-S' || (args.some(word => basename(word) === 'artisan') && args.includes('serve'))],
+  ['django', args => args.includes('runserver')],
+  ['django-admin', args => args.includes('runserver')],
+  ['manage.py', args => args.includes('runserver')],
+  ['docker', args => args.includes('compose') && args.includes('up')],
+  ['docker-compose', args => args.includes('up')],
+])
+
+/** What a `python` runs, to judge by itself: its `-m` module with its arguments, or its script with its own. */
+const pythonRuns = (args: readonly string[]): string[] => {
+  const moduleAt = args.indexOf('-m')
+  if (moduleAt >= 0) {
+    return args.slice(moduleAt + 1)
+  }
+  const script = args.find(word => /\.py$/.test(word))
+  return script === undefined ? [] : args.slice(args.indexOf(script))
+}
+
+/** Whether the simple command `words` (its program first) runs a known server program. */
+const runsServer = (words: readonly string[]): boolean => {
+  const head = basename(words[0] ?? '')
+  const args = words.slice(1)
+  const first = args[0] ?? ''
+  if (SERVER_PROGRAMS.has(head)) {
+    return true
+  }
+  const rule = SERVER_RULES.get(head)
+  if (rule) {
+    return rule(args)
+  }
+  if (PYTHON.test(head)) {
+    // `python -m uvicorn …`, `-m http.server`, `-m flask run`; `python manage.py runserver`.
+    return runsServer(pythonRuns(args))
+  }
+  if (PYTHON_RUNNERS.has(head)) {
+    return first === 'run' && runsServer(args.slice(1))
+  }
+  if (SCRIPT_RUNNERS.has(head)) {
+    if (first === 'exec' || first === 'dlx' || first === 'x') {
+      return runsServer(args.slice(1))
+    }
+    if (SERVE_SCRIPT.test(first === 'run' ? (args[1] ?? '') : first)) {
+      return true
+    }
+    if (head !== 'bun') {
+      return false
+    }
+  }
+  return NODE_RUNNERS.has(head) && args.some(word => !word.startsWith('-') && /\bserver\b/i.test(word))
+}
+
+/**
+ * Whether a background command is a service: a server or daemon that is silent while idle, so
+ * never stalled. One that runs a known server program in any of its simple commands (past launch
+ * wrappers, assignments, a `cd`, a package runner or `uv run`), or one described as a server,
+ * listener or daemon, whatever it runs.
+ */
+export const isServiceTask = (command: string, description = ''): boolean => {
+  if (SERVICE_WORDS.test(description)) {
+    return true
+  }
+  const text = command.replace(SUBSTITUTION, ' ').replace(REDIRECTED, ' ').replace(/[()]/g, ' ')
+  return simpleCommands(text).some(words => {
+    const index = programIndex(words, SERVICE_SKIPPED)
+    return words[0] !== 'for' && index < words.length && runsServer(words.slice(index))
+  })
+}
+
 export type Launch = { log: string; segment: string; cwd: string | null }
 
 /**

@@ -1,4 +1,4 @@
-export type JobState = 'running' | 'quiet' | 'stalled' | 'done'
+export type JobState = 'running' | 'serving' | 'quiet' | 'stalled' | 'done'
 
 export type Progress = { done: number; total: number; pct: number }
 
@@ -32,6 +32,11 @@ export type Job = {
    * minutes is told of once an hour, not once per lapse.
    */
   stallToastAt: number | null
+  /**
+   * Reminders toasted of the silence `stallToastAt` belongs to (`still silent after …`). After
+   * stallReminders of them the silence goes unmentioned until the job writes a line and lapses again.
+   */
+  stallReminded: number
   state: JobState
   finishedAt: number | null
   /** The exit code a background task's output file ends with (`[exited with code N]`); null until then. */
@@ -42,6 +47,14 @@ export type Job = {
    * or counted, and dropped a minute after it ends.
    */
   isTimer: boolean
+  /**
+   * A server or daemon: a known server program (`next dev`, `uvicorn`, `redis-server`…), a task
+   * described as a server, listener or daemon, or a process dev-servers saw listening on a port.
+   * Silent while idle, so never quiet or stalled: `serving` until it exits, which is toasted.
+   */
+  isService: boolean
+  /** The port it listens on, from dev-servers' shared scan cache; null until that is known. */
+  port: number | null
 }
 
 export type Disk = { mount: string; freeGB: number; capacityPct: number }

@@ -6,6 +6,7 @@ import {
   formatDuration,
   isAlive,
   isPidAlive,
+  isServiceTask,
   isTimerTask,
   launchFromCommand,
   matchToken,
@@ -195,4 +196,71 @@ test('tells a pure timer from a real background job', () => {
   expect(isTimerTask('.venv/bin/python -m myproject.train --epochs 3', 'train coarse model')).toBe(false)
   expect(isTimerTask('cat urls.txt | xargs -n1 curl -sO')).toBe(false)
   expect(isTimerTask('')).toBe(false)
+})
+
+test('tells a server or daemon from a batch job, by its program or its description', () => {
+  // A known server program, past launch noise, a cd, assignments, a package runner or `uv run`.
+  for (const command of [
+    'next dev',
+    'npx next dev -p 3001',
+    'PORT=3001 npm run dev',
+    'cd web && pnpm dev',
+    'yarn start',
+    'bun run preview',
+    'npm run dev:web -- --host',
+    'pnpm exec next start',
+    'nohup vite > /tmp/vite.log 2>&1 &',
+    'nuxt dev',
+    'astro dev',
+    'webpack serve --mode development',
+    'ng serve --port 4300',
+    'uvicorn app.main:app --reload',
+    '.venv/bin/gunicorn -w 4 app:app',
+    'uv run uvicorn app:app',
+    'flask --app app run --debug',
+    'fastapi dev main.py',
+    'python manage.py runserver 0.0.0.0:8000',
+    './manage.py runserver',
+    'python3 -m http.server 8000',
+    'bundle exec rails s',
+    'bin/rails server -p 3000',
+    'php artisan serve',
+    'php -S localhost:8000',
+    'node server.js',
+    'node --watch dist/server/index.js',
+    'caddy run',
+    'nginx -g "daemon off;"',
+    'redis-server /etc/redis.conf',
+    'postgres -D /var/lib/pg',
+    'docker compose -f dev.yml up',
+    'docker-compose up',
+    'ollama serve',
+    'modal serve app.py',
+  ]) {
+    expect(isServiceTask(command)).toBe(true)
+  }
+  // Described as a server, listener or daemon, whatever the program.
+  expect(isServiceTask('./bin/thing --listen', 'Start the dev server')).toBe(true)
+  expect(isServiceTask('./bin/thing', 'Restart the Next dev server on port 3000')).toBe(true)
+  expect(isServiceTask('./bin/thing', 'Run the metrics listener')).toBe(true)
+  expect(isServiceTask('./bin/thing', 'the sync daemon')).toBe(true)
+  expect(isServiceTask('./bin/thing', 'serve the static build')).toBe(true)
+  // A batch job is not: training, tests, builds, installs, migrations, a download, a timer.
+  for (const command of [
+    '.venv/bin/python -m myproject.train --epochs 3',
+    'pytest tests/',
+    'npm run build',
+    'npm install',
+    'next build',
+    'node scripts/migrate.js',
+    'cat urls.txt | xargs -n1 curl -sO',
+    'docker compose build',
+    'rails db:migrate',
+    'sleep 600',
+    '',
+  ]) {
+    expect(isServiceTask(command, 'run the thing')).toBe(false)
+  }
+  // The words must stand alone: observing or preserving is not serving.
+  expect(isServiceTask('pytest tests/', 'observe the training run, preserving the logs')).toBe(false)
 })

@@ -1,4 +1,14 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
+
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: string; context?: string[] }
+const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
 import type { On, RegisteredToolSpec } from 'claude-code'
 
 const PANE_PROPS = {
@@ -43,6 +53,10 @@ type World = {
   opened: string[]
   tools: RegisteredToolSpec[]
   commands: string[]
+  /** The dev-servers scan cache's text, made when read (so its `ts` is current); null when the file is missing. */
+  scanCache: (() => string) | null
+  /** Every path the mod read whole. */
+  reads: string[]
 }
 
 /** Answers the host beneath the plugin: processes, files, toasts, status, panes and registrations. */
@@ -60,6 +74,8 @@ const world = (on: On, now: () => number): World => {
     opened: [],
     tools: [],
     commands: [],
+    scanCache: null,
+    reads: [],
   }
   on('process.run', (_$, e) => {
     const out = (stdout: string) => ({
@@ -80,6 +96,10 @@ const world = (on: On, now: () => number): World => {
     value: { kind: 'file' as const, size: w.files[e.path]?.size ?? w.size, mtimeMs: now(), isLink: false },
   }))
   on('fs.exists', (_$, e) => ({ value: !e.path.includes('missing') }))
+  on('fs.read', (_$, e) => {
+    w.reads.push(e.path)
+    return e.path.endsWith('/scan-cache.json') && w.scanCache ? { value: w.scanCache() } : { deny: 'no such file' }
+  })
   on('ui.toast', (_$, e) => {
     w.toasts.push(e.text)
     return { value: undefined }
@@ -117,7 +137,7 @@ const start = async ($: any): Promise<void> => {
 
 /** Calls one of the mod's tools as the model would, answering its text. */
 const tool = async ($: any, name: string, input: Record<string, unknown> = {}): Promise<string> =>
-  String((await $.tool.call({ tool: `mcp__job-watch__${name}`, ...input })).result)
+  String((await callTool($, { tool: `mcp__job-watch__${name}`, ...input })).result)
 
 /** Every Text the Jobs pane draws on the terminal, one string per element. */
 const paneTexts = async ($: any): Promise<string[]> => {
@@ -146,7 +166,7 @@ test('a background Bash task is tracked to its finish', SLOW, async ($, on) => {
   const step = () => Math.min(100, Math.floor((clock.now() - 1_000_000) / 1000))
   Object.defineProperty(w, 'log', { get: () => `step ${step()}/100 loss 0.5\n` })
   Object.defineProperty(w, 'size', { get: () => step() })
-  await $.tool.call({
+  await callTool($, {
     tool: 'Bash',
     command: '.venv/bin/python -m myproject.train --epochs 3',
     run_in_background: true,
@@ -180,7 +200,7 @@ test('a quick background command leaves without a toast', SLOW, async ($, on) =>
     text: 'Command running in background with ID: b2. Output is being written to: /tmp/s/tasks/b2.output.',
   }))
   w.ps = 'pytest tests/test_x.py\n'
-  await $.tool.call({ tool: 'Bash', command: 'pytest tests/test_x.py', run_in_background: true, description: 'run tests' })
+  await callTool($, { tool: 'Bash', command: 'pytest tests/test_x.py', run_in_background: true, description: 'run tests' })
   await clock.advance(10_000)
   w.ps = ''
   await clock.advance(10_000)
@@ -199,7 +219,7 @@ test('a detached nohup launch is picked up from its redirect', SLOW, async ($, o
   w.log = 'extracting 3 of 12 shards\n'
   w.size = 10
 
-  await $.tool.call({
+  await callTool($, {
     tool: 'Bash',
     command: 'cd /Volumes/NAS/data && nohup ./scripts/run.sh >> extract.log 2>&1 < /dev/null & disown; sleep 2',
     description: 'start extraction',
@@ -291,7 +311,7 @@ test('jobs_list reports each job, and with none says how jobs get watched', SLOW
     get: () => (hasExited ? 'step 100/100 loss 0.1\n\n[exited with code 0]\n' : `step ${step()}/100 loss 0.5\n`),
   })
   Object.defineProperty(w, 'size', { get: () => (hasExited ? 1000 : step()) })
-  await $.tool.call({
+  await callTool($, {
     tool: 'Bash',
     command: '.venv/bin/python -m myproject.train --epochs 3',
     run_in_background: true,
@@ -331,7 +351,7 @@ test('a background task with no process to match still finishes on its exit mark
   w.log = 'fetching…\n'
   w.size = 9
   // A pipeline led by `cat` gives `ps` nothing to match: the job is judged by its output file alone.
-  await $.tool.call({
+  await callTool($, {
     tool: 'Bash',
     command: 'cat urls.txt | xargs -n1 curl -sO',
     run_in_background: true,
@@ -558,7 +578,7 @@ test('a sleep timer is listed, but never toasted, counted or opened for, and lea
   w.files['/tmp/s/tasks/r1.output'] = { log: 'collecting tests\n', size: 17 }
 
   // A timer Claude set itself: kept for jobs_list, but no job to count, to open the pane for, or to run ps for.
-  await $.tool.call({
+  await callTool($, {
     tool: 'Bash',
     command: 'sleep 600 && echo "timer done"',
     run_in_background: true,
@@ -580,7 +600,7 @@ test('a sleep timer is listed, but never toasted, counted or opened for, and lea
 
   // A real job beside it: the status line counts that one alone, and it opens the pane.
   w.ps = 'pytest tests/\n'
-  await $.tool.call({ tool: 'Bash', command: 'pytest tests/', run_in_background: true, description: 'Run the suite' })
+  await callTool($, { tool: 'Bash', command: 'pytest tests/', run_in_background: true, description: 'Run the suite' })
   await clock.advance(70_000)
   expect(w.statuses.at(-1)).toBe('jobs: 1 running')
   expect(w.opened).toEqual(['job-watch'])
@@ -615,7 +635,7 @@ test('a wait loop that ps would show never goes stalled, and costs no ps probe',
     text: 'Command running in background with ID: t2. Output is being written to: /tmp/s/tasks/t2.output.',
   }))
   w.ps = '/bin/zsh -c until [ "$(date +%H%M)" -ge 0146 ]; do sleep 30; done; date\n'
-  await $.tool.call({
+  await callTool($, {
     tool: 'Bash',
     command: 'until [ "$(date +%H%M)" -ge 0146 ]; do sleep 30; done; date',
     run_in_background: true,
@@ -650,7 +670,7 @@ const startDownload = async ($: any, on: On, w: World): Promise<void> => {
   w.ps = ' 4242 python fetch.py --all\n'
   w.log = 'fetching archive part 3\n'
   w.size = 24
-  await $.tool.call({ tool: 'Bash', command: 'python fetch.py --all', run_in_background: true, description: 'download the archive' })
+  await callTool($, { tool: 'Bash', command: 'python fetch.py --all', run_in_background: true, description: 'download the archive' })
 }
 
 test('a job silent for hours is toasted once when it stalls, then reminded hourly: not once per poll, nor per ps flap', SLOW, async ($, on) => {
@@ -764,4 +784,151 @@ test('a job that writes a line every 25 minutes is toasted for its first stall, 
     'download the archive has written nothing for 20m',
     'download the archive has written nothing for 10m',
   ])
+})
+
+test('a silence is reminded of stallReminders (3) times, then no more until the job writes again', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  await startDownload($, on, w)
+
+  // Six silent hours: the stall, three hourly reminders, then nothing: the person has heard enough.
+  await clock.advance(6 * 3_600_000)
+  expect(w.toasts).toEqual([
+    'download the archive has written nothing for 10m',
+    'download the archive still silent after 70m',
+    'download the archive still silent after 2h10m',
+    'download the archive still silent after 3h10m',
+  ])
+  expect(w.statuses.at(-1)).toBe('jobs: 1 stalled')
+  expect(await tool($, 'jobs_list')).toMatch(/^download the archive \[d1\]: stalled \(no output for 10m\) · last output 6h00m ago\n/)
+
+  // A line ends that silence; the next one is told of afresh, with its own reminders.
+  w.log = 'fetching archive part 4\n'
+  w.size = 48
+  await clock.advance(10_000)
+  expect(w.statuses.at(-1)).toBe('jobs: 1 running')
+  await clock.advance(2 * 3_600_000)
+  expect(w.toasts.slice(4)).toEqual([
+    'download the archive has written nothing for 10m',
+    'download the archive still silent after 70m',
+  ])
+})
+
+test('with stallReminders 0 each silence is toasted once, when it begins', { ...SLOW, options: { stallReminders: 0 } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  await startDownload($, on, w)
+  await clock.advance(3 * 3_600_000)
+  expect(w.toasts).toEqual(['download the archive has written nothing for 10m'])
+  w.log = 'fetching archive part 4\n'
+  w.size = 48
+  await clock.advance(3 * 3_600_000)
+  expect(w.toasts).toEqual([
+    'download the archive has written nothing for 10m',
+    'download the archive has written nothing for 10m',
+  ])
+})
+
+/** A dev-servers scan cache as another session wrote it, stamped now. */
+const scanned = (now: () => number, listeners: object[]): (() => string) =>
+  () => JSON.stringify({ ts: now(), by: 'another-session', data: { listeners } })
+
+test('a dev server is serving, never stalled: its port comes from the dev-servers scan cache, and its exit is toasted once', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  mock.env(on, { HOME: '/home/dev' })
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'n1' },
+    text: 'Command running in background with ID: n1. Output is being written to: /tmp/s/tasks/n1.output.',
+  }))
+  w.ps = ' 4242 node /home/dev/app/node_modules/.bin/next dev\n'
+  w.log = '  ▲ Next.js 15.0.0\n  - Local: http://localhost:3000\n ✓ Ready in 1.2s\n'
+  w.size = 70
+  // What dev-servers last scanned: the server's process listens on 3000, beside a listener of another kind.
+  w.scanCache = scanned(clock.now, [
+    {
+      pid: 4242,
+      command: 'node',
+      ports: [3000],
+      detail: { commandLine: 'node /home/dev/app/node_modules/.bin/next dev', startedAt: 0, cwd: '/home/dev/app' },
+    },
+    { pid: 99, command: 'claude', ports: [60833], detail: null },
+  ])
+  await callTool($, {
+    tool: 'Bash',
+    command: 'next dev',
+    run_in_background: true,
+    description: 'Restart the Next dev server on port 3000',
+  })
+
+  // Six silent hours: a server writes nothing while idle, so it is serving, never stalled, and no toast comes.
+  await clock.advance(6 * 3_600_000)
+  expect(w.toasts).toEqual([])
+  expect(w.statuses.at(-1)).toBe('jobs: 1 serving')
+  const listed = await tool($, 'jobs_list')
+  expect(listed).toMatch(
+    /^Restart the Next dev server on port 3000 \[n1\]: serving on port 3000 · last output 6h00m ago\n  log \/tmp\/s\/tasks\/n1\.output\n  › ✓ Ready in 1\.2s\n/,
+  )
+  expect(listed).toMatch(/serving = /)
+  const texts = await paneTexts($)
+  expect(texts).toContain('serving')
+  expect(texts).not.toContain('stalled')
+  expect(texts.some(text => /^port 3000 · log 6h00m ago$/.test(text))).toBe(true)
+  // The cache is read until the port is known, then left alone.
+  expect(w.reads).toEqual(['/home/dev/.claude/dev-servers/scan-cache.json'])
+
+  // A real job beside it is counted beside it.
+  w.ps += '  777 python fetch.py --all\n'
+  await tool($, 'jobs_watch', { pid: 777, name: 'fetch' })
+  expect(w.statuses.at(-1)).toBe('jobs: 1 serving · 1 running')
+
+  // The server exits: toasted once, with its code, and listed as finished.
+  w.ps = '  777 python fetch.py --all\n'
+  w.log = '  ▲ Next.js 15.0.0\n ✓ Ready in 1.2s\nError: listen EADDRINUSE\n[exited with code 1]\n'
+  w.size = 120
+  await clock.advance(10_000)
+  expect(w.toasts).toEqual([
+    'Restart the Next dev server on port 3000 exited with code 1 after 6h00m: Error: listen EADDRINUSE',
+  ])
+  expect(w.statuses.at(-1)).toBe('jobs: 1 running')
+  expect(await tool($, 'jobs_list')).toMatch(
+    /^Restart the Next dev server on port 3000 \[n1\]: finished \d+s ago \(exit 1\) · last output \d+s ago\n/m,
+  )
+  await clock.advance(600_000)
+  expect(w.toasts).toHaveLength(1)
+})
+
+test('a task described as a server, whatever its program, and a watched pid that listens are serving, not stalled', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  mock.env(on, { HOME: '/home/dev' })
+  on('session.cwd', () => ({ value: '/home/dev/app' }))
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 's1' },
+    text: 'Command running in background with ID: s1. Output is being written to: /tmp/s/tasks/s1.output.',
+  }))
+  w.ps = ' 4242 ./bin/thing --listen\n  777 ./bin/other\n'
+  w.log = 'listening\n'
+  w.size = 10
+  await callTool($, { tool: 'Bash', command: './bin/thing --listen', run_in_background: true, description: 'Start the dev server' })
+
+  // A pid followed with jobs_watch whose only sign of being a server is the port dev-servers saw it on.
+  w.scanCache = scanned(clock.now, [{ pid: 777, command: 'other', ports: [8081, 8080], detail: null }])
+  expect(await tool($, 'jobs_watch', { pid: 777, name: 'other' })).toBe(
+    'Watching other [pid-777]: pid 777, listening on port 8080. Call jobs_list to check on it: it counts as serving (a server is silent while idle, never stalled) and as finished when the process exits.',
+  )
+
+  // Twenty silent minutes, past the stall threshold: both are serving, neither is toasted.
+  await clock.advance(1_200_000)
+  expect(w.toasts).toEqual([])
+  expect(w.statuses.at(-1)).toBe('jobs: 2 serving')
+  const listed = await tool($, 'jobs_list')
+  expect(listed).toMatch(/^Start the dev server \[s1\]: serving · last output 20m ago\n  log \/tmp\/s\/tasks\/s1\.output\n  › listening\n/m)
+  expect(listed).toMatch(/^other \[pid-777\]: serving on port 8080 · pid 777 · no log \(added 20m ago\)$/m)
+  expect(await paneTexts($)).not.toContain('stalled')
+
+  // The watched pid goes: its exit is announced like any service's, with no code to report.
+  w.ps = ' 4242 ./bin/thing --listen\n'
+  await clock.advance(10_000)
+  expect(w.toasts).toEqual(['other exited after 20m'])
 })
