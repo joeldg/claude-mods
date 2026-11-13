@@ -36,7 +36,22 @@ import {
   usage,
 } from './plan'
 import type { FactSheet } from './plan'
-import { EXCLUDED_DIRS, baseName, datedName, folderOf, inScope, isDoc, joinPath, normalisePath, parseGlobs, relativeTo, rgFilesArgv, rgIdentifiersArgv } from './scope'
+import {
+  DEFAULT_BRANCH_REFS,
+  EXCLUDED_DIRS,
+  baseName,
+  datedName,
+  folderOf,
+  inScope,
+  isDoc,
+  joinPath,
+  normalisePath,
+  parseGlobs,
+  pickDefaultBranch,
+  relativeTo,
+  rgFilesArgv,
+  rgIdentifiersArgv,
+} from './scope'
 import { auditTree } from './view'
 import type { PaneActions } from './view'
 
@@ -515,36 +530,35 @@ async function writeNote($: Engine, filePath: string, content: string | null): P
   return contextNote(rel, found, config.staleDays)
 }
 
-async function defaultBranch($: Engine, root: string): Promise<string | null> {
-  const symbolic = await git($, root, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
-  if (symbolic.ok && symbolic.out.trim() !== '') {
-    return symbolic.out.trim()
-  }
-  const refs = await git($, root, [
-    'for-each-ref',
-    '--format=%(refname:short)',
-    'refs/remotes/origin/main',
-    'refs/remotes/origin/master',
-    'refs/heads/main',
-    'refs/heads/master',
+type Branches = { base: string | null; current: string }
+
+/**
+ * The branch checked out now ('' on a detached HEAD) and the default branch to judge it against: origin/HEAD's
+ * target, else origin/main, origin/master, main, master, else the current one; two reads that never fail.
+ */
+async function branches($: Engine, root: string): Promise<Branches> {
+  const [refs, shown] = await Promise.all([
+    git($, root, ['for-each-ref', '--format=%(refname)%09%(symref)', ...DEFAULT_BRANCH_REFS]),
+    git($, root, ['branch', '--show-current']),
   ])
-  return refs.ok ? (trimmedLines(refs.out)[0] ?? null) : null
+  const current = shown.ok ? shown.out.trim() : ''
+  return { base: pickDefaultBranch(refs.ok ? refs.out : null, current === '' ? null : current), current }
 }
 
 /** What the model is told about the project: name, folders, the last 20 commit subjects, the default branch. */
 async function factSheet($: Engine, root: string): Promise<FactSheet> {
-  const [entries, log, branch] = await Promise.all([$.fs.list(root).catch(() => []), git($, root, ['log', '-20', '--format=%s']), defaultBranch($, root)])
+  const [entries, log, found] = await Promise.all([$.fs.list(root).catch(() => []), git($, root, ['log', '-20', '--format=%s']), branches($, root)])
   const folders = entries
     .filter(entry => entry.kind === 'dir' && !EXCLUDED_DIRS.includes(entry.name) && !entry.name.startsWith('.'))
     .map(entry => entry.name)
     .sort()
-  return { repo: baseName(root), defaultBranch: branch?.replace(/^origin\//, '') ?? null, folders, commits: log.ok ? trimmedLines(log.out) : [] }
+  return { repo: baseName(root), defaultBranch: found.base?.replace(/^origin\//, '') ?? null, folders, commits: log.ok ? trimmedLines(log.out) : [] }
 }
 
 /** The files changed on the branch against the default branch; on the default branch, the last 7 days; plus the working tree. */
 async function changedFiles($: Engine, root: string): Promise<{ files: Set<string>; scope: string }> {
-  const [base, current] = await Promise.all([defaultBranch($, root), git($, root, ['branch', '--show-current'])])
-  const branch = current.out.trim() || 'HEAD'
+  const { base, current } = await branches($, root)
+  const branch = current || 'HEAD'
   const isDefault = base === null || branch === base.replace(/^origin\//, '')
   const committed = isDefault
     ? await git($, root, ['log', '--since=7.days', '--format=', '--name-only'])

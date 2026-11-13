@@ -1,19 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import {
-  EXCLUDED_DIRS,
-  datedName,
-  folderOf,
-  globToRegExp,
-  inScope,
-  isoWeek,
-  joinPath,
-  normalisePath,
-  parseGlobs,
-  relativeTo,
-  rgFilesArgv,
-  rgIdentifiersArgv,
-} from '../hooks/scope'
+import { DEFAULT_BRANCH_REFS, EXCLUDED_DIRS, datedName, folderOf, globToRegExp, inScope, isoWeek, joinPath, normalisePath, parseGlobs, pickDefaultBranch, relativeTo, rgFilesArgv, rgIdentifiersArgv } from '../hooks/scope'
 
 test('the vendored, built and virtualenv folders are out of scope wherever they sit', async () => {
   expect(EXCLUDED_DIRS).toEqual(['node_modules', 'third_party', 'vendor', '.venv', 'venv', 'site-packages', 'dist', 'build', '.git'])
@@ -101,4 +88,20 @@ test('the rg command lines list markdown with the exclusions, and look identifie
   expect(idents).toContain('!*.md')
   expect(idents).toContain('!vendor')
   expect(idents.at(-1)).toBe('/home/dev/widgets')
+})
+
+test('the default branch is picked from one for-each-ref read: origin/HEAD, then origin/main, origin/master, main, master, then the current branch', async () => {
+  const rows = (...lines: string[]): string => lines.map(line => `${line}\n`).join('')
+  expect(DEFAULT_BRANCH_REFS).toEqual(['refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master', 'refs/heads/main', 'refs/heads/master'])
+  // origin/HEAD's target wins over every stand-in, whatever its name.
+  expect(pickDefaultBranch(rows('refs/heads/main\t', 'refs/remotes/origin/HEAD\trefs/remotes/origin/develop', 'refs/remotes/origin/main\t'), 'feature')).toBe('origin/develop')
+  expect(pickDefaultBranch(rows('refs/heads/main\t', 'refs/remotes/origin/main\t', 'refs/remotes/origin/master\t'), 'feature')).toBe('origin/main')
+  expect(pickDefaultBranch(rows('refs/heads/main\t', 'refs/remotes/origin/master\t'), 'feature')).toBe('origin/master')
+  expect(pickDefaultBranch(rows('refs/heads/main\t', 'refs/heads/master\t'), 'feature')).toBe('main')
+  expect(pickDefaultBranch(rows('refs/heads/master\t'), 'feature')).toBe('master')
+  // origin/HEAD listed without a target is passed over; neither main nor master: the branch checked out now, or none.
+  expect(pickDefaultBranch(rows('refs/remotes/origin/HEAD\t', 'refs/remotes/origin/master\t'), 'feature')).toBe('origin/master')
+  expect(pickDefaultBranch(rows(), 'feature')).toBe('feature')
+  expect(pickDefaultBranch('', null)).toBeNull()
+  expect(pickDefaultBranch(null, 'feature')).toBe('feature')
 })

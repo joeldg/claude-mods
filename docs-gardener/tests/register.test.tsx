@@ -504,3 +504,24 @@ test('slash commands, bare file names and names anywhere in the code are not dea
   expect(lookups[0]).toContain(' --hidden ')
   expect(lookups[0]).not.toContain(' -m 1 ')
 })
+
+test('the default branch comes from one for-each-ref read, never symbolic-ref: origin/HEAD, else origin/main and kin, else the current branch', SLOW, async ($, on) => {
+  const w = world(on)
+  // A clone made without origin/HEAD: origin/main stands in.
+  w.refs = 'refs/heads/main\t\nrefs/remotes/origin/main\t\n'
+  w.branchFiles = ['README.md']
+  await start($)
+  expect(await docs($, 'audit --changed')).toMatch(/^Docs audit of the docs changed on feature\/docs against origin\/main: 1 doc checked/)
+  await w.clock.settle()
+  expect(w.completes[0]?.prompt).toContain('Default branch: main')
+  expect(w.ran.filter(line => line.startsWith('git symbolic-ref') || line.startsWith('git rev-parse --verify'))).toEqual([])
+  // One read for the scope, one for the fact sheet; a non-zero exit would have been the old symbolic-ref's.
+  const read = 'git for-each-ref --format=%(refname)%09%(symref) refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master refs/heads/main refs/heads/master'
+  expect(w.ran.filter(line => line === read)).toHaveLength(2)
+  // Neither a remote nor main or master: the checked-out branch is the default, so --changed takes the last 7 days.
+  w.refs = ''
+  w.recentFiles = ['docs/runbook.md']
+  expect(await docs($, 'audit --changed')).toMatch(/^Docs audit of the docs changed in the last 7 days on feature\/docs: 1 doc checked/)
+  await w.clock.settle()
+  expect(w.completes.at(-1)?.prompt).toContain('Default branch: feature/docs')
+})

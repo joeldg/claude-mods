@@ -132,6 +132,32 @@ export function rgIdentifiersArgv(root: string, identifiers: readonly string[], 
   ]
 }
 
+/** `refs/remotes/origin/main` as `origin/main`, `refs/heads/main` as `main`. */
+const shortRef = (ref: string): string => ref.replace(/^refs\/(?:remotes|heads)\//, '')
+
+/** The branches that stand in for an unset origin/HEAD, in order. */
+const STAND_INS = ['refs/remotes/origin/main', 'refs/remotes/origin/master', 'refs/heads/main', 'refs/heads/master']
+
+/** The refs one `git for-each-ref` read covers to find the default branch: origin/HEAD and its stand-ins. */
+export const DEFAULT_BRANCH_REFS: readonly string[] = ['refs/remotes/origin/HEAD', ...STAND_INS]
+
+/**
+ * The default branch to judge the checked-out one against, from one `git for-each-ref --format=%(refname)%09%(symref)`
+ * read over DEFAULT_BRANCH_REFS (a read that never fails): what origin/HEAD points to when it is set (a clone made
+ * without it has none), else the first of origin/main, origin/master, main, master that exists, else the branch
+ * checked out now (null on a detached HEAD).
+ */
+export const pickDefaultBranch = (refs: string | null, currentBranch: string | null): string | null => {
+  const rows = (refs ?? '').split('\n').map(line => line.split('\t'))
+  const head = rows.find(([name, target]) => name === 'refs/remotes/origin/HEAD' && target)
+  if (head?.[1]) {
+    return shortRef(head[1])
+  }
+  const names = new Set(rows.map(([name]) => name ?? ''))
+  const found = STAND_INS.find(ref => names.has(ref))
+  return found ? shortRef(found) : currentBranch
+}
+
 const DATED = /(?:^|[^0-9])(\d{4}-\d{2}-\d{2})(?:[^0-9]|$)/
 
 /** The `yyyy-mm-dd` a file name carries, or null. */

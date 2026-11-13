@@ -92,6 +92,8 @@ export type World = {
   /** When each path last changed (ms), for `git log --since`. */
   changedAt: Record<string, number>
   branch: string
+  /** What `git for-each-ref` prints over origin/HEAD and its stand-ins: `<refname>\t<symref target, or nothing>` per line. */
+  refs: string
   branchFiles: string[]
   dirtyFiles: string[]
   /** Files git does not track: `ls-files --others` lists them, `ls-files --` does not, and `blame` fails on them. */
@@ -115,6 +117,9 @@ export type World = {
   opened: { id: string; title?: string; focus?: true }[]
   closed: string[]
 }
+
+/** The one read that finds the default branch, as the mod spells it. */
+const FOR_EACH_REF = 'for-each-ref --format=%(refname)%09%(symref) refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master refs/heads/main refs/heads/master'
 
 const ok = (stdout: string, exitCode = 0, stderr = '') => ({
   value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
@@ -183,6 +188,7 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
     touched: { 'docs/old-design.md': NOW - 95 * DAY },
     changedAt: { 'src/config.py': NOW - 10 * DAY },
     branch: 'feature/docs',
+    refs: 'refs/heads/main\t\nrefs/remotes/origin/HEAD\trefs/remotes/origin/main\nrefs/remotes/origin/main\t\n',
     branchFiles: [],
     dirtyFiles: [],
     untracked: [],
@@ -299,8 +305,8 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
     if (key === 'log -20 --format=%s') {
       return ok(COMMITS.map(line => `${line}\n`).join(''))
     }
-    if (key === 'symbolic-ref --short refs/remotes/origin/HEAD') {
-      return ok('origin/main\n')
+    if (key === FOR_EACH_REF) {
+      return ok(w.refs)
     }
     if (key === 'branch --show-current') {
       return ok(`${w.branch}\n`)
