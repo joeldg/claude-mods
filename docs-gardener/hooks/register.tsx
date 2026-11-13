@@ -45,7 +45,7 @@ type Engine = EngineInterface
 const PLUGIN = 'docs-gardener'
 const PANE = 'docs-gardener'
 const TITLE = 'Docs audit'
-const COMMAND = 'docs'
+const COMMAND = 'garden'
 const TOOL_NAME = 'docs_check'
 const TOOL = `mcp__${PLUGIN}__${TOOL_NAME}`
 const CONTEXT_BLOCK = 'docsGardener'
@@ -68,7 +68,7 @@ const RELIST_MS = 10 * 60_000
 const CONTEXT_TEXT = [
   'Docs here are gardened (docs-gardener): reference docs describe the current state of the project, nothing more.',
   "Before editing a .md file, call docs_check({ path }) and fix what it lists; put passing thoughts and working notes in the project's notes file (NOTES.md or the scratchpad), not in reference docs.",
-  '/docs audit cleans up: the deterministic checks, then a model edit plan applied from a pane.',
+  '/garden audit cleans up: the deterministic checks, then a model edit plan applied from a pane.',
 ].join('\n')
 
 const TOOL_DESCRIPTION =
@@ -393,7 +393,7 @@ const inTarget = (target: Target, file: string): boolean =>
 
 const targetName = (target: Target): string => (target.isFolder ? (target.rel === '' ? 'all docs' : `${target.rel}/`) : target.rel)
 
-/** The deterministic findings for a file or folder, as the tool and `/docs check` answer them. */
+/** The deterministic findings for a file or folder, as the tool and `/garden check` answer them. */
 async function checkPath($: Engine, raw: string): Promise<string> {
   const root = await repoRoot($)
   const target = await resolveTarget($, root, raw)
@@ -533,7 +533,7 @@ async function startAudit($: Engine, request: Request): Promise<string> {
   const now = await $.clock.now()
   const current = await read($, audit)
   if (current?.state === 'running' && now - current.startedAt < STALE_AUDIT_MS) {
-    return `${PLUGIN}: an audit is already running (${current.model} is answering); /docs show opens it.`
+    return `${PLUGIN}: an audit is already running (${current.model} is answering); /garden show opens it.`
   }
   const root = await repoRoot($)
   const corpus = await loadCorpus($, root)
@@ -689,13 +689,13 @@ async function report($: Engine, isApply: boolean): Promise<void> {
     const list = [...written.entries()].map(([path, times]) => (times > 1 ? `${path} ×${times}` : path)).join(', ')
     const summary = `applied ${plural(count, 'change')} in ${plural(written.size, 'file')}`
     $.ui.toast(`Docs audit ${summary}${failedNote}`, { timeoutMs: 8_000 })
-    $.ui.log(`${PLUGIN}: /docs audit --apply ${summary}${list !== '' ? ` (${list})` : ''}${failedNote}; the diffs are in the debug log.`)
+    $.ui.log(`${PLUGIN}: /garden audit --apply ${summary}${list !== '' ? ` (${list})` : ''}${failedNote}; the diffs are in the debug log.`)
     return
   }
   const proposed = current.files.flatMap(file => file.items.filter(item => item.verdict !== 'current'))
   const inFiles = current.files.filter(file => file.items.some(item => item.verdict !== 'current')).length
   const summary = proposed.length > 0 ? `${plural(proposed.length, 'change')} proposed in ${plural(inFiles, 'file')}` : 'nothing to change'
-  $.ui.toast(`Docs audit ready: ${summary}${failedNote} · /docs show`, { timeoutMs: 8_000 })
+  $.ui.toast(`Docs audit ready: ${summary}${failedNote} · /garden show`, { timeoutMs: 8_000 })
 }
 
 async function setItem($: Engine, fi: number, ii: number, state: DocsItemState, note: string | null): Promise<void> {
@@ -784,7 +784,7 @@ async function applyAll($: Engine, fi: number): Promise<void> {
 async function show($: Engine): Promise<string> {
   const current = await read($, audit)
   if (!current) {
-    return 'No docs audit yet. /docs audit runs one.'
+    return 'No docs audit yet. /garden audit runs one.'
   }
   const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true }).catch((error: unknown) => ({ isPlaced: false as const, reason: messageOf(error) }))
   return opened.isPlaced ? `Showing the docs audit of ${current.scope}.` : `The pane could not be shown here (${opened.reason}); the audit of ${current.scope} is kept.`
@@ -808,13 +808,8 @@ export const register: Register = (on, options) => {
   roots = new Map()
 
   on('session.start', async ($, e, next) => {
+    // The tool first and on its own: a refused command name (a skill may own it) must not cost the tool.
     try {
-      await $.command.register({
-        name: COMMAND,
-        description: 'Garden the docs: /docs audit [path|--changed] [--apply] checks every markdown file and plans edits with a model; /docs check <path> runs the checks alone',
-        argumentHint: 'audit [path|--changed] [--apply] | check <path> | show',
-        immediate: true,
-      })
       await $.tool.register({
         name: TOOL_NAME,
         description: TOOL_DESCRIPTION,
@@ -826,7 +821,17 @@ export const register: Register = (on, options) => {
         isDeferred: false,
       })
     } catch (error) {
-      debug($, `could not register: ${messageOf(error)}`)
+      debug($, `could not register the tool: ${messageOf(error)}`)
+    }
+    try {
+      await $.command.register({
+        name: COMMAND,
+        description: 'Garden the docs: /garden audit [path|--changed] [--apply] checks every markdown file and plans edits with a model; /garden check <path> runs the checks alone',
+        argumentHint: 'audit [path|--changed] [--apply] | check <path> | show',
+        immediate: true,
+      })
+    } catch (error) {
+      debug($, `could not register the command: ${messageOf(error)}`)
     }
     return next(e)
   })

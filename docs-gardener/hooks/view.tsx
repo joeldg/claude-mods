@@ -143,7 +143,7 @@ export function auditTree(kit: Kit, audit: DocsAudit | null, actions: PaneAction
   if (audit === null) {
     return (
       <Box flexDirection="column">
-        <Text dimColor>No docs audit yet. /docs audit runs one.</Text>
+        <Text dimColor>No docs audit yet. /garden audit runs one.</Text>
       </Box>
     )
   }

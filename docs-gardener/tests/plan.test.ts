@@ -49,7 +49,7 @@ const item = (section: string, verdict: DocsPlanItem['verdict'], replacement: st
 
 const LINES = README.split('\n')
 
-test('parseArgs reads the /docs forms', async () => {
+test('parseArgs reads the /garden forms', async () => {
   expect(parseArgs('')).toEqual({ kind: 'help' })
   expect(parseArgs('help')).toEqual({ kind: 'help' })
   expect(parseArgs('audit')).toEqual({ kind: 'audit', path: null, isChanged: false, isApply: false })

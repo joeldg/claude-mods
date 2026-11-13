@@ -149,7 +149,7 @@ test('writeTimeChecks off: writes are left alone', { ...SLOW, options: { writeTi
 test('the docs_check tool is registered in front, allowed without asking, and lists the findings for a file or folder', SLOW, async ($, on) => {
   const w = world(on)
   await start($)
-  expect(w.commands).toEqual(['docs'])
+  expect(w.commands).toEqual(['garden'])
   expect(w.tools).toHaveLength(1)
   expect(w.tools[0]).toMatchObject({ name: 'docs_check', isDeferred: false, inputSchema: { type: 'object', required: ['path'] } })
   expect(w.tools[0]?.description).toMatch(/before editing/i)
@@ -190,11 +190,11 @@ test('the first message carries a three-line note about gardened docs', SLOW, as
   const text = out.blocks[1]?.text ?? ''
   expect(text.split('\n')).toHaveLength(3)
   expect(text).toContain('docs_check')
-  expect(text).toContain('/docs audit')
+  expect(text).toContain('/garden audit')
   expect(text).toMatch(/notes file/)
 })
 
-test('/docs audit: the checks, then a plan per flagged file, shown in the pane with Apply and Skip', SLOW, async ($, on) => {
+test('/garden audit: the checks, then a plan per flagged file, shown in the pane with Apply and Skip', SLOW, async ($, on) => {
   const w = world(on)
   Object.assign(w.plans, PLANS)
   await start($)
@@ -218,7 +218,7 @@ test('/docs audit: the checks, then a plan per flagged file, shown in the pane w
   expect(prompt).toContain('3| Build the data with `scripts/build_data.sh`')
   const subjects = w.completes.map(call => /^(?:File|Folder): (.+)$/m.exec(String(call.prompt))?.[1])
   expect(subjects).toEqual(['README.md', 'docs/big.md', 'docs/digests/', 'docs/old-design.md', 'docs/plans/2026-09-plan.md', 'docs/runbook.md'])
-  expect(w.toasts).toEqual([`Docs audit ready: 4 changes proposed in 3 files · /docs show`])
+  expect(w.toasts).toEqual([`Docs audit ready: 4 changes proposed in 3 files · /garden show`])
 
   for (const surface of SURFACES) {
     shown = await pane($, surface)
@@ -322,7 +322,7 @@ test('--apply applies every item as it arrives, without the pane, and reports wh
   expect([...w.writes].sort()).toEqual(['README.md', 'README.md', ROLLUP, 'docs/old-design.md'].sort())
   expect(w.toasts).toEqual(['Docs audit applied 4 changes in 3 files'])
   expect(w.logs).toEqual([
-    `docs-gardener: /docs audit --apply applied 4 changes in 3 files (README.md ×2, ${ROLLUP}, docs/old-design.md); the diffs are in the debug log.`,
+    `docs-gardener: /garden audit --apply applied 4 changes in 3 files (README.md ×2, ${ROLLUP}, docs/old-design.md); the diffs are in the debug log.`,
   ])
   expect(w.debug.filter(line => line.startsWith('docs-gardener: applied '))).toHaveLength(4)
 })
@@ -351,7 +351,7 @@ test('malformed model output is ignored item by item; a reply with no plan is sa
   expect(shown.lines.filter(line => line.includes('Nowhere') || line.includes('bogus'))).toEqual([])
   expect(shown.lines).toContain('  the reply held no usable plan')
   expect(shown.buttons.filter(button => (button.key ?? '').startsWith('apply-0-'))).toEqual([{ key: 'apply-0-0', label: 'Apply' }])
-  expect(w.toasts).toEqual([`Docs audit ready: 1 change proposed in 1 file · /docs show`])
+  expect(w.toasts).toEqual([`Docs audit ready: 1 change proposed in 1 file · /garden show`])
 })
 
 test('a failed model call is shown per file and the audit still finishes', SLOW, async ($, on) => {
@@ -362,7 +362,7 @@ test('a failed model call is shown per file and the audit still finishes', SLOW,
   await w.clock.settle()
   const shown = await pane($)
   expect(shown.lines).toContain('  model call failed: the API answered HTTP 529 (overloaded)')
-  expect(w.toasts).toEqual(['Docs audit ready: nothing to change (6 model calls failed) · /docs show'])
+  expect(w.toasts).toEqual(['Docs audit ready: nothing to change (6 model calls failed) · /garden show'])
   expect(shown.buttons.filter(button => (button.key ?? '').startsWith('apply'))).toEqual([])
 })
 
@@ -373,7 +373,7 @@ test('nothing flagged: the model is never asked', SLOW, async ($, on) => {
   await w.clock.settle()
   expect(w.completes).toEqual([])
   expect(w.opened).toEqual([])
-  expect(await docs($, 'show')).toBe('No docs audit yet. /docs audit runs one.')
+  expect(await docs($, 'show')).toBe('No docs audit yet. /garden audit runs one.')
 })
 
 test('a clean project: nothing flagged across the scope, no model call', SLOW, async ($, on) => {
@@ -430,14 +430,14 @@ test('--changed on the default branch takes the last 7 days of commits and the w
   expect(subjects).toEqual(['docs/notes.md', 'docs/runbook.md'])
 })
 
-test('an audit already running is not started twice; /docs check and /docs help answer at once', SLOW, async ($, on) => {
+test('an audit already running is not started twice; /garden check and /garden help answer at once', SLOW, async ($, on) => {
   const w = world(on)
   await start($)
   await docs($, 'audit')
-  expect(await docs($, 'audit')).toBe(`docs-gardener: an audit is already running (${MODEL} is answering); /docs show opens it.`)
+  expect(await docs($, 'audit')).toBe(`docs-gardener: an audit is already running (${MODEL} is answering); /garden show opens it.`)
   await w.clock.settle()
   expect(await docs($, 'check README.md')).toMatch(/^docs-gardener: 4 findings in README\.md\n/)
-  expect(await docs($, 'help')).toMatch(/^Usage: \/docs audit \[path\|--changed\] \[--apply\]/)
+  expect(await docs($, 'help')).toMatch(/^Usage: \/garden audit \[path\|--changed\] \[--apply\]/)
   expect(await docs($, 'prune')).toMatch(/Usage:/)
   expect(w.completes).toHaveLength(6)
 })

@@ -361,7 +361,7 @@ export const SURFACES = ['terminal', 'desktop'] as const
 
 /** A slash command as the person types it. */
 export const typed = (args: string) => ({
-  command: 'docs',
+  command: 'garden',
   args,
   origin: { kind: 'composer' as const },
   presentation: { isFullscreen: false, columns: 120 },

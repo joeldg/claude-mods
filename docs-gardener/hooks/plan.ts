@@ -27,7 +27,7 @@ export type DocsCommand =
   | { kind: 'help' }
   | { kind: 'usage'; message: string }
 
-/** Reads `/docs audit [path|--changed] [--apply]`, `/docs check <path>`, `/docs show`, `/docs help`. */
+/** Reads `/garden audit [path|--changed] [--apply]`, `/garden check <path>`, `/garden show`, `/garden help`. */
 export function parseArgs(args: string): DocsCommand {
   const [verb = '', ...rest] = args.trim().split(/\s+/).filter(word => word !== '')
   if (verb === '' || verb === 'help') {
@@ -38,10 +38,10 @@ export function parseArgs(args: string): DocsCommand {
   }
   if (verb === 'check') {
     const path = rest[0]
-    return rest.length === 1 && path !== undefined ? { kind: 'check', path } : { kind: 'usage', message: '/docs check takes one path.' }
+    return rest.length === 1 && path !== undefined ? { kind: 'check', path } : { kind: 'usage', message: '/garden check takes one path.' }
   }
   if (verb !== 'audit') {
-    return { kind: 'usage', message: `/docs ${verb} is not a command.` }
+    return { kind: 'usage', message: `/garden ${verb} is not a command.` }
   }
   let path: string | null = null
   let isChanged = false
@@ -52,11 +52,11 @@ export function parseArgs(args: string): DocsCommand {
     } else if (word === '--apply') {
       isApply = true
     } else if (word.startsWith('-')) {
-      return { kind: 'usage', message: `${word} is not a flag of /docs audit.` }
+      return { kind: 'usage', message: `${word} is not a flag of /garden audit.` }
     } else if (path === null) {
       path = word
     } else {
-      return { kind: 'usage', message: '/docs audit takes one path.' }
+      return { kind: 'usage', message: '/garden audit takes one path.' }
     }
   }
   return { kind: 'audit', path, isChanged, isApply }
@@ -64,7 +64,7 @@ export function parseArgs(args: string): DocsCommand {
 
 export const usage = (): string =>
   [
-    'Usage: /docs audit [path|--changed] [--apply]',
+    'Usage: /garden audit [path|--changed] [--apply]',
     '  audit            every markdown file in scope: the deterministic checks, then one model call per flagged file for an edit plan, shown in a pane',
     '  audit <path>     one file or folder',
     '  audit --changed  the docs changed on this branch against the default branch (on the default branch: the last 7 days and the working tree)',
@@ -320,7 +320,7 @@ const plural = (count: number, word: string): string => `${count} ${word}${count
 
 export const findingLine = (found: DocsFinding): string => `  ${found.line > 0 ? `L${found.line} ` : ''}${found.kind}: ${found.text}`
 
-/** The findings as text, for the tool and `/docs check`: grouped by file unless the subject is that one file. */
+/** The findings as text, for the tool and `/garden check`: grouped by file unless the subject is that one file. */
 export function describeFindings(findings: readonly DocsFinding[], subject: string): string {
   if (findings.length === 0) {
     return `docs-gardener: nothing to fix in ${subject}.`
