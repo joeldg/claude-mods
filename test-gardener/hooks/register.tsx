@@ -3,6 +3,7 @@ import type { EngineInterface, Register, RenderElement, ToolSpec } from 'claude-
 
 import type { BranchTests, GardenerSettings } from '../types'
 import {
+  DEFAULT_BRANCH_REFS,
   assembleAudit,
   auditSuggestion,
   auditText,
@@ -21,6 +22,7 @@ import {
   neighbourhood,
   neighbourhoodText,
   parseRipwireClones,
+  pickDefaultBranch,
   primaryModule,
   relative,
   resolvePath,
@@ -58,6 +60,10 @@ const REFRESH_MS = 2 * 60_000
 const RG_TIMEOUT_MS = 20_000
 const GIT_TIMEOUT_MS = 20_000
 const RIPWIRE_TIMEOUT_MS = 120_000
+/** How many directory entries a walk of the tree reads at most, when neither rg nor git lists the files. */
+const WALK_CAP = 50_000
+/** Folders a walk leaves out, besides hidden ones. */
+const SKIPPED_DIRS = ['node_modules', 'third_party', 'vendor', 'venv', 'site-packages', 'dist', 'build', 'target', '__pycache__']
 /** How many neighbour files' tests a new test is compared against. */
 const NEIGHBOUR_FILES = 6
 /** The test files per language, as rg and git globs. */
@@ -76,8 +82,15 @@ type Memory = {
   /** The project root (the git top level, else the session's folder); undefined until asked. */
   root: string | undefined
   isRepo: boolean
+  /** The root is the home folder itself, outside any repository: no project, nothing scanned. */
+  isHome: boolean
   refreshing: Promise<void> | null
+  /** Whether rg can start, probed on the first listing; null until then. */
+  rg: Promise<boolean> | null
 }
+
+/** The tool's and the audit's answer in a session whose folder is the home folder itself. */
+const HOME_TEXT = 'test-gardener: this session runs in your home folder, not a project, so no test files are scanned; start Claude in the project folder and ask again.'
 
 const usage = (settings: GardenerSettings): string =>
   `Usage: /tests audit [path] — the consolidation report: clones, near-duplicates, parametrize candidates, files over ${settings.maxTestsPerFile} tests, skips, tests whose module is gone.`
@@ -133,7 +146,7 @@ async function run($: Engine, argv: readonly string[], cwd: string, timeoutMs: n
   }
 }
 
-/** The project root: the git top level, else the session's folder; asked once. */
+/** The project root: the git top level, else the session's folder; asked once, with whether it is the home folder itself. */
 async function projectRoot($: Engine, m: Memory): Promise<string> {
   if (m.root !== undefined) {
     return m.root
@@ -143,27 +156,96 @@ async function projectRoot($: Engine, m: Memory): Promise<string> {
   const root = top?.ok ? top.out.trim().replace(/\/+$/, '') : ''
   m.isRepo = root !== ''
   m.root = root === '' ? cwd : root
+  // The home folder itself, outside any repository, is no project: a listing there runs for minutes and finds the world.
+  const home = ((await $.env.get('HOME')) ?? '').replace(/\/+$/, '')
+  m.isHome = !m.isRepo && home !== '' && m.root === home
   return m.root
 }
 
-/** The project's files under `root`, absolute: rg's listing (gitignore honoured), narrowed by `globs` when given; git's when rg is missing. */
-async function listFiles($: Engine, m: Memory, root: string, globs: readonly string[] | null): Promise<string[]> {
-  const argv = ['rg', '--files']
-  for (const glob of globs ?? []) {
-    argv.push('-g', glob)
+/**
+ * Whether `exe` can start: a bare name checked against each `PATH` folder. With no `PATH` to read it is assumed
+ * present, so the listing is still tried. Checking first spares a process that can only fail (rg is not on PATH in
+ * every desktop session).
+ */
+async function canStart($: Engine, exe: string): Promise<boolean> {
+  try {
+    const folders = ((await $.env.get('PATH')) ?? '').split(':').filter(Boolean)
+    if (folders.length === 0) {
+      return true
+    }
+    for (const folder of folders) {
+      if (await $.fs.exists(`${folder.replace(/\/+$/, '')}/${exe}`)) {
+        return true
+      }
+    }
+    return false
+  } catch {
+    return true
   }
-  let ran = await run($, argv, root, RG_TIMEOUT_MS)
+}
+
+/** Whether rg can start, probed once per session; the stand-in is logged once when it cannot. */
+function hasRg($: Engine, m: Memory): Promise<boolean> {
+  m.rg ??= (async () => {
+    const found = await canStart($, 'rg')
+    if (!found) {
+      await debug($, `rg is not on PATH; files are listed with ${m.isRepo ? 'git ls-files' : 'a directory walk'}`)
+    }
+    return found
+  })()
+  return m.rg
+}
+
+/** The files under `root`, absolute, by a walk of the tree: hidden and vendored folders left out, WALK_CAP entries at most. */
+async function walkFiles($: Engine, root: string): Promise<string[]> {
+  const out: string[] = []
+  const queue: string[] = [root]
+  let seen = 0
+  while (queue.length > 0 && seen < WALK_CAP) {
+    const dir = queue.shift() ?? root
+    for (const entry of await $.fs.list(dir).catch(() => [])) {
+      seen += 1
+      if (entry.kind === 'dir') {
+        if (!entry.isLink && !entry.name.startsWith('.') && !SKIPPED_DIRS.includes(entry.name)) {
+          queue.push(`${dir}/${entry.name}`)
+        }
+      } else if (entry.kind === 'file') {
+        out.push(`${dir}/${entry.name}`)
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * The project's files under `root`, absolute: rg's listing (gitignore honoured), narrowed by `globs` when given; git's
+ * when rg is not on PATH or did not run; a walk of the tree outside a repository.
+ */
+async function listFiles($: Engine, m: Memory, root: string, globs: readonly string[] | null): Promise<string[]> {
+  if (m.isHome) {
+    return []
+  }
+  let ran: Ran | null = null
+  if (await hasRg($, m)) {
+    const argv = ['rg', '--files']
+    for (const glob of globs ?? []) {
+      argv.push('-g', glob)
+    }
+    ran = await run($, argv, root, RG_TIMEOUT_MS)
+  }
   if (ran === null && m.isRepo) {
     ran = await run($, ['git', 'ls-files', '--cached', '--others', '--exclude-standard'], root, RG_TIMEOUT_MS)
   }
-  if (ran === null) {
-    return []
+  let paths: string[]
+  if (ran !== null) {
+    paths = ran.out
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line !== '')
+      .map(line => resolvePath(root, line))
+  } else {
+    paths = m.isRepo ? [] : await walkFiles($, root)
   }
-  const paths = ran.out
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line !== '')
-    .map(line => resolvePath(root, line))
   return globs === null ? paths : paths.filter(isTestFile)
 }
 
@@ -266,6 +348,9 @@ async function noteAfterWrite($: Engine, m: Memory, filePath: string, written: s
   try {
     const path = resolvePath(await $.session.cwd(), filePath)
     const root = await projectRoot($, m)
+    if (m.isHome) {
+      return null
+    }
     const text = written ?? (await $.fs.read(path))
     const { infos, before } = await scanTests($, m, root, { path, text })
     const units = extractTests(path, text)
@@ -332,6 +417,9 @@ async function neighbourhoodTool($: Engine, m: Memory, input: { module?: unknown
     return 'test-gardener: pass `module` (the module under test, e.g. mesh_build) or `path` (a source file or a test file).'
   }
   const root = await projectRoot($, m)
+  if (m.isHome) {
+    return HOME_TEXT
+  }
   const { infos } = await scanTests($, m, root, null)
   const module = primaryModule(candidates, infos, excluding) ?? ''
   const near = neighbourhood(module, infos)
@@ -353,6 +441,9 @@ async function ripwireClones($: Engine, m: Memory, root: string, dir: string): P
 /** The /tests audit of the project, or of a subtree: the text, with the consolidations suggested as the next prompt. */
 async function audit($: Engine, m: Memory, pathArg: string | null): Promise<string> {
   const root = await projectRoot($, m)
+  if (m.isHome) {
+    return HOME_TEXT
+  }
   const scope = pathArg === null ? root : resolvePath(await $.session.cwd(), pathArg)
   const { infos } = await scanTests($, m, root, null)
   const inScope = infos.filter(info => scope === root || info.path === scope || info.path.startsWith(`${scope}/`))
@@ -373,29 +464,16 @@ async function audit($: Engine, m: Memory, pathArg: string | null): Promise<stri
   return auditText(result, m.settings)
 }
 
-/** The default branch: what origin/HEAD points to, else main or master; null when none is found. */
-async function defaultBranch($: Engine, root: string): Promise<string | null> {
-  const head = await run($, ['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], root, GIT_TIMEOUT_MS)
-  if (head?.ok && head.out.trim() !== '') {
-    return head.out.trim()
-  }
-  for (const name of ['main', 'master']) {
-    const ref = await run($, ['git', 'rev-parse', '--verify', '--quiet', `refs/heads/${name}`], root, GIT_TIMEOUT_MS)
-    if (ref?.ok) {
-      return name
-    }
-  }
-  return null
-}
-
-/** Tests and lines the checked-out branch adds to test files against the default branch; zero on the default branch itself. */
+/**
+ * Tests and lines the checked-out branch adds to test files against the default branch (origin/HEAD's target, else
+ * origin/main, origin/master, main, master, read in one `for-each-ref` that never fails); zero on the default branch
+ * itself, on a detached HEAD, and where no default branch is told apart from the checked-out one.
+ */
 async function countBranch($: Engine, root: string): Promise<BranchCount> {
-  const base = await defaultBranch($, root)
-  if (base === null) {
-    return ZERO
-  }
+  const refs = await run($, ['git', 'for-each-ref', '--format=%(refname)%09%(symref)', ...DEFAULT_BRANCH_REFS], root, GIT_TIMEOUT_MS)
   const current = (await run($, ['git', 'branch', '--show-current'], root, GIT_TIMEOUT_MS))?.out.trim() ?? ''
-  if (current === '' || current === base.replace(/^origin\//, '')) {
+  const base = pickDefaultBranch(refs?.ok ? refs.out : null, current === '' ? null : current)
+  if (base === null || current === '' || current === base.replace(/^origin\//, '')) {
     return ZERO
   }
   const diff = await run($, ['git', 'diff', '-U0', `${base}...HEAD`, '--', ...TEST_GLOBS.map(glob => `:(glob)${glob}`)], root, GIT_TIMEOUT_MS)
@@ -444,7 +522,9 @@ export const register: Register = (on, options) => {
     },
     root: undefined,
     isRepo: false,
+    isHome: false,
     refreshing: null,
+    rg: null,
   }
 
   on('session.start', async ($, e, next) => {

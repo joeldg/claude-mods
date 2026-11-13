@@ -1,4 +1,13 @@
 import { expect, mock, test } from 'claude-code/testing'
+
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: string; context?: string[] }
+const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -7,6 +16,10 @@ const PY_ROOT = '/home/dev/meshkit'
 const TS_ROOT = '/home/dev/webshop'
 const LEDGER_ROOT = '/home/dev/ledger'
 const TOOL = 'mcp__test-gardener__tests_neighbourhood'
+/** The PATH folder the probe finds rg in, when it is there. */
+const BIN = '/usr/local/bin'
+const LS_FILES = 'git ls-files --cached --others --exclude-standard'
+const FOR_EACH_REF = 'git for-each-ref --format=%(refname)%09%(symref) refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master refs/heads/main refs/heads/master'
 
 const BAND = {
   isCollapsed: false, hasSurvey: false,
@@ -35,8 +48,12 @@ type World = {
   logs: string[]
   /** What `git rev-parse --show-toplevel` answers; null: not a repository. */
   gitRoot: string | null
+  /** rg is on PATH; false: the probe finds none, and rg is never to be started. */
+  rg: boolean
   branch: string
   diff: string
+  /** What `git for-each-ref` prints over origin/HEAD and its stand-ins, as `refLines` spells it. */
+  refs: string
   /** What `ripwire --clones` prints; null: the command cannot start. */
   ripwire: string | null
   /** Another plugin's band beneath this one; null: the engine's empty band. */
@@ -44,6 +61,9 @@ type World = {
 }
 
 const dirOf = (path: string): string => path.slice(0, path.lastIndexOf('/'))
+
+/** for-each-ref's rows, one per line in git's order: `<refname>\t<symref target, or nothing>`. */
+const refLines = (...rows: string[]): string => rows.map(row => `${row}\n`).join('')
 
 /** Answers the host beneath the plugin: HOME, the files, rg, git and ripwire, the tools written through, the band beneath. */
 const world = (on: On, cwd: string): World => {
@@ -59,8 +79,10 @@ const world = (on: On, cwd: string): World => {
     suggested: [],
     logs: [],
     gitRoot: cwd,
+    rg: true,
     branch: 'feature/mesh-resume',
     diff: '',
+    refs: refLines('refs/heads/main\t', 'refs/remotes/origin/HEAD\trefs/remotes/origin/main', 'refs/remotes/origin/main\t'),
     ripwire: null,
     otherBand: null,
   }
@@ -68,7 +90,7 @@ const world = (on: On, cwd: string): World => {
     w.files.set(path, text)
     w.mtimes.set(path, ++w.stamp)
   }
-  mock.env(on, { HOME })
+  mock.env(on, { HOME, PATH: `${BIN}:/usr/bin` })
   on('session.cwd', () => ({ value: cwd }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
@@ -103,7 +125,7 @@ const world = (on: On, cwd: string): World => {
     w.writes.push(e.path)
     return { value: undefined }
   })
-  on('fs.exists', (_$, e) => ({ value: w.files.has(e.path) }))
+  on('fs.exists', (_$, e) => ({ value: e.path === `${BIN}/rg` ? w.rg : w.files.has(e.path) }))
   on('fs.stat', (_$, e) => {
     const text = w.files.get(e.path)
     return text === undefined
@@ -135,9 +157,13 @@ const world = (on: On, cwd: string): World => {
     const at = e.init?.cwd ?? cwd
     w.ran.push({ argv, cwd: at })
     const answer = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
-    if (e.argv[0] === 'rg') {
+    // rg and git list the same files, relative to where they run.
+    const listing = () => {
       const base = at.replace(/\/+$/, '')
       return answer([...w.files.keys()].filter(path => path.startsWith(`${base}/`)).map(path => path.slice(base.length + 1)).sort().join('\n') + '\n')
+    }
+    if (e.argv[0] === 'rg') {
+      return w.rg ? listing() : { deny: 'spawn rg ENOENT' }
     }
     if (e.argv[0] === 'ripwire') {
       return w.ripwire === null ? { deny: 'spawn ripwire ENOENT' } : answer(w.ripwire)
@@ -146,13 +172,16 @@ const world = (on: On, cwd: string): World => {
       if (argv === 'git rev-parse --show-toplevel') {
         return w.gitRoot === null ? answer('', 128, 'fatal: not a git repository (or any of the parent directories): .git\n') : answer(`${w.gitRoot}\n`)
       }
-      if (argv === 'git symbolic-ref --short refs/remotes/origin/HEAD') {
-        return answer('origin/main\n')
+      if (argv === LS_FILES) {
+        return listing()
+      }
+      if (argv === FOR_EACH_REF) {
+        return answer(w.refs)
       }
       if (argv === 'git branch --show-current') {
         return answer(`${w.branch}\n`)
       }
-      if (argv.startsWith('git diff -U0 origin/main...HEAD -- ')) {
+      if (argv.startsWith('git diff -U0 ')) {
         return answer(w.diff)
       }
     }
@@ -269,6 +298,10 @@ const RESUME_TWICE = [
   pyTest('test_build_resume_twice', [...RESUME_BODY, 'assert isinstance(mesh, dict)']),
   '',
 ].join('\n')
+/** The note RESUME_TWICE earns as a new file in the Python project. */
+const TWICE_NOTE =
+  'test-gardener: tests/test_meshes.py already covers mesh_build with 19 tests (also tests/test_mesh_build_resume.py, 6). ' +
+  'New test test_build_resume_twice is a near-duplicate of test_build_resume in tests/test_meshes.py (0.85) — parametrize them.'
 
 /** A TypeScript project: one module covered by two test files, another with none. */
 const TS_FILES: Record<string, string> = {
@@ -321,6 +354,10 @@ const DISCOUNT_TEST = [
   '})',
   '',
 ].join('\n')
+/** What tests_neighbourhood answers for `total` in the TypeScript project. */
+const TOTAL_COVERED =
+  'test-gardener: total is covered by src/cart/total.test.ts (3 tests: sums line items, applies tax, ignores empty carts) and src/cart/__tests__/rounding.test.ts (1 test: rounds to cents).\n' +
+  'Extend one of these or parametrize an existing test rather than starting another file; past 40 tests a file is split by concern.'
 
 const debit = ['def test_post_debit():', '    ledger = Ledger()', '    ledger.post("cash", 100, "debit")', '    assert ledger.balance("cash") == 100', '    assert ledger.entries == 1'].join('\n')
 const credit = debit.replace('test_post_debit', 'test_post_credit').replace('"cash", 100, "debit"', '"cash", 250, "credit"').replace('== 100', '== 250')
@@ -386,13 +423,10 @@ test('a new test file for a module other files cover, with a near-copy of a test
   await begin($, PY_ROOT)
 
   const path = `${PY_ROOT}/tests/test_mesh_build_twice.py`
-  const ran = await $.tool.call({ tool: 'Write', file_path: path, content: RESUME_TWICE })
+  const ran = await callTool($, { tool: 'Write', file_path: path, content: RESUME_TWICE })
   expect(w.files.get(path)).toBe(RESUME_TWICE)
   expect(ran.deny).toBeUndefined()
-  expect(ran.context).toEqual([
-    'test-gardener: tests/test_meshes.py already covers mesh_build with 19 tests (also tests/test_mesh_build_resume.py, 6). ' +
-      'New test test_build_resume_twice is a near-duplicate of test_build_resume in tests/test_meshes.py (0.85) — parametrize them.',
-  ])
+  expect(ran.context).toEqual([TWICE_NOTE])
   // The scan is kept across sessions, by path and mtime, under the home folder.
   expect(w.writes).toEqual([`${HOME}/.claude/test-gardener/${w.writes[0]?.split('/').pop()}`])
   expect(w.writes[0]).toMatch(/\/[0-9a-f]{8}\.json$/)
@@ -406,7 +440,7 @@ test('the test that takes a file past the guideline gets the size note, and noth
   seed(w, PY_FILES)
   await begin($, PY_ROOT)
 
-  const ran = await $.tool.call({
+  const ran = await callTool($, {
     tool: 'Edit',
     file_path: 'tests/test_mesh_faces.py',
     old_string: '# more tests below',
@@ -425,7 +459,7 @@ test('a clean write says nothing: a fresh module, then an edit that copies nothi
   w.gitRoot = null
   await begin($, TS_ROOT)
 
-  const fresh = await $.tool.call({ tool: 'Write', file_path: `${TS_ROOT}/src/cart/discount.test.ts`, content: DISCOUNT_TEST })
+  const fresh = await callTool($, { tool: 'Write', file_path: `${TS_ROOT}/src/cart/discount.test.ts`, content: DISCOUNT_TEST })
   expect(fresh.context).toBeUndefined()
   expect(fresh.deny).toBeUndefined()
   expect(w.files.get(`${TS_ROOT}/src/cart/discount.test.ts`)).toBe(DISCOUNT_TEST)
@@ -437,7 +471,7 @@ test('a clean write says nothing: a fresh module, then an edit that copies nothi
   expect(w.reads.filter(path => path === rounding)).toHaveLength(1)
   expect(w.reads.filter(path => path === total)).toHaveLength(1)
 
-  const edited = await $.tool.call({
+  const edited = await callTool($, {
     tool: 'Edit',
     file_path: `${TS_ROOT}/src/cart/total.test.ts`,
     old_string: "  it('ignores empty carts', () => {\n    expect(total([])).toBe(0)\n  })",
@@ -460,7 +494,7 @@ test('a write outside the test files passes through untouched, with no scan', as
   seed(w, TS_FILES)
   await begin($, TS_ROOT)
 
-  const ran = await $.tool.call({ tool: 'Write', file_path: `${TS_ROOT}/src/cart/total.ts`, content: 'export const total = () => 0\n' })
+  const ran = await callTool($, { tool: 'Write', file_path: `${TS_ROOT}/src/cart/total.ts`, content: 'export const total = () => 0\n' })
   expect(ran.context).toBeUndefined()
   expect(ran.text).toBe(`File written: ${TS_ROOT}/src/cart/total.ts`)
   expect(w.files.get(`${TS_ROOT}/src/cart/total.ts`)).toBe('export const total = () => 0\n')
@@ -479,16 +513,13 @@ test('the tests_neighbourhood tool sits in the prompt, needs no permission, and 
   expect(w.tools[0]?.description).toMatch(/before (adding|writing) tests/i)
   expect(await $.tool.check({ tool: TOOL, input: { module: 'total' } })).toMatchObject({ decision: 'allow' })
 
-  const covered =
-    'test-gardener: total is covered by src/cart/total.test.ts (3 tests: sums line items, applies tax, ignores empty carts) and src/cart/__tests__/rounding.test.ts (1 test: rounds to cents).\n' +
-    'Extend one of these or parametrize an existing test rather than starting another file; past 40 tests a file is split by concern.'
-  expect(String((await $.tool.call({ tool: TOOL, module: 'total' })).result)).toBe(covered)
-  expect(String((await $.tool.call({ tool: TOOL, path: 'src/cart/total.ts' })).result)).toBe(covered)
-  expect(String((await $.tool.call({ tool: TOOL, path: `${TS_ROOT}/src/cart/__tests__/rounding.test.ts` })).result)).toBe(covered)
-  expect(String((await $.tool.call({ tool: TOOL, module: 'discount' })).result)).toBe(
+  expect(String((await callTool($, { tool: TOOL, module: 'total' })).result)).toBe(TOTAL_COVERED)
+  expect(String((await callTool($, { tool: TOOL, path: 'src/cart/total.ts' })).result)).toBe(TOTAL_COVERED)
+  expect(String((await callTool($, { tool: TOOL, path: `${TS_ROOT}/src/cart/__tests__/rounding.test.ts` })).result)).toBe(TOTAL_COVERED)
+  expect(String((await callTool($, { tool: TOOL, module: 'discount' })).result)).toBe(
     'test-gardener: no test file names or imports discount yet. 2 test files live under src/cart/; a new one there keeps the layout.',
   )
-  expect(String((await $.tool.call({ tool: TOOL })).result)).toBe(
+  expect(String((await callTool($, { tool: TOOL })).result)).toBe(
     'test-gardener: pass `module` (the module under test, e.g. mesh_build) or `path` (a source file or a test file).',
   )
 })
@@ -646,4 +677,128 @@ test('the branch count refreshes after a turn at most every two minutes; a lower
 
   const ui = await $.ui.mount({ plugin: 'test-gardener', surface: 'terminal', component: 'AbovePrompt', props: BAND })
   expect(shown((await ui.drawn()) as Node)).toBe('4 tests · +30 lines of tests on this branch → /tests audit')
+})
+
+test('without rg on PATH it is never started: the files come from git ls-files, said once in the debug log', async ($, on) => {
+  mock.clock(on, { now: 0 })
+  const w = world(on, PY_ROOT)
+  seed(w, PY_FILES)
+  w.rg = false
+  await begin($, PY_ROOT)
+
+  const ran = await callTool($, { tool: 'Write', file_path: `${PY_ROOT}/tests/test_mesh_build_twice.py`, content: RESUME_TWICE })
+  expect(ran.context).toEqual([TWICE_NOTE])
+  // A second listing, for the tool: the probe is not repeated, nor the log line.
+  expect(String((await callTool($, { tool: TOOL, module: 'mesh_faces' })).result)).toMatch(/^test-gardener: mesh_faces is covered by tests\/test_mesh_faces\.py/)
+  const argvs = w.ran.map(one => one.argv)
+  expect(argvs.filter(argv => argv.startsWith('rg '))).toHaveLength(0)
+  expect(argvs.filter(argv => argv === LS_FILES)).toEqual([LS_FILES, LS_FILES])
+  expect(w.ran.find(one => one.argv === LS_FILES)?.cwd).toBe(PY_ROOT)
+  expect(w.logs.filter(line => line.includes('rg'))).toEqual(['test-gardener: rg is not on PATH; files are listed with git ls-files'])
+})
+
+test('without rg and outside git the files come from a walk of the tree, hidden and vendored folders left out', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, TS_ROOT)
+  seed(w, TS_FILES)
+  // Test files a walk must not pick up: under node_modules and under a hidden folder.
+  seed(w, {
+    [`${TS_ROOT}/node_modules/cart-kit/total.test.js`]: "import { total } from '../../src/cart/total'\n\nit('is vendored', () => {})\n",
+    [`${TS_ROOT}/.cache/total.test.ts`]: "import { total } from '../src/cart/total'\n\nit('is hidden', () => {})\n",
+  })
+  w.rg = false
+  w.gitRoot = null
+  await begin($, TS_ROOT)
+  await clock.settle()
+
+  expect(String((await callTool($, { tool: TOOL, module: 'total' })).result)).toBe(TOTAL_COVERED)
+  expect(w.ran.map(one => one.argv)).toEqual(['git rev-parse --show-toplevel'])
+  expect(w.logs.filter(line => line.includes('rg'))).toEqual(['test-gardener: rg is not on PATH; files are listed with a directory walk'])
+})
+
+test('the default branch comes from one for-each-ref read: origin/HEAD, else origin/main, origin/master, main, master; none: nothing to diff', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, PY_ROOT)
+  seed(w, PY_FILES)
+  w.diff = branchDiff(38, 1204)
+  const cases: [string[], string | null][] = [
+    [['refs/heads/main\t', 'refs/remotes/origin/HEAD\trefs/remotes/origin/develop', 'refs/remotes/origin/main\t'], 'origin/develop'],
+    [['refs/heads/master\t', 'refs/remotes/origin/main\t', 'refs/remotes/origin/master\t'], 'origin/main'],
+    [['refs/heads/master\t', 'refs/remotes/origin/master\t'], 'origin/master'],
+    [['refs/heads/main\t', 'refs/heads/master\t'], 'main'],
+    [['refs/heads/master\t'], 'master'],
+    [[], null],
+  ]
+  for (const [rows, base] of cases) {
+    w.refs = refLines(...rows)
+    const before = gitDiffs(w).length
+    await begin($, PY_ROOT)
+    await clock.settle()
+    if (base === null) {
+      // A repository with neither main nor master: the checked-out branch stands in, so there is nothing to diff and no band.
+      expect(gitDiffs(w)).toHaveLength(before)
+      const ui = await $.ui.mount({ plugin: 'test-gardener', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+      expect(shown((await ui.drawn()) as Node)).toBe('')
+      await ui.unmount()
+    } else {
+      expect(gitDiffs(w)).toHaveLength(before + 1)
+      expect(gitDiffs(w).at(-1)?.argv.startsWith(`git diff -U0 ${base}...HEAD -- `)).toBe(true)
+    }
+    await $.session.end({ reason: 'other', sessionId: 's1', resume: { id: 's1' } })
+  }
+  const gits = w.ran.map(one => one.argv).filter(argv => argv.startsWith('git '))
+  expect(gits.filter(argv => argv === FOR_EACH_REF)).toHaveLength(cases.length)
+  expect(gits.some(argv => argv.includes('symbolic-ref') || argv.includes('rev-parse --verify'))).toBe(false)
+})
+
+test('a session in the home folder scans nothing: the tool says so, a test file written there gets no note, no listing runs', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, HOME)
+  w.gitRoot = null
+  seed(w, { [`${HOME}/notes/tests/test_notes.py`]: 'def test_notes():\n    assert True\n' })
+  await begin($, HOME)
+  await clock.settle()
+
+  expect(String((await callTool($, { tool: TOOL, module: 'checks' })).result)).toBe(
+    'test-gardener: this session runs in your home folder, not a project, so no test files are scanned; start Claude in the project folder and ask again.',
+  )
+  const ran = await callTool($, { tool: 'Write', file_path: `${HOME}/notes/tests/test_more.py`, content: 'def test_notes():\n    assert True\n' })
+  expect(ran.context).toBeUndefined()
+  expect(w.ran.map(one => one.argv)).toEqual(['git rev-parse --show-toplevel'])
+  expect(w.logs).toEqual([])
+})
+
+test('a test under tests/ importing ../hooks/<module> is reported as covering hooks/<module>.ts, by relative or absolute path or by name', async ($, on) => {
+  mock.clock(on, { now: 0 })
+  const MOD_ROOT = '/home/dev/gardener'
+  const w = world(on, MOD_ROOT)
+  seed(w, {
+    [`${MOD_ROOT}/hooks/checks.ts`]: 'export const check = (doc: string): number => doc.length\n',
+    [`${MOD_ROOT}/hooks/register.tsx`]: 'export const register = () => undefined\n',
+    [`${MOD_ROOT}/tests/checks.test.ts`]: [
+      "import { expect, test } from 'claude-code/testing'",
+      '',
+      "import { check } from '../hooks/checks'",
+      "import type { Doc } from '../hooks/checks'",
+      '',
+      "test('validates a doc', async () => {",
+      "  expect(check('# Title')).toBe(7)",
+      '})',
+      '',
+      "test('reports a dead link', async () => {",
+      "  expect(check('')).toBe(0)",
+      '})',
+      '',
+    ].join('\n'),
+    [`${MOD_ROOT}/tests/register.test.tsx`]: ["import { test } from 'claude-code/testing'", '', "import { register } from '../hooks/register'", '', "test('registers', async () => {", '  register()', '})', ''].join('\n'),
+  })
+  await begin($, MOD_ROOT)
+
+  const covered =
+    'test-gardener: checks is covered by tests/checks.test.ts (2 tests: validates a doc, reports a dead link).\n' +
+    'Extend one of these or parametrize an existing test rather than starting another file; past 40 tests a file is split by concern.'
+  expect(String((await callTool($, { tool: TOOL, path: 'hooks/checks.ts' })).result)).toBe(covered)
+  expect(String((await callTool($, { tool: TOOL, path: `${MOD_ROOT}/hooks/checks.ts` })).result)).toBe(covered)
+  expect(String((await callTool($, { tool: TOOL, module: 'checks' })).result)).toBe(covered)
+  expect(String((await callTool($, { tool: TOOL, path: 'hooks/register.tsx' })).result)).toMatch(/^test-gardener: register is covered by tests\/register\.test\.tsx \(1 test: registers\)\./)
 })

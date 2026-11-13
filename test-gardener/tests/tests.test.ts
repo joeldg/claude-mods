@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import type { GardenerSettings } from '../types'
 import {
+  DEFAULT_BRANCH_REFS,
   assembleAudit,
   auditSuggestion,
   auditText,
@@ -21,6 +22,7 @@ import {
   neighbourhoodText,
   normalizeBody,
   parseRipwireClones,
+  pickDefaultBranch,
   primaryModule,
   relative,
   similarity,
@@ -366,6 +368,10 @@ test('the neighbourhood of a module is the test files naming it or importing it'
   expect(primaryModule(['mesh_build_twice', 'meshkit', 'mesh_build', 'build'], INFOS, '/home/dev/meshkit/tests/test_mesh_build_twice.py')).toBe('mesh_build')
   expect(primaryModule(['discount', 'money'], INFOS)).toBe('discount')
   expect(primaryModule([], INFOS)).toBeNull()
+  // A test folder beside the module's: `tests/checks.test.ts` importing `../hooks/checks` covers `hooks/checks.ts`.
+  const sideways = importsOf('/home/dev/mod/tests/checks.test.ts', "import { check } from '../hooks/checks'\nimport type { Doc } from '../hooks/checks'\nimport { world } from './world'\n")
+  expect(sideways).toEqual(['checks', 'world'])
+  expect(coversModule({ module: moduleOf('/home/dev/mod/tests/checks.test.ts'), imports: sideways }, moduleName('hooks/checks.ts'))).toBe(true)
 })
 
 test('the note after a write: coverage, the near-duplicate, the size; nothing for a clean write', async () => {
@@ -572,4 +578,20 @@ test('paths and hashes', async () => {
   expect(hashOf('/home/dev/meshkit')).toMatch(/^[0-9a-f]{8}$/)
   expect(hashOf('/home/dev/meshkit')).toBe(hashOf('/home/dev/meshkit'))
   expect(hashOf('/home/dev/meshkit')).not.toBe(hashOf('/home/dev/webshop'))
+})
+
+test('the default branch is picked from one for-each-ref read: origin/HEAD, then origin/main, origin/master, main, master, then the current branch', async () => {
+  const rows = (...lines: string[]): string => lines.map(line => `${line}\n`).join('')
+  expect(DEFAULT_BRANCH_REFS).toEqual(['refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master', 'refs/heads/main', 'refs/heads/master'])
+  // origin/HEAD's target wins over every stand-in, whatever its name.
+  expect(pickDefaultBranch(rows('refs/heads/main\t', 'refs/remotes/origin/HEAD\trefs/remotes/origin/develop', 'refs/remotes/origin/main\t'), 'feature')).toBe('origin/develop')
+  expect(pickDefaultBranch(rows('refs/heads/main\t', 'refs/remotes/origin/main\t', 'refs/remotes/origin/master\t'), 'feature')).toBe('origin/main')
+  expect(pickDefaultBranch(rows('refs/heads/main\t', 'refs/remotes/origin/master\t'), 'feature')).toBe('origin/master')
+  expect(pickDefaultBranch(rows('refs/heads/main\t', 'refs/heads/master\t'), 'feature')).toBe('main')
+  expect(pickDefaultBranch(rows('refs/heads/master\t'), 'feature')).toBe('master')
+  // origin/HEAD listed without a target is passed over; neither main nor master: the branch checked out now, or none.
+  expect(pickDefaultBranch(rows('refs/remotes/origin/HEAD\t', 'refs/remotes/origin/master\t'), 'feature')).toBe('origin/master')
+  expect(pickDefaultBranch(rows(), 'feature')).toBe('feature')
+  expect(pickDefaultBranch('', null)).toBeNull()
+  expect(pickDefaultBranch(null, 'feature')).toBe('feature')
 })
