@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelCompleteResult, PluginOptions, Register } from 'claude-code'
 
-import type { DocsAudit, DocsAuditFile, DocsAuditItem, DocsCacheEntry, DocsCorpusCache, DocsFinding, DocsItemState, DocsParagraphDigest } from '../types'
+import type { DocsAudit, DocsAuditFile, DocsAuditItem, DocsCacheEntry, DocsCorpusCache, DocsFinding, DocsItemState, DocsParagraphDigest, DocsPlanItem } from '../types'
 import {
   DAY_MS,
   MAX_LOOKUPS,
@@ -18,9 +18,11 @@ import {
   oversized,
   paragraphDigests,
   parseBlame,
+  pathCandidates,
   sortFindings,
   splitLines,
   staleMarkers,
+  stemOf,
 } from './checks'
 import type { DeadReferenceLookups, Doc, LineAge, OrphanCandidate } from './checks'
 import {
@@ -29,8 +31,11 @@ import {
   buildRollupPrompt,
   contextNote,
   describeFindings,
+  isWrappingOnly,
+  onOriginalLines,
   parseArgs,
   parsePlan,
+  removedCodeSpans,
   rollupPath,
   sectionRange,
   usage,
@@ -239,12 +244,12 @@ async function loadCorpus($: Engine, root: string): Promise<Doc[]> {
 }
 
 /** Records one rg's answer for a chunk: each identifier found is cached and passes; output cut short proves nothing of the rest, which pass uncached. */
-function recordLookups(root: string, chunk: readonly string[], ran: Ran, now: number, found: Set<string>): void {
+function recordLookups(root: string, chunk: readonly string[], ran: Ran, now: number, found: Set<string>, prefix: string): void {
   const hits = new Set(trimmedLines(ran.out))
   for (const identifier of chunk) {
     const has = hits.has(identifier)
     if (has || !ran.isTruncated) {
-      lookups.set(`${root}\0${identifier}`, { has, at: now })
+      lookups.set(`${root}\0${prefix}${identifier}`, { has, at: now })
     }
     if (has || ran.isTruncated) {
       found.add(identifier)
@@ -252,13 +257,17 @@ function recordLookups(root: string, chunk: readonly string[], ran: Ran, now: nu
   }
 }
 
-/** Which of the identifiers occur in the code: from the cache, else one batched rg lookup. */
-async function identifiersInCode($: Engine, root: string, wanted: readonly string[]): Promise<Set<string>> {
+/**
+ * Which of the identifiers occur in the code, whole-word (or, with `isWholeWord` false, as text anywhere): from the
+ * cache, else one batched rg lookup.
+ */
+async function identifiersInCode($: Engine, root: string, wanted: readonly string[], isWholeWord = true): Promise<Set<string>> {
   const now = await $.clock.now()
   const found = new Set<string>()
   const missing: string[] = []
+  const prefix = isWholeWord ? '' : '~'
   for (const identifier of new Set(wanted)) {
-    const known = lookups.get(`${root}\0${identifier}`)
+    const known = lookups.get(`${root}\0${prefix}${identifier}`)
     if (known !== undefined && now - known.at < LOOKUP_MS) {
       if (known.has) {
         found.add(identifier)
@@ -269,7 +278,7 @@ async function identifiersInCode($: Engine, root: string, wanted: readonly strin
   }
   for (let i = 0; i < missing.length; i += LOOKUP_CHUNK) {
     const chunk = missing.slice(i, i + LOOKUP_CHUNK)
-    const ran = await run($, rgIdentifiersArgv(root, chunk, config.excludeGlobs), root, RG_MS)
+    const ran = await run($, rgIdentifiersArgv(root, chunk, config.excludeGlobs, isWholeWord), root, RG_MS)
     if (!ran.ok && ran.err.trim() !== '') {
       // Without rg nothing can be called dead: every identifier passes.
       debug($, `rg could not look identifiers up (${ran.err.trim().slice(0, 200)}); none is called dead`)
@@ -278,7 +287,7 @@ async function identifiersInCode($: Engine, root: string, wanted: readonly strin
       }
       continue
     }
-    recordLookups(root, chunk, ran, now, found)
+    recordLookups(root, chunk, ran, now, found, prefix)
   }
   return found
 }
@@ -305,6 +314,9 @@ async function deadReferencesOf($: Engine, root: string, doc: Doc): Promise<Docs
   const refs = findReferences(doc.text)
   const identifiers = identifiersOf(doc)
   const inCode = identifiers.length > 0 ? await identifiersInCode($, root, identifiers) : new Set<string>()
+  // The stems of the identifiers with a placeholder tail that were not found whole-word: `AUTO_` for `AUTO_NNN`.
+  const stems = identifiers.filter(identifier => !inCode.has(identifier)).map(stemOf).filter((stem): stem is string => stem !== null)
+  const inText = stems.length > 0 ? await identifiersInCode($, root, stems, false) : new Set<string>()
   const existing = new Map<string, Promise<boolean>>()
   const lookup: DeadReferenceLookups = {
     exists: rel => {
@@ -316,6 +328,7 @@ async function deadReferencesOf($: Engine, root: string, doc: Doc): Promise<Docs
       return known
     },
     inCode: async identifier => inCode.has(identifier),
+    inCodeText: async text => inText.has(text),
     makeTargets: refs.some(ref => ref.kind === 'make') ? await makeTargetsOf($, root) : null,
   }
   return deadReferences(doc, lookup)
@@ -706,8 +719,75 @@ async function askModel($: Engine, root: string, corpus: readonly Doc[], facts: 
     return
   }
   const plan = parsePlan(reply.text, lines, file.kind === 'series')
-  const items: DocsAuditItem[] = plan.items.map(item => ({ ...item, state: 'pending', note: null }))
+  const items: DocsAuditItem[] = []
+  for (const item of plan.items) {
+    items.push(await vetItem($, root, file.file, lines, item))
+  }
   await setFile($, fi, { items, model: 'done', modelNote: plan.isPlan ? null : 'the reply held no usable plan' })
+}
+
+/**
+ * Which inline-code spans an update drops that the project still has: a path that exists from the root or the doc's
+ * folder, or text found in the code (the stem for a placeholder tail, the name without its trailing slash). Spans with
+ * spaces, a command line or prose, are not names and are not looked up.
+ */
+async function liveSpans($: Engine, root: string, file: string, spans: readonly string[]): Promise<string[]> {
+  const live: string[] = []
+  const byNeedle = new Map<string, string[]>()
+  for (const span of spans) {
+    const token = span.trim().replace(/\/+$/, '')
+    if (token === '' || /\s/.test(token)) {
+      continue
+    }
+    let exists = false
+    for (const candidate of pathCandidates(file, token)) {
+      if (await $.fs.exists(`${root}/${candidate}`).catch(() => false)) {
+        exists = true
+        break
+      }
+    }
+    if (exists) {
+      live.push(span)
+      continue
+    }
+    const needle = stemOf(token) ?? token
+    byNeedle.set(needle, [...(byNeedle.get(needle) ?? []), span])
+  }
+  if (byNeedle.size > 0) {
+    const found = await identifiersInCode($, root, [...byNeedle.keys()], false)
+    for (const [needle, owners] of byNeedle) {
+      if (found.has(needle)) {
+        live.push(...owners)
+      }
+    }
+  }
+  return live
+}
+
+/**
+ * A plan item as the pane will offer it. An update is held back (`refused`) when it drops a backticked path or name
+ * the project still has (the model sees the doc, not the code: it has deleted true references it could not verify) or
+ * when it only re-wraps the lines; one that only removes words is laid back on the author's lines, so line breaks and
+ * indentation stay. Other items pass as they came.
+ */
+async function vetItem($: Engine, root: string, file: string, lines: readonly string[], item: DocsPlanItem): Promise<DocsAuditItem> {
+  const pending: DocsAuditItem = { ...item, state: 'pending', note: null }
+  if (item.verdict !== 'update' || item.replacement === null) {
+    return pending
+  }
+  const out = applyPlanItem(file, lines.join('\n'), item)
+  if ('error' in out) {
+    return pending
+  }
+  if (isWrappingOnly(out.before, out.after)) {
+    return { ...pending, state: 'refused', note: 'changes only the line breaks' }
+  }
+  const live = await liveSpans($, root, file, removedCodeSpans(out.before, out.after))
+  if (live.length > 0) {
+    return { ...pending, state: 'refused', note: `drops ${live.map(span => `\`${span}\``).join(', ')}, which the project still has` }
+  }
+  const laid = onOriginalLines(out.before, out.after)
+  return laid === null ? pending : { ...pending, replacement: laid.join('\n') }
 }
 
 /** The background half of an audit: the model, file by file; with `--apply`, each plan applied as it lands. */
@@ -738,6 +818,8 @@ async function report($: Engine, isApply: boolean): Promise<void> {
   }
   const failed = current.files.filter(file => file.model === 'failed').length
   const failedNote = failed > 0 ? ` (${plural(failed, 'model call')} failed)` : ''
+  const refused = current.files.flatMap(file => file.items).filter(item => item.state === 'refused').length
+  const refusedNote = refused > 0 ? `, ${plural(refused, 'edit')} held back` : ''
   if (isApply) {
     const written = new Map<string, number>()
     let count = 0
@@ -753,14 +835,15 @@ async function report($: Engine, isApply: boolean): Promise<void> {
     }
     const list = [...written.entries()].map(([path, times]) => (times > 1 ? `${path} ×${times}` : path)).join(', ')
     const summary = `applied ${plural(count, 'change')} in ${plural(written.size, 'file')}`
-    $.ui.toast(`Docs audit ${summary}${failedNote}`, { timeoutMs: 8_000 })
-    $.ui.log(`${PLUGIN}: /garden audit --apply ${summary}${list !== '' ? ` (${list})` : ''}${failedNote}; the diffs are in the debug log.`)
+    $.ui.toast(`Docs audit ${summary}${refusedNote}${failedNote}`, { timeoutMs: 8_000 })
+    $.ui.log(`${PLUGIN}: /garden audit --apply ${summary}${list !== '' ? ` (${list})` : ''}${refusedNote}${failedNote}; the diffs are in the debug log.`)
     return
   }
-  const proposed = current.files.flatMap(file => file.items.filter(item => item.verdict !== 'current'))
-  const inFiles = current.files.filter(file => file.items.some(item => item.verdict !== 'current')).length
+  const isOffered = (item: DocsAuditItem): boolean => item.verdict !== 'current' && item.state !== 'refused'
+  const proposed = current.files.flatMap(file => file.items.filter(isOffered))
+  const inFiles = current.files.filter(file => file.items.some(isOffered)).length
   const summary = proposed.length > 0 ? `${plural(proposed.length, 'change')} proposed in ${plural(inFiles, 'file')}` : 'nothing to change'
-  $.ui.toast(`Docs audit ready: ${summary}${failedNote} · /garden show`, { timeoutMs: 8_000 })
+  $.ui.toast(`Docs audit ready: ${summary}${refusedNote}${failedNote} · /garden show`, { timeoutMs: 8_000 })
 }
 
 async function setItem($: Engine, fi: number, ii: number, state: DocsItemState, note: string | null): Promise<void> {

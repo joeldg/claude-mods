@@ -231,7 +231,7 @@ export function diffBlock(file: string, range: Range, verdict: string, before: r
   return [`@@ ${file}:${range.start + 1}-${range.end + 1} (${verdict})`, ...before.map(line => `-${line}`), ...after.map(line => `+${line}`)].join('\n')
 }
 
-export type Applied = { text: string; diff: string; range: Range }
+export type Applied = { text: string; diff: string; range: Range; before: string[]; after: string[] }
 
 /**
  * The file's text with one plan item applied: the section replaced by `replacement`, or removed when it
@@ -279,8 +279,76 @@ export function applyPlanItem(file: string, text: string, item: DocsPlanItem): A
       out.splice(range.start, 1)
     }
   }
-  return { text: out.join('\n'), diff: diffBlock(file, range, item.verdict, before, after), range }
+  return { text: out.join('\n'), diff: diffBlock(file, range, item.verdict, before, after), range, before, after }
 }
+
+/** The inline code spans of some lines, backticks off, each once. */
+export function codeSpans(lines: readonly string[]): Set<string> {
+  const out = new Set<string>()
+  for (const line of lines) {
+    for (const match of line.matchAll(/`([^`]+)`/g)) {
+      out.add(match[1] ?? '')
+    }
+  }
+  out.delete('')
+  return out
+}
+
+/** The inline code spans `after` no longer has: the paths and names an update drops. */
+export function removedCodeSpans(before: readonly string[], after: readonly string[]): string[] {
+  const kept = codeSpans(after)
+  return [...codeSpans(before)].filter(span => !kept.has(span))
+}
+
+const wordsOf = (lines: readonly string[]): string[] => lines.join('\n').split(/\s+/).filter(word => word !== '')
+
+/** Whether `after` says what `before` says, with other line breaks or spacing only. */
+export const isWrappingOnly = (before: readonly string[], after: readonly string[]): boolean => wordsOf(before).join(' ') === wordsOf(after).join(' ')
+
+/**
+ * `after` laid back on `before`'s lines when it only drops words (a sentence, a parenthesis): the author's line breaks
+ * and indentation stay, a line left with no word goes, and a blank line doubled by that goes too. Null when `after`
+ * adds or changes a word, so the model's text stands as written.
+ */
+export function onOriginalLines(before: readonly string[], after: readonly string[]): string[] | null {
+  const want = wordsOf(after)
+  let w = 0
+  const out: string[] = []
+  let dropped = false
+  for (const line of before) {
+    const parts = line.split(/(\s+)/)
+    const lead = parts[0] === '' ? (parts[1] ?? '') : ''
+    let text = ''
+    let hasWord = false
+    let kept = false
+    for (let i = 0; i < parts.length; i += 2) {
+      const word = parts[i] ?? ''
+      if (word === '') {
+        continue
+      }
+      hasWord = true
+      if (w < want.length && word === want[w]) {
+        text += (kept ? (parts[i - 1] ?? ' ') : lead) + word
+        kept = true
+        w += 1
+      }
+    }
+    if (!hasWord) {
+      // A line of no words stays, once, where a dropped line would leave two.
+      if (!(dropped && out.at(-1)?.trim() === '')) {
+        out.push(line)
+      }
+      dropped = false
+    } else if (kept) {
+      out.push(text)
+      dropped = false
+    } else {
+      dropped = true
+    }
+  }
+  return w === want.length ? out : null
+}
+
 
 /** The clauses the write-time note is made of; at most 6, then a count. */
 const MAX_CLAUSES = 6
@@ -363,6 +431,8 @@ const POLICY = [
   '- A finished plan (a `status:` line saying it is done, or an "Outcome" section) belongs under docs/archive/: say so in the reason of a "current" verdict, with the `git mv` command; never rewrite it into something else.',
   '- Prefer the smallest edit: "update" rewrites one section and carries its full new text, heading included; "delete", "stray" and "duplicate" remove the section (replacement null).',
   '- Never invent facts about the project. When unsure, answer "current".',
+  '- The findings are the only checked facts about the code: you see the doc, not the project. Remove a backticked path or name only when a finding calls it dead; one you merely cannot see stays, and an update that drops one the project still has is held back.',
+  "- Edit within lines: keep the author's line breaks and indentation, never re-wrap a paragraph. An update that only re-wraps is held back.",
 ].join('\n')
 
 /** The prompt for one doc: the fact sheet, the policy, the findings, the numbered file, the JSON asked for. */

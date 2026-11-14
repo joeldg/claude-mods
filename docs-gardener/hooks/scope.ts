@@ -114,14 +114,15 @@ export function rgFilesArgv(root: string, excludeGlobs: readonly string[]): stri
 
 /**
  * One `rg` that prints every whole-word occurrence of the identifiers in the code (anything but markdown, hidden
- * folders included): with `-m 1` a file naming two of them would yield the first alone.
+ * folders included): with `-m 1` a file naming two of them would yield the first alone. `isWholeWord` false looks the
+ * texts up as substrings: the stem of `AUTO_NNN`, a folder name a doc mentions.
  */
-export function rgIdentifiersArgv(root: string, identifiers: readonly string[], excludeGlobs: readonly string[]): string[] {
+export function rgIdentifiersArgv(root: string, identifiers: readonly string[], excludeGlobs: readonly string[], isWholeWord = true): string[] {
   return [
     'rg',
     '--no-filename',
     '-o',
-    '-w',
+    ...(isWholeWord ? ['-w'] : []),
     '-F',
     '--hidden',
     ...identifiers.flatMap(identifier => ['-e', identifier]),

@@ -153,14 +153,15 @@ function blameOf(w: World, rel: string): string {
  * What `rg -o -w -F` prints for the identifiers over the code (anything but markdown): each whole-word match, in
  * hidden folders only with `--hidden`, and with `-m 1` from the first matching line of each file alone.
  */
-function identifiersInCode(w: World, idents: string[], isHidden: boolean, isFirstLineOnly: boolean): string[] {
+function identifiersInCode(w: World, idents: string[], isHidden: boolean, isFirstLineOnly: boolean, isWholeWord: boolean): string[] {
   const out: string[] = []
+  const escaped = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   for (const [path, text] of w.files) {
     if (path.endsWith('.md') || (!isHidden && path.split('/').some(segment => segment.startsWith('.')))) {
       continue
     }
     for (const line of text.split('\n')) {
-      const hits = idents.filter(ident => new RegExp(`\\b${ident}\\b`).test(line))
+      const hits = idents.filter(ident => new RegExp(isWholeWord ? `\\b${escaped(ident)}\\b` : escaped(ident)).test(line))
       if (hits.length === 0) {
         continue
       }
@@ -268,7 +269,7 @@ export function world(on: On, options: { clean?: boolean } = {}): World {
     }
     if (exe === 'rg') {
       const idents = args.flatMap((arg, i) => (arg === '-e' ? [args[i + 1] ?? ''] : []))
-      const found = identifiersInCode(w, idents, args.includes('--hidden'), args.includes('-m'))
+      const found = identifiersInCode(w, idents, args.includes('--hidden'), args.includes('-m'), args.includes('-w'))
       return ok(found.map(ident => `${ident}\n`).join(''), found.length ? 0 : 1)
     }
     if (exe !== 'git') {

@@ -114,8 +114,19 @@ export type DeadReferenceLookups = {
   exists: (rel: string) => Promise<boolean>
   /** Whether the identifier occurs whole-word in the code (anything but markdown). */
   inCode: (identifier: string) => Promise<boolean>
+  /** Whether the text occurs anywhere in the code, not only whole-word: for the stem of `AUTO_NNN`. */
+  inCodeText?: (text: string) => Promise<boolean>
   /** The Makefile's targets; null when the repo has no Makefile. */
   makeTargets: ReadonlySet<string> | null
+}
+
+/**
+ * `AUTO_` for `AUTO_NNN`, `widget_` for `widget_001`: the stem of an identifier whose tail is a placeholder (a letter
+ * repeated three or more times, or two or more digits) after `_` or `-`; null for a plain identifier.
+ */
+export const stemOf = (identifier: string): string | null => {
+  const match = /^(.*?[A-Za-z0-9][_-])(?:([A-Za-z])\2{2,}|\d{2,})$/.exec(identifier)
+  return match?.[1] ?? null
 }
 
 /** The folders a token is tried from: the root, then the doc's own. */
@@ -188,6 +199,11 @@ export async function deadReferences(doc: Doc, lookups: DeadReferenceLookups): P
     left -= 1
     if (ref.kind === 'identifier') {
       if (!(await lookups.inCode(ref.token))) {
+        const stem = stemOf(ref.token)
+        if (stem !== null && lookups.inCodeText !== undefined && (await lookups.inCodeText(stem))) {
+          // `AUTO_NNN` stands for the ids the code makes from `AUTO_`.
+          continue
+        }
         out.push(
           finding(doc.file, ref.line, 'dead-reference', `names ${ref.token}, which is not found in the code`, 'Rename it to what the code calls it now, or remove it.'),
         )

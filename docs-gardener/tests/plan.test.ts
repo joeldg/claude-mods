@@ -8,8 +8,11 @@ import {
   buildRollupPrompt,
   contextNote,
   describeFindings,
+  isWrappingOnly,
+  onOriginalLines,
   parseArgs,
   parsePlan,
+  removedCodeSpans,
   rollupPath,
   sectionRange,
 } from '../hooks/plan'
@@ -233,4 +236,31 @@ test('the prompts carry the fact sheet, the findings and the numbered file, and 
   expect(rollup).toContain('docs/digests/ROLLUP-2026-42.md')
   expect(rollup).toContain('"verdict": "rollup"')
   expect(rollup).toContain('--- docs/digests/2026-10-01.md ---')
+})
+
+test("an update is vetted: the code spans it drops, a re-wrap that says the same, a deletion laid back on the author's lines", async () => {
+  const before = [
+    'The build runs this too. It counts the clips whose stretch is gone, and the approved',
+    'stretches with no clip. The row ids of each list go to `check/` in the out',
+    'folder.',
+  ]
+  const after = ['The build runs this too. It counts the clips whose stretch is gone, and the approved stretches with no clip.']
+  expect(removedCodeSpans(before, after)).toEqual(['check/'])
+  expect(removedCodeSpans(before, before)).toEqual([])
+  expect(isWrappingOnly(before, after)).toBe(false)
+  expect(isWrappingOnly(before, [before.join(' ')])).toBe(true)
+  expect(isWrappingOnly(before, ['  The build runs this too.  It counts the clips whose stretch is gone, and the approved', 'stretches with no clip. The row ids of each list go to `check/` in the out folder.'])).toBe(true)
+  // Only words dropped: laid back on the original lines, the emptied line gone.
+  expect(onOriginalLines(before, after)).toEqual([
+    'The build runs this too. It counts the clips whose stretch is gone, and the approved',
+    'stretches with no clip.',
+  ])
+  // Words added or changed: the model's text stands.
+  expect(onOriginalLines(before, ['The build runs this too, and more.'])).toBeNull()
+  expect(onOriginalLines(['The loader calls `parse_config` and then `load_widgets` for each entry.'], ['The loader calls `parse_config` for each entry.'])).toEqual([
+    'The loader calls `parse_config` for each entry.',
+  ])
+  // Indentation stays; a list line emptied goes with its marker; a blank line a dropped line would double goes too.
+  expect(onOriginalLines(['- keep this', '- drop this line', '  indented tail'], ['- keep this', 'indented tail'])).toEqual(['- keep this', '  indented tail'])
+  expect(onOriginalLines(['a', '', 'b', '', 'c'], ['a', 'c'])).toEqual(['a', '', 'c'])
 })

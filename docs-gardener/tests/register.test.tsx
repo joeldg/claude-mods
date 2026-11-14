@@ -525,3 +525,36 @@ test('the default branch comes from one for-each-ref read, never symbolic-ref: o
   await w.clock.settle()
   expect(w.completes.at(-1)?.prompt).toContain('Default branch: feature/docs')
 })
+
+test("an update that drops a path or name the project still has, or only re-wraps, is held back; one that only removes words keeps the author's lines", SLOW, async ($, on) => {
+  const w = world(on)
+  w.plans['README.md'] = JSON.stringify([
+    // Drops scripts/build_data.sh and load_widgets (dead, fine) but also scripts/run_tests.sh, which exists.
+    { section: '3-5', verdict: 'update', reason: 'tidier', replacement: 'Build the data, then run the tests.\nDeploy with `make deploy`; lint with `make lint`.\nThe loader calls `parse_config` for each entry.' },
+    // The same words on other lines.
+    { section: '3-3', verdict: 'update', reason: 'wrapped', replacement: 'Build the data with `scripts/build_data.sh`, then run\n`scripts/run_tests.sh`.' },
+    // Drops load_widgets alone, which the code no longer has.
+    { section: '5-5', verdict: 'update', reason: 'load_widgets is gone', replacement: 'The loader calls `parse_config` for each entry.' },
+  ])
+  await start($)
+  await docs($, 'audit')
+  await w.clock.settle()
+  expect(w.toasts).toEqual(['Docs audit ready: 1 change proposed in 1 file, 2 edits held back · /garden show'])
+
+  const shown = await pane($)
+  expect(shown.lines).toContain('  update · 3-5: tidier')
+  expect(shown.lines).toContain('  ✗ kept: drops `scripts/run_tests.sh`, which the project still has')
+  expect(shown.lines).toContain('  ✗ kept: changes only the line breaks')
+  const keys = shown.buttons.map(button => button.key)
+  expect(keys).not.toContain('apply-0-0')
+  expect(keys).not.toContain('apply-0-1')
+  expect(keys).toContain('apply-0-2')
+  // The substring lookup ran for the dropped names that are not paths.
+  expect(w.ran.some(argv => argv.startsWith('rg --no-filename -o -F --hidden') && argv.includes('load_widgets'))).toBe(true)
+
+  const ui = await mountPane($, 'terminal')
+  await ui.press({ key: 'apply-0-2' })
+  expect(w.files.get('README.md')).toBe(README.replace('The loader calls `parse_config` and then `load_widgets` for each entry.', 'The loader calls `parse_config` for each entry.'))
+  expect(w.writes).toEqual(['README.md'])
+  await ui.unmount()
+})

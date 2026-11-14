@@ -1,6 +1,6 @@
 {
   "name": "docs-gardener",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Keeps a project's markdown true to the project: deterministic checks (dead references, stale TODOs, duplicated paragraphs, orphans, dated series, oversized files, finished plans) at write time and from a docs_check tool, and /docs audit, which adds a model edit plan you apply item by item from a pane, or all at once for a scheduled run. Only /docs audit calls a model (one Haiku call per flagged file by default).",
   "author": {
     "name": "joeldg"

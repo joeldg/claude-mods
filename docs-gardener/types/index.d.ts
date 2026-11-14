@@ -35,7 +35,8 @@ export type DocsPlanItem = {
   anchor: string | null
 }
 
-export type DocsItemState = 'pending' | 'applied' | 'skipped' | 'failed'
+/** `refused`: an update held back before it was offered, because it drops what the project still has or only re-wraps. */
+export type DocsItemState = 'pending' | 'applied' | 'skipped' | 'failed' | 'refused'
 
 export type DocsAuditItem = DocsPlanItem & {
   state: DocsItemState

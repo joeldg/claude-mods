@@ -7,6 +7,7 @@ import {
   duplicateParagraphs,
   findReferences,
   finishedPlan,
+  stemOf,
   linkTargets,
   makeTargets,
   orphanCandidates,
@@ -23,7 +24,7 @@ const readme: Doc = { file: 'README.md', text: README }
 const runbook: Doc = { file: 'docs/runbook.md', text: RUNBOOK }
 
 /** Lookups over a small repo: what exists, what the code names, the Makefile's targets. */
-const lookups = (exists: string[], inCode: string[], targets: string[] | null, calls: string[] = []) => ({
+const lookups = (exists: string[], inCode: string[], targets: string[] | null, calls: string[] = [], inText: string[] = []) => ({
   exists: async (rel: string) => {
     calls.push(`exists ${rel}`)
     return exists.includes(rel)
@@ -31,6 +32,10 @@ const lookups = (exists: string[], inCode: string[], targets: string[] | null, c
   inCode: async (ident: string) => {
     calls.push(`code ${ident}`)
     return inCode.includes(ident)
+  },
+  inCodeText: async (text: string) => {
+    calls.push(`text ${text}`)
+    return inText.includes(text)
   },
   makeTargets: targets === null ? null : new Set(targets),
 })
@@ -126,7 +131,8 @@ test('dead-reference: at most 40 lookups per file, the first ones', async () => 
   const calls: string[] = []
   const found = await deadReferences(doc, lookups([], [], ['x'], calls))
   expect(MAX_LOOKUPS).toBe(40)
-  expect(calls).toHaveLength(40)
+  // The identifiers looked up; the stems of the two-digit ones (`missing_ident_`) are a second question about the same 40.
+  expect(calls.filter(call => !call.startsWith('text '))).toHaveLength(40)
   expect(found).toHaveLength(40)
   expect(found.at(-1)?.text).toBe('names missing_ident_39, which is not found in the code')
 })
@@ -283,4 +289,18 @@ test('oversized and finished-plan', async () => {
   expect(finishedPlan(outcome)).toMatchObject({ line: 3, text: 'a finished plan (an "Outcome" section)' })
   expect(finishedPlan({ file: 'docs/plan-c.md', text: '---\nstatus: in progress\n---\n' })).toBeNull()
   expect(finishedPlan({ file: 'docs/archive/old.md', text: '---\nstatus: done\n---\n' })).toBeNull()
+})
+
+test('dead-reference: an identifier with a placeholder tail, AUTO_NNN, is alive when its stem AUTO_ is in the code', async () => {
+  expect(stemOf('AUTO_NNN')).toBe('AUTO_')
+  expect(stemOf('widget_001')).toBe('widget_')
+  expect(stemOf('SCAN-xxx')).toBe('SCAN-')
+  expect(stemOf('parse_config')).toBeNull()
+  expect(stemOf('load_widgets')).toBeNull()
+  expect(stemOf('get_ll')).toBeNull()
+  const doc: Doc = { file: 'docs/studio.md', text: '# Studio\n\nEvents come in as `AUTO_NNN` segments; `GEMINI_NNN` ones are gone.\n' }
+  const calls: string[] = []
+  const found = await deadReferences(doc, lookups([], [], null, calls, ['AUTO_']))
+  expect(found.map(one => one.text)).toEqual(['names GEMINI_NNN, which is not found in the code'])
+  expect(calls).toEqual(['code AUTO_NNN', 'text AUTO_', 'code GEMINI_NNN', 'text GEMINI_'])
 })

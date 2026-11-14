@@ -88,6 +88,10 @@ test('the rg command lines list markdown with the exclusions, and look identifie
   expect(idents).toContain('!*.md')
   expect(idents).toContain('!vendor')
   expect(idents.at(-1)).toBe('/home/dev/widgets')
+  // Texts looked up anywhere, not whole-word: the stem of `AUTO_NNN`, a folder name a doc mentions.
+  const texts = rgIdentifiersArgv('/home/dev/widgets', ['AUTO_'], [], false)
+  expect(texts.slice(0, 5)).toEqual(['rg', '--no-filename', '-o', '-F', '--hidden'])
+  expect(texts).not.toContain('-w')
 })
 
 test('the default branch is picked from one for-each-ref read: origin/HEAD, then origin/main, origin/master, main, master, then the current branch', async () => {

@@ -53,6 +53,8 @@ export function stateLine(item: DocsAuditItem): string | null {
       return '  skipped'
     case 'failed':
       return `  ✗ ${item.note ?? 'failed'}`
+    case 'refused':
+      return `  ✗ kept: ${item.note ?? 'held back'}`
     default:
       return null
   }
