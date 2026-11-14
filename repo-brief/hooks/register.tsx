@@ -230,7 +230,7 @@ export const register: Register = (on, options) => {
   // for a quick one up to BRIEF_WAIT_MS (prompt.context), and the band draws once it lands.
   on('session.start', async ($, e, next) => {
     await $.command.register({
-      // Not `brief`: Claude Code ships a /brief of its own, and the engine refuses the name (the whole hook was skipped).
+      // Not `brief`: the validator reports /brief as a name Claude Code ships, which the engine refuses while skipping the hook that registers it.
       name: 'repo',
       description: 'Re-gather the repo brief (branch, uncommitted work, commits, PRs, focus issues) and show it',
     })

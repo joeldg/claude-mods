@@ -198,7 +198,7 @@ Catches Claude up on the repo when a session starts, so you don't have to ask "c
 - A one-line band above the prompt, e.g. `main ↑1 · 3 changed · PRs #123 ✗ #124 ✓ · 2 owner issues · 2 stale branches · last commit 2h ago`. **Hide** dismisses it.
 - Claude gets the same summary once, in its first message, so the prompt cache stays warm. It refreshes after compaction. The gather is started, not awaited, at session start: the first message uses it if it has landed, otherwise waits up to 5 s for a quick one, otherwise goes without. A start-time gather that found no repository is asked again at the first message, since in a session's first second the engine has answered another folder.
 - When gh's token can't read the PRs (a fine-grained token without "Checks: read", or no login), the brief says `PRs: gh token can't read them` in their place, keeps the issues it could read, and leaves gh alone for 30 minutes instead of failing at every refresh. `/brief` asks again at once.
-- `/repo` re-gathers now and prints the full summary (it was `/brief` until Claude Code shipped a `/brief` of its own, which made the engine refuse the name and skip the mod's session-start hook).
+- `/repo` re-gathers now and prints the full summary (it was `/brief`; `claude plugin validate` on 2.1.322 reports `/brief` as a name Claude Code ships, which the engine refuses while skipping the hook that registers it, so the mod moved ahead of that).
 - Makes no model calls: only `git` and `gh`. The band refreshes after a turn at most every 2 minutes.
 
 Settings: focus labels, refresh minutes, and whether to brief Claude.
