@@ -130,7 +130,7 @@ Settings: `modalCommand` (empty = `modal`, then `python3 -m modal`), `pollSecond
 
 Does the "merged #219, clean up branches and start #214" round trip for you, and surfaces CI failures with their logs.
 
-- Watches your open PRs in the session's repo: it adopts them at session start, and picks up every `gh pr create` Claude runs. It polls `gh pr view` every 60s.
+- Watches your open PRs in the session's repo: it adopts them at session start (asked again at the next turns when the start-time folder was no repository: in a session's first second the engine has answered another folder), and picks up every `gh pr create` Claude runs. It polls `gh pr view` every 60s.
 - Status line: `PRs: #219 ✓ · #220 CI… · #221 ✗`, for every watched PR.
 - **CI toasts only where they're wanted.** A CI pass or failure (with the failing check names) toasts for the PRs this session opened (`gh pr create`) or you added with `/prs watch`, and for any PR whose branch this worktree has checked out. PRs adopted from the repository at start stay on the status line, in `/prs` and in `prs_status`, and still get the merge ritual, but their CI results don't toast — so with seven worktree sessions of one repo a result toasts once, where it matters, not seven times. `toastAdoptedCi` (off) brings back toasts for every watched PR.
 - **When a PR merges**, it cleans up with plain local git, then toasts the outcome and suggests carrying on (Tab to accept):
@@ -196,7 +196,7 @@ Catches Claude up on the repo when a session starts, so you don't have to ask "c
   - issues labelled `owner`, `todo`, `P0` or `blocked`
   - stale branches (merged into the default branch, or upstream gone). The default branch is what `origin/HEAD` points to, else `origin/main`, `origin/master`, `main`, `master`, else the branch you are on — found with one `git for-each-ref` read, so a clone made without `origin/HEAD` costs no failing command.
 - A one-line band above the prompt, e.g. `main ↑1 · 3 changed · PRs #123 ✗ #124 ✓ · 2 owner issues · 2 stale branches · last commit 2h ago`. **Hide** dismisses it.
-- Claude gets the same summary once, in its first message, so the prompt cache stays warm. It refreshes after compaction. The gather is started, not awaited, at session start: the first message uses it if it has landed, otherwise waits up to 5 s for a quick one, otherwise goes without.
+- Claude gets the same summary once, in its first message, so the prompt cache stays warm. It refreshes after compaction. The gather is started, not awaited, at session start: the first message uses it if it has landed, otherwise waits up to 5 s for a quick one, otherwise goes without. A start-time gather that found no repository is asked again at the first message, since in a session's first second the engine has answered another folder.
 - When gh's token can't read the PRs (a fine-grained token without "Checks: read", or no login), the brief says `PRs: gh token can't read them` in their place, keeps the issues it could read, and leaves gh alone for 30 minutes instead of failing at every refresh. `/brief` asks again at once.
 - `/brief` re-gathers now and prints the full summary.
 - Makes no model calls: only `git` and `gh`. The band refreshes after a turn at most every 2 minutes.

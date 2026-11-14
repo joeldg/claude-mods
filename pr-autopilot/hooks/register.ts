@@ -130,6 +130,14 @@ let isTurnRunning = false
 let shownStatus: string | undefined | null = null
 /** The session's folder, to adopt its PRs again when a hold ends with none watched. */
 let sessionCwd: string | null = null
+/** Whether the last adoption found a git work tree where it looked. */
+let lastAdoptFoundWorkTree = false
+/**
+ * Turns at which adoption is tried again, from the folder as it stands then: the start-time folder was no work tree.
+ * In a session's first second the engine has answered another folder, and a repository's PRs went unwatched.
+ */
+let adoptTriesLeft = 0
+const ADOPT_RETRIES = 3
 
 const isSame = (a: Pick<WatchedPr, 'repo' | 'number'>, b: Pick<WatchedPr, 'repo' | 'number'>): boolean =>
   a.number === b.number && a.repo.toLowerCase() === b.repo.toLowerCase()
@@ -325,6 +333,7 @@ async function remember($: Engine, ref: PrRef, view: PrView | null, isOwn: boole
 async function adopt($: Engine, cwd: string): Promise<GhFailed | null> {
   try {
     const inside = await git($, cwd, ['rev-parse', '--is-inside-work-tree'])
+    lastAdoptFoundWorkTree = inside.ok
     if (!inside.ok) {
       return null
     }
@@ -745,6 +754,33 @@ async function runPrs($: Engine, args: string): Promise<string> {
   return note ? `${listed}\n${note}` : listed
 }
 
+/** The adoption at session start; a folder that is no work tree then is tried again at the next ADOPT_RETRIES turns. */
+async function adoptAtStart($: Engine, cwd: string): Promise<void> {
+  try {
+    await adopt($, cwd)
+  } catch (error) {
+    debug($, `could not adopt open PRs: ${String(error)}`)
+    return
+  }
+  if (!lastAdoptFoundWorkTree) {
+    adoptTriesLeft = ADOPT_RETRIES
+  }
+}
+
+/** Adopts from the session's folder as it stands now; found a work tree, no further turn asks. */
+async function adoptAgain($: Engine): Promise<void> {
+  try {
+    const cwd = await $.session.cwd()
+    sessionCwd = cwd
+    await adopt($, cwd)
+    if (lastAdoptFoundWorkTree) {
+      adoptTriesLeft = 0
+    }
+  } catch (error) {
+    debug($, `could not adopt open PRs: ${String(error)}`)
+  }
+}
+
 export const register: Register = (on, options) => {
   config = {
     pollMs: Math.max(10, Number(options.pollSeconds ?? 60)) * 1000,
@@ -760,6 +796,8 @@ export const register: Register = (on, options) => {
   isTurnRunning = false
   shownStatus = null
   sessionCwd = null
+  lastAdoptFoundWorkTree = false
+  adoptTriesLeft = 0
 
   on('session.start', async ($, e, next) => {
     sessionCwd = e.cwd
@@ -771,12 +809,16 @@ export const register: Register = (on, options) => {
     })
     await $.tool.register(PRS_STATUS_TOOL).catch((error: unknown) => debug($, `the prs_status tool did not register: ${String(error)}`))
     ensureTimer($)
-    void adopt($, e.cwd).catch((error: unknown) => debug($, `could not adopt open PRs: ${String(error)}`))
+    void adoptAtStart($, e.cwd)
     return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
     isTurnRunning = true
+    if (adoptTriesLeft > 0) {
+      adoptTriesLeft -= 1
+      void adoptAgain($)
+    }
     return next(e)
   })
 

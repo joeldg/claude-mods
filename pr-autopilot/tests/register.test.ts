@@ -422,6 +422,26 @@ test('a folder that is not a git repository adopts nothing', async ($, on) => {
   expect(w.statuses.at(-1)).toBeUndefined()
 })
 
+test('a start whose folder is no work tree adopts at the next turn, from the folder as it stands then', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on)
+  // In a session's first second the engine has answered another folder.
+  await $.session.start({ cwd: '/Users/me', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(w.ran.map(one => one.cwd)).toEqual(['/Users/me'])
+  expect(w.statuses.at(-1)).toBeUndefined()
+
+  adoptable(w, () => [JSON.parse(view219('OPEN', [run('lint', 'COMPLETED', 'SUCCESS')]))])
+  await $.turn.start({ text: 'hello', turnId: 't1' })
+  await clock.settle()
+  expect(w.ran.map(one => one.cwd)).toEqual(['/Users/me', CWD, CWD, CWD])
+  expect(w.statuses.at(-1)).toBe('PRs: #219 ✓')
+  // Adopted: later turns ask nothing more.
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await clock.settle()
+  expect(w.ran).toHaveLength(4)
+})
+
 test('/prs watch adds a PR by number in this folder’s repository', async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on)

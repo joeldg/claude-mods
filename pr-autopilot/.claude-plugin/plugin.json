@@ -1,6 +1,6 @@
 {
   "name": "pr-autopilot",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Watches your open pull requests: CI pass/fail toasts for the PRs you open here, failing-check logs attached when you mention them, a prs_status tool so Claude reads them without gh, and the post-merge ritual (fetch --prune, switch, ff-only pull, delete the branch) done for you with no model calls; in a linked worktree it only fetches and leaves the worktree to you. Tells you once when gh's token cannot read checks.",
   "author": {
     "name": "joeldg"
