@@ -50,6 +50,12 @@ type World = {
   gitRoot: string | null
   /** rg is on PATH; false: the probe finds none, and rg is never to be started. */
   rg: boolean
+  /** rg, found on PATH, starts; false: spawning it fails (a folder that is not there gives the same ENOENT). */
+  rgStarts: boolean
+  /** git ls-files answers; false: it cannot start. */
+  lsFiles: boolean
+  /** What `$.session.cwd()` answers now. */
+  cwd: string
   branch: string
   diff: string
   /** What `git for-each-ref` prints over origin/HEAD and its stand-ins, as `refLines` spells it. */
@@ -80,6 +86,9 @@ const world = (on: On, cwd: string): World => {
     logs: [],
     gitRoot: cwd,
     rg: true,
+    rgStarts: true,
+    lsFiles: true,
+    cwd,
     branch: 'feature/mesh-resume',
     diff: '',
     refs: refLines('refs/heads/main\t', 'refs/remotes/origin/HEAD\trefs/remotes/origin/main', 'refs/remotes/origin/main\t'),
@@ -91,7 +100,7 @@ const world = (on: On, cwd: string): World => {
     w.mtimes.set(path, ++w.stamp)
   }
   mock.env(on, { HOME, PATH: `${BIN}:/usr/bin` })
-  on('session.cwd', () => ({ value: cwd }))
+  on('session.cwd', () => ({ value: w.cwd }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
@@ -154,7 +163,7 @@ const world = (on: On, cwd: string): World => {
   })
   on('process.run', (_$, e) => {
     const argv = e.argv.join(' ')
-    const at = e.init?.cwd ?? cwd
+    const at = e.init?.cwd ?? w.cwd
     w.ran.push({ argv, cwd: at })
     const answer = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
     // rg and git list the same files, relative to where they run.
@@ -163,17 +172,18 @@ const world = (on: On, cwd: string): World => {
       return answer([...w.files.keys()].filter(path => path.startsWith(`${base}/`)).map(path => path.slice(base.length + 1)).sort().join('\n') + '\n')
     }
     if (e.argv[0] === 'rg') {
-      return w.rg ? listing() : { deny: 'spawn rg ENOENT' }
+      return w.rg && w.rgStarts ? listing() : { deny: 'spawn rg ENOENT' }
     }
     if (e.argv[0] === 'ripwire') {
       return w.ripwire === null ? { deny: 'spawn ripwire ENOENT' } : answer(w.ripwire)
     }
     if (e.argv[0] === 'git') {
       if (argv === 'git rev-parse --show-toplevel') {
-        return w.gitRoot === null ? answer('', 128, 'fatal: not a git repository (or any of the parent directories): .git\n') : answer(`${w.gitRoot}\n`)
+        const inside = w.gitRoot !== null && (at === w.gitRoot || at.startsWith(`${w.gitRoot}/`))
+        return inside ? answer(`${w.gitRoot}\n`) : answer('', 128, 'fatal: not a git repository (or any of the parent directories): .git\n')
       }
       if (argv === LS_FILES) {
-        return listing()
+        return w.lsFiles ? listing() : { deny: 'git ls-files: still running after 20000ms' }
       }
       if (argv === FOR_EACH_REF) {
         return answer(w.refs)
@@ -801,4 +811,51 @@ test('a test under tests/ importing ../hooks/<module> is reported as covering ho
   expect(String((await callTool($, { tool: TOOL, path: `${MOD_ROOT}/hooks/checks.ts` })).result)).toBe(covered)
   expect(String((await callTool($, { tool: TOOL, module: 'checks' })).result)).toBe(covered)
   expect(String((await callTool($, { tool: TOOL, path: 'hooks/register.tsx' })).result)).toMatch(/^test-gardener: register is covered by tests\/register\.test\.tsx \(1 test: registers\)\./)
+})
+
+test('the root is asked again when the session folder changes: a start outside the project does not hold for the session', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, PY_ROOT)
+  seed(w, PY_FILES)
+  // In a session's first second the engine has answered another folder: every probe then said "not a git repository".
+  w.cwd = '/nowhere'
+  await begin($, '/nowhere')
+  await clock.settle()
+  expect(w.ran.map(one => one.argv)).toEqual(['git rev-parse --show-toplevel'])
+
+  w.cwd = PY_ROOT
+  const out = await $.command.run(typed('tests', 'audit'))
+  expect(out.text).toMatch(/^test-gardener audit: \d+ test files · \d+ tests · own pairwise pass/)
+  expect(w.ran.filter(one => one.argv === 'git rev-parse --show-toplevel').map(one => one.cwd)).toEqual(['/nowhere', PY_ROOT])
+  expect(w.ran.find(one => one.argv.startsWith('rg --files'))?.cwd).toBe(PY_ROOT)
+})
+
+test('rg that cannot start gives way to git ls-files; when git cannot list either, the audit and the tool say so; a project without tests is told apart from a listing that failed', async ($, on) => {
+  mock.clock(on, { now: 0 })
+  const w = world(on, PY_ROOT)
+  seed(w, PY_FILES)
+  w.rgStarts = false
+  await begin($, PY_ROOT)
+
+  const out = await $.command.run(typed('tests', 'audit'))
+  expect(out.text).toMatch(/^test-gardener audit: \d+ test files · \d+ tests/)
+  expect(w.ran.filter(one => one.argv === LS_FILES).length).toBeGreaterThan(0)
+  expect(w.logs.some(line => /rg did not run: .*ENOENT/.test(line))).toBe(true)
+
+  // Neither lister: no answer of "0 test files" that would pass for a project without tests.
+  w.lsFiles = false
+  const failed = `the files under ${PY_ROOT} could not be listed (rg could not start; git ls-files could not start)`
+  expect((await $.command.run(typed('tests', 'audit'))).text).toBe(`test-gardener: ${failed}; nothing was audited.`)
+  expect(String((await callTool($, { tool: TOOL, module: 'mesh_faces' })).result)).toBe(`test-gardener: ${failed}, so nothing is known about its tests.`)
+
+  // No test files at all, listed fine: said plainly, with what listed the files.
+  w.lsFiles = true
+  for (const path of [...w.files.keys()]) {
+    if (path.startsWith(`${PY_ROOT}/tests/`)) {
+      w.files.delete(path)
+      w.mtimes.delete(path)
+    }
+  }
+  const left = [...w.files.keys()].filter(path => path.startsWith(`${PY_ROOT}/`)).length
+  expect((await $.command.run(typed('tests', 'audit'))).text).toBe(`test-gardener audit: no test files under the project among the ${left} files git ls-files listed.`)
 })

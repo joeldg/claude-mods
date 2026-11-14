@@ -23,6 +23,7 @@ import {
   neighbourhoodText,
   parseRipwireClones,
   pickDefaultBranch,
+  plural,
   primaryModule,
   relative,
   resolvePath,
@@ -74,13 +75,20 @@ const DEFAULTS: GardenerSettings = { nearDuplicate: 0.6, maxTestsPerFile: 40, bi
 /** A test file as the scan cache keeps it, by path and mtime. */
 type CacheEntry = { mtimeMs: number; module: string | null; imports: string[]; tests: TestSummary[] }
 type Cache = { version: number; files: Record<string, CacheEntry> }
-type Scan = { infos: TestFileInfo[]; before: CacheEntry | undefined }
-type Ran = { ok: boolean; out: string; err: string }
+/** What listed the files, when one did. */
+type Lister = 'rg' | 'git ls-files' | 'a walk of the tree'
+/** The files under the root and what listed them, or why nothing could (rg, then git, each tried). */
+type Listed = { paths: string[]; by: Lister } | { failed: string }
+type Scan = { infos: TestFileInfo[]; before: CacheEntry | undefined; by: Lister; failed: string | null }
+/** A command's outcome; `isStarted` false when it could not be spawned or outlasted its timeout (the error in `err`). */
+type Ran = { ok: boolean; code: number | null; out: string; err: string; isStarted: boolean }
 /** The session's own, made in `register`: hooks close over it, helpers take it. */
 type Memory = {
   settings: GardenerSettings
   /** The project root (the git top level, else the session's folder); undefined until asked. */
   root: string | undefined
+  /** The session folder the root was derived from: the root is asked again when it changes. */
+  cwd: string | undefined
   isRepo: boolean
   /** The root is the home folder itself, outside any repository: no project, nothing scanned. */
   isHome: boolean
@@ -135,25 +143,37 @@ async function debug($: Engine, line: string) {
   }
 }
 
-/** Runs a command in `cwd`; null when it cannot start or outlasts its timeout (logged). */
-async function run($: Engine, argv: readonly string[], cwd: string, timeoutMs: number): Promise<Ran | null> {
+/** Runs a command in `cwd`; not ok, and not started, when it cannot start or outlasts its timeout (logged). */
+async function run($: Engine, argv: readonly string[], cwd: string, timeoutMs: number): Promise<Ran> {
   try {
     const out = await $.process.run(argv, { cwd, timeoutMs })
-    return { ok: out.exitCode === 0, out: out.stdout, err: out.stderr }
+    return { ok: out.exitCode === 0, code: out.exitCode, out: out.stdout, err: out.stderr, isStarted: true }
   } catch (error) {
     await debug($, `${argv[0] ?? 'command'} did not run: ${String(error)}`)
-    return null
+    return { ok: false, code: null, out: '', err: String(error), isStarted: false }
   }
 }
 
-/** The project root: the git top level, else the session's folder; asked once, with whether it is the home folder itself. */
+/** Whether a listing can be used: it succeeded, found nothing (rg exits 1), or printed paths before failing (rg exits 2 on a folder it may not read). */
+const isUsable = (ran: Ran): boolean => ran.ok || ran.code === 1 || ran.out.trim() !== ''
+
+/** Why a command gave nothing, for the person: it could not start, or what it said. */
+const failureOf = (ran: Ran): string => (ran.isStarted ? `exited: ${ran.err.trim().split('\n')[0]?.slice(0, 120) || 'no output'}` : 'could not start')
+
+/**
+ * The project root: the git top level, else the session's folder, with whether it is the home folder itself. Asked
+ * again whenever the session's folder differs from the one it was derived from: in a session's first second the engine
+ * has answered another folder (every mod's git then said "not a git repository" inside a repository), and a verdict
+ * taken then must not hold for the session.
+ */
 async function projectRoot($: Engine, m: Memory): Promise<string> {
-  if (m.root !== undefined) {
+  const cwd = (await $.session.cwd()).replace(/\/+$/, '')
+  if (m.root !== undefined && m.cwd === cwd) {
     return m.root
   }
-  const cwd = (await $.session.cwd()).replace(/\/+$/, '')
   const top = await run($, ['git', 'rev-parse', '--show-toplevel'], cwd, GIT_TIMEOUT_MS)
-  const root = top?.ok ? top.out.trim().replace(/\/+$/, '') : ''
+  const root = top.ok ? top.out.trim().replace(/\/+$/, '') : ''
+  m.cwd = cwd
   m.isRepo = root !== ''
   m.root = root === '' ? cwd : root
   // The home folder itself, outside any repository, is no project: a listing there runs for minutes and finds the world.
@@ -219,22 +239,34 @@ async function walkFiles($: Engine, root: string): Promise<string[]> {
 
 /**
  * The project's files under `root`, absolute: rg's listing (gitignore honoured), narrowed by `globs` when given; git's
- * when rg is not on PATH or did not run; a walk of the tree outside a repository.
+ * when rg is not on PATH or gave nothing; a walk of the tree outside a repository. In a repository where neither rg
+ * nor git could list, `failed` says why: an answer of no files would pass for a project without tests.
  */
-async function listFiles($: Engine, m: Memory, root: string, globs: readonly string[] | null): Promise<string[]> {
+async function listFiles($: Engine, m: Memory, root: string, globs: readonly string[] | null): Promise<Listed> {
   if (m.isHome) {
-    return []
+    return { paths: [], by: 'a walk of the tree' }
   }
+  const why: string[] = []
   let ran: Ran | null = null
+  let by: Lister = 'rg'
   if (await hasRg($, m)) {
     const argv = ['rg', '--files']
     for (const glob of globs ?? []) {
       argv.push('-g', glob)
     }
     ran = await run($, argv, root, RG_TIMEOUT_MS)
+    if (!isUsable(ran)) {
+      why.push(`rg ${failureOf(ran)}`)
+      ran = null
+    }
   }
   if (ran === null && m.isRepo) {
+    by = 'git ls-files'
     ran = await run($, ['git', 'ls-files', '--cached', '--others', '--exclude-standard'], root, RG_TIMEOUT_MS)
+    if (!isUsable(ran)) {
+      why.push(`git ls-files ${failureOf(ran)}`)
+      ran = null
+    }
   }
   let paths: string[]
   if (ran !== null) {
@@ -243,10 +275,13 @@ async function listFiles($: Engine, m: Memory, root: string, globs: readonly str
       .map(line => line.trim())
       .filter(line => line !== '')
       .map(line => resolvePath(root, line))
+  } else if (m.isRepo) {
+    return { failed: why.join('; ') }
   } else {
-    paths = m.isRepo ? [] : await walkFiles($, root)
+    by = 'a walk of the tree'
+    paths = await walkFiles($, root)
   }
-  return globs === null ? paths : paths.filter(isTestFile)
+  return { paths: globs === null ? paths : paths.filter(isTestFile), by }
 }
 
 async function cacheFile($: Engine, root: string): Promise<string | null> {
@@ -295,7 +330,11 @@ async function mtimesOf($: Engine, paths: readonly string[]): Promise<Map<string
  * rest read now; `fresh` is a file just written, whose text is at hand. `before` is what the cache held for it.
  */
 async function scanTests($: Engine, m: Memory, root: string, fresh: { path: string; text: string } | null): Promise<Scan> {
-  const paths = (await listFiles($, m, root, TEST_GLOBS)).sort()
+  const listed = await listFiles($, m, root, TEST_GLOBS)
+  if ('failed' in listed) {
+    return { infos: [], before: undefined, by: 'rg', failed: listed.failed }
+  }
+  const paths = [...listed.paths].sort()
   const file = await cacheFile($, root)
   const cache = await loadCache($, file)
   const before = fresh === null ? undefined : cache.files[fresh.path]
@@ -321,7 +360,7 @@ async function scanTests($: Engine, m: Memory, root: string, fresh: { path: stri
   if (file !== null && (changed || Object.keys(cache.files).length !== Object.keys(kept).length)) {
     await saveCache($, file, { version: CACHE_VERSION, files: kept })
   }
-  return { infos, before }
+  return { infos, before, by: listed.by, failed: null }
 }
 
 /** The tests of one file, with bodies; none when it cannot be read. */
@@ -352,7 +391,11 @@ async function noteAfterWrite($: Engine, m: Memory, filePath: string, written: s
       return null
     }
     const text = written ?? (await $.fs.read(path))
-    const { infos, before } = await scanTests($, m, root, { path, text })
+    const scan = await scanTests($, m, root, { path, text })
+    if (scan.failed !== null) {
+      return null
+    }
+    const { infos, before } = scan
     const units = extractTests(path, text)
     const known = typeof original === 'string' ? extractTests(path, original).map(unit => unit.name) : original === null ? [] : (before?.tests.map(test => test.name) ?? null)
     const isNew = original === null || (original === undefined && before === undefined)
@@ -420,7 +463,11 @@ async function neighbourhoodTool($: Engine, m: Memory, input: { module?: unknown
   if (m.isHome) {
     return HOME_TEXT
   }
-  const { infos } = await scanTests($, m, root, null)
+  const scan = await scanTests($, m, root, null)
+  if (scan.failed !== null) {
+    return `test-gardener: the files under ${root} could not be listed (${scan.failed}), so nothing is known about its tests.`
+  }
+  const { infos } = scan
   const module = primaryModule(candidates, infos, excluding) ?? ''
   const near = neighbourhood(module, infos)
   return neighbourhoodText(module, near.map(file => ({ ...file, path: relative(root, file.path) })), m.settings, near.length === 0 ? layoutHint(root, infos) : null)
@@ -429,8 +476,8 @@ async function neighbourhoodTool($: Engine, m: Memory, input: { module?: unknown
 /** ripwire's clone pairs over `dir`, relative to the project; null when it is not on PATH or fails. */
 async function ripwireClones($: Engine, m: Memory, root: string, dir: string): Promise<Duplicate[] | null> {
   const ran = await run($, ['ripwire', dir, '--clones'], root, RIPWIRE_TIMEOUT_MS)
-  if (ran === null || !ran.ok) {
-    if (ran !== null) {
+  if (!ran.ok) {
+    if (ran.isStarted) {
       await debug($, `ripwire exited with ${ran.err.trim().slice(0, 200)}`)
     }
     return null
@@ -445,7 +492,11 @@ async function audit($: Engine, m: Memory, pathArg: string | null): Promise<stri
     return HOME_TEXT
   }
   const scope = pathArg === null ? root : resolvePath(await $.session.cwd(), pathArg)
-  const { infos } = await scanTests($, m, root, null)
+  const scan = await scanTests($, m, root, null)
+  if (scan.failed !== null) {
+    return `test-gardener: the files under ${root} could not be listed (${scan.failed}); nothing was audited.`
+  }
+  const { infos } = scan
   const inScope = infos.filter(info => scope === root || info.path === scope || info.path.startsWith(`${scope}/`))
   const files: AuditFile[] = []
   for (const info of inScope) {
@@ -453,7 +504,13 @@ async function audit($: Engine, m: Memory, pathArg: string | null): Promise<stri
       files.push({ path: relative(root, info.path), module: info.module, imports: info.imports, units: await readUnits($, info.path) })
     }
   }
-  const projectFiles = (await listFiles($, m, root, null)).map(path => relative(root, path))
+  const listed = await listFiles($, m, root, null)
+  const projectFiles = ('failed' in listed ? [] : listed.paths).map(path => relative(root, path))
+  if (inScope.length === 0) {
+    // Said apart from a listing that failed: this project (or subtree) has no test files among the files listed.
+    const where = scope === root ? 'the project' : relative(root, scope)
+    return `test-gardener audit: no test files under ${where} among the ${plural(projectFiles.length, 'file')} ${scan.by} listed.`
+  }
   const dir = commonDirectory(inScope.map(info => info.path)) ?? scope
   const ripwire = files.length === 0 ? null : await ripwireClones($, m, root, dir)
   const result = assembleAudit({ scope: scope === root ? '' : relative(root, scope), files, ripwire, projectFiles }, m.settings)
@@ -471,13 +528,13 @@ async function audit($: Engine, m: Memory, pathArg: string | null): Promise<stri
  */
 async function countBranch($: Engine, root: string): Promise<BranchCount> {
   const refs = await run($, ['git', 'for-each-ref', '--format=%(refname)%09%(symref)', ...DEFAULT_BRANCH_REFS], root, GIT_TIMEOUT_MS)
-  const current = (await run($, ['git', 'branch', '--show-current'], root, GIT_TIMEOUT_MS))?.out.trim() ?? ''
-  const base = pickDefaultBranch(refs?.ok ? refs.out : null, current === '' ? null : current)
+  const current = (await run($, ['git', 'branch', '--show-current'], root, GIT_TIMEOUT_MS)).out.trim()
+  const base = pickDefaultBranch(refs.ok ? refs.out : null, current === '' ? null : current)
   if (base === null || current === '' || current === base.replace(/^origin\//, '')) {
     return ZERO
   }
   const diff = await run($, ['git', 'diff', '-U0', `${base}...HEAD`, '--', ...TEST_GLOBS.map(glob => `:(glob)${glob}`)], root, GIT_TIMEOUT_MS)
-  return diff?.ok ? countBranchTests(diff.out) : ZERO
+  return diff.ok ? countBranchTests(diff.out) : ZERO
 }
 
 /** Counts the branch's tests once, however many ask meanwhile; outside a git repository the count is zero. */
@@ -521,6 +578,7 @@ export const register: Register = (on, options) => {
       modelReview: options.modelReview === true,
     },
     root: undefined,
+    cwd: undefined,
     isRepo: false,
     isHome: false,
     refreshing: null,

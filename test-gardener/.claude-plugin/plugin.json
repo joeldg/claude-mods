@@ -1,6 +1,6 @@
 {
   "name": "test-gardener",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Makes Claude consolidate tests instead of appending them. After it writes or edits a test file, a note names the test files that already cover the module, the near-duplicates and clones among the tests it just added, and a file past the size guideline; a tests_neighbourhood tool answers the same before tests are written; /tests audit lists the consolidations for the project (clones, near-duplicates, parametrize candidates, oversized files, skips, tests whose module is gone) and suggests executing them; a band above the prompt flags a branch heavy with new tests. Never edits a test, blocks nothing, makes no model calls.",
   "author": {
     "name": "joeldg"
