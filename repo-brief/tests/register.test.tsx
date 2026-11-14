@@ -5,6 +5,7 @@ const CWD = '/Users/me/repo'
 
 const BAND = {
   hasSurvey: false,
+  isCollapsed: false,
   isWorking: false,
   maxRows: 10,
   bodyColumns: 120,
@@ -158,7 +159,7 @@ test('the snapshot gathered at session start is the one the first message gets',
 test('the band draws the one-liner on terminal and desktop, and Hide hides it', async ($, on) => {
   mock.clock(on, { now: 0 })
   world(on)
-  await $.command.run(typed('brief', ''))
+  await $.command.run(typed('repo', ''))
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'repo-brief', surface, component: 'AbovePrompt', props: BAND })
@@ -173,15 +174,15 @@ test('the band draws the one-liner on terminal and desktop, and Hide hides it', 
     expect(await ui.find({ type: 'Button' })).toBeUndefined()
     await ui.unmount()
 
-    // /brief brings the band back.
-    await $.command.run(typed('brief', ''))
+    // /repo brings the band back.
+    await $.command.run(typed('repo', ''))
   }
 })
 
 test('the band yields to a survey', async ($, on) => {
   mock.clock(on, { now: 0 })
   world(on)
-  await $.command.run(typed('brief', ''))
+  await $.command.run(typed('repo', ''))
   const ui = await $.ui.mount({
     plugin: 'repo-brief',
     surface: 'terminal',
@@ -207,7 +208,21 @@ test('outside a git repo there is no brief and no band', async ($, on) => {
     expect(shown((await ui.drawn()) as Node)).toBe('')
     await ui.unmount()
   }
-  expect((await $.command.run(typed('brief', ''))).text).toBe(`repo-brief: ${CWD} is not inside a git repository.`)
+  expect((await $.command.run(typed('repo', ''))).text).toBe(`repo-brief: ${CWD} is not inside a git repository.`)
+})
+
+test("a start-time gather that found no repository is asked again at the first message: the engine has answered another folder in a session's first second", async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, { ...REPLIES, 'git status': { exitCode: 128, stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' } })
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(w.ran).toEqual(['git status'])
+
+  w.replies['git status'] = REPLIES['git status'] as Reply
+  const out = await $.prompt.context(firstContext)
+  expect(w.ran.filter(key => key === 'git status')).toHaveLength(2)
+  expect(out.blocks).toHaveLength(2)
+  expect(out.blocks.at(-1)?.text ?? '').toContain('main')
 })
 
 test('when gh fails the brief still has the git side and no PR section', async ($, on) => {
@@ -226,17 +241,17 @@ test('when gh fails the brief still has the git side and no PR section', async (
   await ui.unmount()
 })
 
-test('/brief re-gathers and returns the whole summary', async ($, on) => {
+test('/repo re-gathers and returns the whole summary', async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on)
 
-  const first = await $.command.run(typed('brief', ''))
+  const first = await $.command.run(typed('repo', ''))
   expect(first.text?.split('\n')[0]).toBe('Repo state just now (gathered by the repo-brief mod):')
   expect(first.text).toContain('Branch: main tracking origin/main, ahead 1, behind 2')
   expect(first.text).toContain('#123 ✗ CI failing')
 
   w.replies['git status'] = '## main...origin/main\n'
-  const second = await $.command.run(typed('brief', ''))
+  const second = await $.command.run(typed('repo', ''))
   expect(second.text).toContain('Branch: main tracking origin/main, up to date')
   expect(second.text).toContain('Working tree: clean')
   expect(w.ran.filter(key => key === 'git status')).toHaveLength(2)
@@ -245,7 +260,7 @@ test('/brief re-gathers and returns the whole summary', async ($, on) => {
 test('a finished turn refreshes the band at most every refreshMinutes', async ($, on) => {
   const clock = mock.clock(on, { now: 0 })
   const w = world(on)
-  await $.command.run(typed('brief', ''))
+  await $.command.run(typed('repo', ''))
   w.replies['git status'] = '## main...origin/main [ahead 3]\n'
 
   await clock.advance(60_000)
@@ -269,8 +284,8 @@ test(
     mock.clock(on, { now: 0 })
     world(on)
     // A test's options reach `register` from Claude Code 2.1.289 on; an older kit hands it the defaults,
-    // which /brief shows by the focus labels it lists, and then there is nothing here to check.
-    const brief = await $.command.run(typed('brief', ''))
+    // which /repo shows by the focus labels it lists, and then there is nothing here to check.
+    const brief = await $.command.run(typed('repo', ''))
     if (!brief.text?.includes('#16 Someday [idea]')) {
       return
     }
@@ -282,7 +297,7 @@ test(
 test("another plugin's band beneath stays, under the brief", async ($, on) => {
   mock.clock(on, { now: 0 })
   world(on, REPLIES, 'New in Downloads: paper.pdf')
-  await $.command.run(typed('brief', ''))
+  await $.command.run(typed('repo', ''))
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'repo-brief', surface, component: 'AbovePrompt', props: BAND })
@@ -290,7 +305,7 @@ test("another plugin's band beneath stays, under the brief", async ($, on) => {
     await ui.press({ key: 'hide' })
     expect(shown((await ui.drawn()) as Node)).toBe('New in Downloads: paper.pdf')
     await ui.unmount()
-    await $.command.run(typed('brief', ''))
+    await $.command.run(typed('repo', ''))
   }
 })
 
@@ -327,15 +342,15 @@ test(
   },
 )
 
-test('/brief asks gh again, hold or not', async ($, on) => {
+test('/repo asks gh again, hold or not', async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on, { ...REPLIES, 'gh pr': CHECKS_DENIED })
-  const held = await $.command.run(typed('brief', ''))
+  const held = await $.command.run(typed('repo', ''))
   expect(held.text).toContain("PRs: gh token can't read them")
   expect(held.text).toContain('Open issues: 3')
 
   w.replies['gh pr'] = GH_PRS
-  const again = await $.command.run(typed('brief', ''))
+  const again = await $.command.run(typed('repo', ''))
   expect(again.text).toContain('#123 ✗ CI failing: Fix login redirect (fix/login)')
   expect(again.text).not.toContain("can't read them")
   expect(w.ran.filter(key => key === 'gh pr')).toHaveLength(2)
@@ -345,7 +360,7 @@ test('the default branch comes from one for-each-ref read: origin/HEAD, else ori
   mock.clock(on, { now: 0 })
   // A clone made without origin/HEAD, as the 3-day logs showed: origin/main stands in.
   const w = world(on, { ...REPLIES, 'git for-each-ref': 'refs/remotes/origin/main\t\nrefs/heads/main\t\n' })
-  const first = await $.command.run(typed('brief', ''))
+  const first = await $.command.run(typed('repo', ''))
   expect(first.text).toContain('merged into origin/main')
   expect(w.argvs).toContain('git branch --merged origin/main')
   expect(w.ran).not.toContain('git symbolic-ref')
@@ -355,7 +370,7 @@ test('the default branch comes from one for-each-ref read: origin/HEAD, else ori
   // Neither main nor master anywhere: the branch checked out now.
   w.replies['git for-each-ref'] = ''
   w.replies['git status'] = '## trunk...origin/trunk\n'
-  const second = await $.command.run(typed('brief', ''))
+  const second = await $.command.run(typed('repo', ''))
   expect(second.text).toContain('merged into trunk')
   expect(w.argvs).toContain('git branch --merged trunk')
 })

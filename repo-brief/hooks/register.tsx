@@ -75,7 +75,7 @@ type Ask = { cwd: string; timeoutMs: number; now: number }
 /**
  * A gh list's stdout, or null when it could not start, timed out, exited non-zero or is held: a list
  * refused over auth (a token that may not read it, no login) is expected and quiet, so it is not asked
- * again for AUTH_HOLD_MS in this session; /brief asks anyway.
+ * again for AUTH_HOLD_MS in this session; /repo asks anyway.
  */
 async function ghList($: Engine, ask: Ask, kind: keyof GhHeld, argv: readonly string[]): Promise<Listed> {
   if (ask.now < ghHeld[kind]) {
@@ -230,7 +230,8 @@ export const register: Register = (on, options) => {
   // for a quick one up to BRIEF_WAIT_MS (prompt.context), and the band draws once it lands.
   on('session.start', async ($, e, next) => {
     await $.command.register({
-      name: 'brief',
+      // Not `brief`: Claude Code ships a /brief of its own, and the engine refuses the name (the whole hook was skipped).
+      name: 'repo',
       description: 'Re-gather the repo brief (branch, uncommitted work, commits, PRs, focus issues) and show it',
     })
     void gather($, FULL)
@@ -243,7 +244,9 @@ export const register: Register = (on, options) => {
       return result
     }
     const known = await read($, snapshot)
-    const current = known ?? (await within($, gather($, QUICK), BRIEF_WAIT_MS))
+    // A snapshot saying "no repository" is asked again: in a session's first second the engine has answered another
+    // folder, and the start-time gather then found no repository where there is one.
+    const current = known !== null && known.isRepo ? known : await within($, gather($, QUICK), BRIEF_WAIT_MS)
     if (!current?.isRepo) {
       return result
     }
@@ -263,7 +266,7 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'brief' }, async $ => {
+  on('command.run', { command: 'repo' }, async $ => {
     if (inflight) {
       await inflight
     }
