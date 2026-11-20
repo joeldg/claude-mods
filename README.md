@@ -153,6 +153,7 @@ Settings:
 - `logLines` (120)
 - `deleteRemoteBranch` (off): deletes the branch on GitHub too, only while it still points at the merged commit. GitHub's own "Automatically delete head branches" setting does the same job.
 - `toastAdoptedCi` (off): toast the CI results of PRs adopted from the repository too, as every PR's used to; with several worktree sessions of one repo, each would toast.
+- A session another session's process started (a hook's `claude -p`, say) adopts nothing, polls nothing and looks no number up in its prompt: a summarizer's prompt holds a whole conversation log, and its issue numbers were being asked of `gh pr checks`.
 
 It never closes issues; put "Closes #N" in PR bodies for that.
 
@@ -201,6 +202,7 @@ Catches Claude up on the repo when a session starts, so you don't have to ask "c
 - When gh's token can't read the PRs (a fine-grained token without "Checks: read", or no login), the brief says `PRs: gh token can't read them` in their place, keeps the issues it could read, and leaves gh alone for 30 minutes instead of failing at every refresh. `/brief` asks again at once.
 - `/repo` re-gathers now and prints the full summary (it was `/brief`; `claude plugin validate` on 2.1.322 reports `/brief` as a name Claude Code ships, which the engine refuses while skipping the hook that registers it, so the mod moved ahead of that).
 - Makes no model calls: only `git` and `gh`. The band refreshes after a turn at most every 2 minutes.
+- A session another session's process started (a hook's `claude -p`, say) gets no brief and no gather: such a run used to cost nine git and gh calls each.
 
 Settings: focus labels, refresh minutes, and whether to brief Claude.
 

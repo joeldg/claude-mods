@@ -781,6 +781,26 @@ async function adoptAgain($: Engine): Promise<void> {
   }
 }
 
+/** Another session's process started this one: nothing is gathered, adopted, looked up or shown. */
+let isNestedRun = false
+
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
 export const register: Register = (on, options) => {
   config = {
     pollMs: Math.max(10, Number(options.pollSeconds ?? 60)) * 1000,
@@ -798,6 +818,7 @@ export const register: Register = (on, options) => {
   sessionCwd = null
   lastAdoptFoundWorkTree = false
   adoptTriesLeft = 0
+  isNestedRun = false
 
   on('session.start', async ($, e, next) => {
     sessionCwd = e.cwd
@@ -808,8 +829,11 @@ export const register: Register = (on, options) => {
       immediate: true,
     })
     await $.tool.register(PRS_STATUS_TOOL).catch((error: unknown) => debug($, `the prs_status tool did not register: ${String(error)}`))
-    ensureTimer($)
-    void adoptAtStart($, e.cwd)
+    isNestedRun = await isNested($)
+    if (!isNestedRun) {
+      ensureTimer($)
+      void adoptAtStart($, e.cwd)
+    }
     return next(e)
   })
 
@@ -837,7 +861,7 @@ export const register: Register = (on, options) => {
   // Watches the PR a `gh pr create` opened (or names as already existing).
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
-    if (ran.deny !== undefined || !CREATE.test(e.command)) {
+    if (isNestedRun || ran.deny !== undefined || !CREATE.test(e.command)) {
       return ran
     }
     try {
@@ -856,7 +880,7 @@ export const register: Register = (on, options) => {
 
   // Hands the model the failing checks and the failed log's tail when the person mentions a failing PR.
   on('prompt.submit', async ($, e, next) => {
-    if (!config.attachCiLogs || !PERSONAL.has(e.origin.kind)) {
+    if (isNestedRun || !config.attachCiLogs || !PERSONAL.has(e.origin.kind)) {
       return next(e)
     }
     const blocks: string[] = []

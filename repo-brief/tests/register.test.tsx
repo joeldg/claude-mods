@@ -225,6 +225,20 @@ test("a start-time gather that found no repository is asked again at the first m
   expect(out.blocks.at(-1)?.text ?? '').toContain('main')
 })
 
+test("a session another session's process started gets no brief and runs nothing: a hook's `claude -p` is not a session to catch up", async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  // What the engine hands every process a session starts.
+  mock.env(on, { CLAUDE_CODE_CHILD_SESSION: '1' })
+  const w = world(on)
+  await $.session.start({ cwd: CWD, surface: null, isInteractive: false })
+  await clock.settle()
+  const out = await $.prompt.context(firstContext)
+  await $.turn.complete(TURN)
+  await clock.settle()
+  expect(out.blocks.map(block => block.name)).toEqual(['currentDate'])
+  expect(w.ran).toEqual([])
+})
+
 test('when gh fails the brief still has the git side and no PR section', async ($, on) => {
   mock.clock(on, { now: 0 })
   world(on, { ...REPLIES, 'gh pr': 'deny', 'gh issue': { exitCode: 4, stderr: 'To get started with GitHub CLI, please run:  gh auth login' } })

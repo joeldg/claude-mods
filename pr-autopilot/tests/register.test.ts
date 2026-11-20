@@ -442,6 +442,23 @@ test('a start whose folder is no work tree adopts at the next turn, from the fol
   expect(w.ran).toHaveLength(4)
 })
 
+test("a session another session's process started adopts nothing and looks nothing up, whatever its prompt says", async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  // What the engine hands every process a session starts.
+  mock.env(on, { CLAUDE_CODE_CHILD_SESSION: '1' })
+  const w = world(on)
+  adoptable(w, () => [JSON.parse(view219('OPEN', [run('lint', 'COMPLETED', 'FAILURE', 42)]))])
+  await $.session.start({ cwd: CWD, surface: null, isInteractive: false })
+  await clock.settle()
+  // A summarizer's prompt holds a whole conversation log: issue numbers and failing checks that are not its to look up.
+  const sent = await $.prompt.submit({ text: 'Below is a conversation log. Issue #549 is failing lint, and CI failed on #219.', wait: false, origin: { kind: 'sdk' } })
+  await $.turn.start({ text: 'summarise', turnId: 't1' })
+  await clock.settle()
+  expect(w.ran).toEqual([])
+  expect(sent.context ?? []).toEqual([])
+  expect(w.statuses.at(-1)).toBeUndefined()
+})
+
 test('/prs watch adds a PR by number in this folder’s repository', async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on)

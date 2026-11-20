@@ -209,8 +209,28 @@ async function within<T>($: Engine, work: Promise<T>, ms: number): Promise<T | n
 /** Starts a background gather when the last one is older than `refreshMinutes`. */
 async function refreshIfStale($: Engine) {
   const now = await $.clock.now()
-  if (!inflight && now - lastGatherAt >= config.refreshMs) {
+  if (!isNestedRun && !inflight && now - lastGatherAt >= config.refreshMs) {
     void gather($, FULL)
+  }
+}
+
+/** Another session's process started this one: nothing is gathered, adopted, looked up or shown. */
+let isNestedRun = false
+
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
   }
 }
 
@@ -225,6 +245,7 @@ export const register: Register = (on, options) => {
   lastGatherAt = 0
   hasBriefed = false
   ghHeld = { prs: 0, issues: 0 }
+  isNestedRun = false
 
   // The gather is started, not awaited: the first message reads the snapshot if it is ready, else waits
   // for a quick one up to BRIEF_WAIT_MS (prompt.context), and the band draws once it lands.
@@ -234,13 +255,16 @@ export const register: Register = (on, options) => {
       name: 'repo',
       description: 'Re-gather the repo brief (branch, uncommitted work, commits, PRs, focus issues) and show it',
     })
-    void gather($, FULL)
+    isNestedRun = await isNested($)
+    if (!isNestedRun) {
+      void gather($, FULL)
+    }
     return next(e)
   })
 
   on('prompt.context', async ($, e, next) => {
     const result = await next(e)
-    if (!config.briefClaude) {
+    if (!config.briefClaude || isNestedRun) {
       return result
     }
     const known = await read($, snapshot)
