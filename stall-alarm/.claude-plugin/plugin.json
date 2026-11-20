@@ -1,6 +1,6 @@
 {
   "name": "stall-alarm",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Raises the alarm when a long-running session stalls while you are away: a permission dialog or a question that has waited for you past a threshold (toast, Mac notification, optional phone push, repeated while it stays open), and a turn that stopped on a login, usage-limit or billing error, with the fix. Leaves scheduled routines to routine-watch. No model calls.",
   "author": {
     "name": "joeldg"

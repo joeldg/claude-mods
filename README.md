@@ -294,6 +294,7 @@ Raises the alarm when a session you walked away from has stalled: a dialog waiti
 - **Phone push (optional):** `notifyCommand` runs a command on each alarm, e.g. `curl -s -d {message} ntfy.sh/your-topic`. `{title}` and `{message}` are filled in as single arguments, never through a shell.
 - `/stalls` shows the open waits with their ages, the last alarms and the settings; `/stalls off` and `/stalls on` toggle it for the session.
 - Makes no model calls, and runs no process but the notifications.
+- A session another session's process started (a hook's `claude -p`, say) is left alone: no waits, no alarms. An ECC Stop hook spawned 64 such runs in three days, each dying on its login and each raising a "Claude stopped" alarm. A question the engine asks about before it runs is worded as a question ("waiting for your answer: …"), not as a permission ("for your OK: AskUserQuestion").
 
 Settings: `stallMinutes` (5), `repeatMinutes` (30, permission dialogs), `questionRepeatMinutes` (120), `questionRepeats` (3; 0 = alarm once), `notifyMac` (on), `notifyCommand` (empty), `alarmOnAnyError` (off), `skipRoutines` (on).
 

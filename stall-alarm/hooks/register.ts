@@ -70,7 +70,8 @@ const countOption = (value: unknown, fallback: number): number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback
 
 /** Whether this session is left alone: a scheduled routine, which routine-watch watches. */
-const isQuiet = (session: StallSession): boolean => config.skipRoutines && session.isRoutine
+/** Left alone: a routine run (routine-watch's), or a session another session's process started. */
+const isQuiet = (session: StallSession): boolean => session.isNested === true || (config.skipRoutines && session.isRoutine)
 
 async function debug($: Engine, line: string) {
   try {
@@ -244,6 +245,23 @@ async function stopped($: Engine, text: string, kind: string | null) {
   await alarm($, 'Claude stopped', errorMessage(text, kind))
 }
 
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
 export const register: Register = (on, options) => {
   config = {
     stallMinutes: minutesOption(options.stallMinutes, DEFAULTS.stallMinutes, 0.25),
@@ -262,7 +280,7 @@ export const register: Register = (on, options) => {
   failed = null
 
   on('session.start', async ($, e, next) => {
-    await save($, { ...(await load($)), folder: folderName(e.cwd) })
+    await save($, { ...(await load($)), folder: folderName(e.cwd), isNested: await isNested($) })
     await $.command.register({
       name: 'stalls',
       description: 'What Claude is waiting on you for and for how long, the last alarms, the settings; off|on for the session',
@@ -290,7 +308,12 @@ export const register: Register = (on, options) => {
     const verdict = await next(e)
     // A query (`$.tool.check`) carries no call id: nothing waits on it.
     if (verdict.decision === 'ask' && e.tool_use_id !== undefined) {
-      await beginWait($, e.tool_use_id, 'ok', describeCall(e.tool, e.input))
+      // The engine asks before a question runs, too: that wait is the question's, worded as one, not a permission's.
+      if (e.tool === 'AskUserQuestion') {
+        await beginWait($, e.tool_use_id, 'question', firstQuestion(e.input))
+      } else {
+        await beginWait($, e.tool_use_id, 'ok', describeCall(e.tool, e.input))
+      }
     }
     return verdict
   })

@@ -232,6 +232,9 @@ export const describeSettings = (settings: StallSettings): string =>
 /** What /stalls prints: the open waits with their ages, the last alarms, the settings. */
 export const describeStalls = (session: StallSession, settings: StallSettings, now: number): string => {
   const lines: string[] = []
+  if (session.isNested) {
+    lines.push('Started by another session (a hook or a script ran claude): nothing is tracked or alarmed.')
+  }
   if (session.isRoutine && settings.skipRoutines) {
     lines.push('Routine session: left to routine-watch (skipRoutines on).')
   }

@@ -46,9 +46,19 @@ const osascript = (message: string, title: string) => [
   `display notification "${message}" with title "${title}" sound name "Glass"`,
 ]
 
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: unknown; context?: string[] }
+const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
+
 /** Answers the host beneath the plugin: processes, toasts, the status line, the engine's verdicts, the turns. */
 const world = (on: On): World => {
-  const w: World = { argv: [], toasts: [], statuses: [], verdicts: {}, exits: {} }
+  // A question is allowed to run: the kit denies one that is asked about with no person there to answer.
+  const w: World = { argv: [], toasts: [], statuses: [], verdicts: { AskUserQuestion: 'allow' }, exits: {} }
   on('process.run', (_$, e) => {
     w.argv.push([...e.argv])
     const exitCode = w.exits[e.argv[0] ?? ''] ?? 0
@@ -125,7 +135,7 @@ test('a dialog answered within the threshold raises no alarm, toast or status', 
   await begin($)
 
   expect((await ask($, 'toolu_1')).decision).toBe('ask')
-  const call = $.tool.call({ tool: 'Bash', command: PUSH.command, tool_use_id: 'toolu_1' })
+  const call = callTool($, { tool: 'Bash', command: PUSH.command, tool_use_id: 'toolu_1' })
   await clock.advance(2 * MINUTE)
   await call
   await clock.advance(10 * MINUTE)
@@ -203,10 +213,8 @@ test('a question left unanswered alarms; its answer closes the wait', { timeoutM
   })
   await begin($)
 
-  const asking = $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
+  const asking = callTool($, { tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
   await clock.settle()
-  // The engine's ask for the same call is the same wait.
-  await ask($, 'toolu_q', { questions: QUESTIONS }, 'AskUserQuestion')
   await clock.advance(5 * MINUTE)
   const message = 'Claude has been waiting 5m for your answer: Which sources should the digest use?'
   expect(w.toasts).toEqual([message])
@@ -218,6 +226,13 @@ test('a question left unanswered alarms; its answer closes the wait', { timeoutM
   expect(w.statuses.at(-1)).toBeUndefined()
   await clock.advance(60 * MINUTE)
   expect(w.toasts).toHaveLength(1)
+
+  // Where the engine asks before the question runs, that wait is the question's too, worded as one.
+  w.verdicts.AskUserQuestion = 'ask'
+  await ask($, 'toolu_q2', { questions: QUESTIONS }, 'AskUserQuestion')
+  await clock.advance(5 * MINUTE)
+  expect(w.toasts.at(-1)).toBe(message)
+  await endTurn($, 'answer')
 })
 
 test('a question alarms again two hours on, not thirty minutes on; /stalls says how often and how many times', { timeoutMs: 30_000 }, async ($, on) => {
@@ -225,7 +240,7 @@ test('a question alarms again two hours on, not thirty minutes on; /stalls says 
   const w = world(on)
   questionPending(on, clock, 2 * HOUR + 6 * MINUTE)
   await begin($)
-  const asking = $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
+  const asking = callTool($, { tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
   await clock.settle()
 
   await clock.advance(5 * MINUTE)
@@ -277,7 +292,7 @@ test('questionRepeatMinutes and questionRepeats set how often a question alarms 
   const w = world(on)
   questionPending(on, clock, 2 * HOUR + MINUTE)
   await begin($)
-  const asking = $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
+  const asking = callTool($, { tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
   await clock.settle()
   await clock.advance(5 * MINUTE)
   await clock.advance(20 * MINUTE)
@@ -312,7 +327,7 @@ test('with questionRepeats 0 a question alarms once, while a dialog beside it st
   const w = world(on)
   questionPending(on, clock, HOUR + 6 * MINUTE)
   await begin($)
-  const asking = $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
+  const asking = callTool($, { tool: 'AskUserQuestion', tool_use_id: 'toolu_q', questions: QUESTIONS })
   await clock.settle()
   await ask($, 'toolu_1')
   await clock.advance(5 * MINUTE)
@@ -427,6 +442,23 @@ test('a routine session is left to routine-watch: nothing is tracked or alarmed'
   expect(w.toasts).toEqual([])
   expect(w.statuses).toEqual([])
   expect((await $.command.run(typed('stalls'))).text?.split('\n')[0]).toBe('Routine session: left to routine-watch (skipRoutines on).')
+})
+
+test("a session another session's process started is left alone: a hook's `claude -p` that dies on its login alarms nobody", { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  // What the engine hands every process a session starts.
+  mock.env(on, { CLAUDE_CODE_CHILD_SESSION: '1' })
+  const w = world(on)
+  await begin($, 'Below is a conversation log from a Claude Code coding session.', 'sdk')
+  await ask($, 'toolu_1')
+  await clock.advance(10 * MINUTE)
+  await $.classic.StopFailure({ error: 'authentication_failed', error_details: OAUTH })
+  await endTurn($, 'error')
+  await clock.settle()
+  expect(w.argv).toEqual([])
+  expect(w.toasts).toEqual([])
+  expect(w.statuses).toEqual([])
+  expect((await $.command.run(typed('stalls'))).text?.split('\n')[0]).toBe('Started by another session (a hook or a script ran claude): nothing is tracked or alarmed.')
 })
 
 test('with skipRoutines off a routine session is watched like any other', { options: { skipRoutines: false }, timeoutMs: 30_000 }, async ($, on) => {

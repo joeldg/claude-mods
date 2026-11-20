@@ -24,6 +24,8 @@ export type StallSession = {
   isRoutine: boolean
   /** `/stalls off` for this session. */
   isOff: boolean
+  /** Another session's process started this one (a hook's `claude -p`, say): nobody is waiting on it, nothing alarms. */
+  isNested?: boolean
   /** The name of the folder the session runs in, for the notification's title; '' when unknown. */
   folder: string
   /** The waits still open, by tool_use_id. */
