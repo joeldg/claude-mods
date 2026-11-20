@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { CWD, DB, NICE, NOW, PYTHON, SESSION, SIDECAR, SOURCES, START_JITTER_MS, STATS, callsOf, progress, recall, say, sidecar, start, world } from './world'
+import { CWD, DB, NICE, NOW, PYTHON, SESSION, SIDECAR, SOURCES, START_JITTER_MS, STATS, callTool, callsOf, progress, recall, say, sidecar, start, world } from './world'
 
 const SLOW = { timeoutMs: 30_000 }
 /** No random wait before the start update: it runs as soon as the start's timers fire. */
@@ -130,7 +130,7 @@ test('an engine that cannot start is said once, the status clears, and the tools
   expect(w.toasts[0]).toMatch(/^recall: indexing failed: /)
   expect(w.statuses.at(-1)).toBeUndefined()
 
-  const ran = await $.tool.call({ tool: 'mcp__recall__search', query: 'modal deploy' })
+  const ran = await callTool($, { tool: 'mcp__recall__search', query: 'modal deploy' })
   expect(String(ran.result)).toMatch(/^recall: the search failed: the engine did not run \(/)
   expect(w.toasts).toHaveLength(2)
   expect(w.calls).toEqual([])
@@ -203,7 +203,7 @@ test('with /usr/bin/nice present the updates run under nice -n 19; the stats che
   expect(update[4]).toMatch(/\/engine\/recall\.py$/)
   expect(update.slice(5, 8)).toEqual(['--db', DB, 'update'])
   expect(w.argvs.find(argv => argv.includes('stats'))?.[0]).toBe(PYTHON)
-  await $.tool.call({ tool: 'mcp__recall__search', query: 'modal deploy' })
+  await callTool($, { tool: 'mcp__recall__search', query: 'modal deploy' })
   expect(w.argvs.at(-1)?.[0]).toBe(PYTHON)
 
   // A rebuild and the update a session's end leaves running too.
@@ -302,4 +302,18 @@ test('a first build that finds the lock held says so once in the debug log; /rec
   await w.clock.settle()
   expect(w.toasts).toHaveLength(2)
   expect(w.logs).toEqual([BUSY_LINE])
+})
+
+test("a session another session's process started is not recalled for: no update, no related sessions, no ledger, no status", AT_ONCE, async ($, on) => {
+  // What the engine hands every process a session starts.
+  const w = world(on, { CLAUDE_CODE_CHILD_SESSION: '1' })
+  await $.session.start({ cwd: CWD, surface: null, isInteractive: false })
+  await w.clock.advance(START_JITTER_MS)
+  await say($, 'Below is a conversation log from a coding session about the importer. Create a summary.')
+  await w.clock.settle()
+  await w.clock.advance(60_000)
+  expect(w.calls).toEqual([])
+  expect(w.spawned).toEqual([])
+  expect(w.statuses).toEqual([])
+  expect(w.toasts).toEqual([])
 })

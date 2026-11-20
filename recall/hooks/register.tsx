@@ -1421,8 +1421,29 @@ async function takeArmed($: Engine): Promise<string[]> {
   return taken.blocks
 }
 
+/** Another session's process started this one: no index update, no ledger, no related sessions, no band. */
+let isNestedRun = false
+
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
 export const register: Register = (on, options) => {
   config = configFrom(options)
+  isNestedRun = false
   isUpdating = false
   isAsking = false
   timer = null
@@ -1461,6 +1482,12 @@ export const register: Register = (on, options) => {
         immediate: true,
       })
       .catch((error: unknown) => $.ui.log(`recall: /remember did not register: ${messageOf(error)}`, { to: 'debug' }))
+    // A session another session's process started (a hook's `claude -p`) is no session to recall for or to keep a
+    // ledger of: no timer, no update, no band; the tools and commands still answer when asked.
+    isNestedRun = await isNested($)
+    if (isNestedRun) {
+      return next(e)
+    }
     ensureTimer($)
     // Nothing here holds the session's start up: timers carry it. The ledger and the band come at once; the update waits
     // a random part of startJitterSeconds, so sessions that start together (after a reboot, say) do not all run it at
@@ -1519,7 +1546,7 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     // A slash command (`/name args`) is not a prompt to the model; a path such as /var/log/x is.
-    if (!PERSONAL.has(e.origin.kind) || /^\/[\w:.-]+(?:\s|$)/.test(e.text.trimStart())) {
+    if (isNestedRun || !PERSONAL.has(e.origin.kind) || /^\/[\w:.-]+(?:\s|$)/.test(e.text.trimStart())) {
       return next(e)
     }
     // After a reload no session.start runs: the timer starts here, and a status the last environment left is cleared.
@@ -1556,6 +1583,9 @@ export const register: Register = (on, options) => {
 
   // Every row the conversation keeps feeds the ledger; the row itself goes on untouched.
   on('session.append', async ($, e, next) => {
+    if (isNestedRun) {
+      return next(e)
+    }
     try {
       noteRow($, e)
     } catch (error) {

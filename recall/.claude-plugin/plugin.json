@@ -1,6 +1,6 @@
 {
   "name": "recall",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Makes past sessions recallable: indexes Claude Code and Codex transcripts, subagent runs, memory files, standing orders and second-opinion reviews into a local SQLite index (kept after Claude Code deletes old transcripts), gives Claude search, expand, recap and list tools, and adds /recall (search, last session, timeline, decisions, commands, files, PRs, ask), /remember, a pick-up-where-you-left-off band, a related-work band, and a per-session ledger (goal, open tasks, questions answered, files touched, PRs and commits) that comes back after a compaction and /recall ledger prints. Nothing calls a model except /recall ask: one call to the ask model per question, billed to your usage.",
   "author": {
     "name": "joeldg"

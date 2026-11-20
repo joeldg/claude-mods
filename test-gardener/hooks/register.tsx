@@ -95,6 +95,8 @@ type Memory = {
   refreshing: Promise<void> | null
   /** Whether rg can start, probed on the first listing; null until then. */
   rg: Promise<boolean> | null
+  /** Another session's process started this one: the branch is not counted and no band is kept. */
+  isNested: boolean
 }
 
 /** The tool's and the audit's answer in a session whose folder is the home folder itself. */
@@ -567,6 +569,23 @@ async function refreshIfStale($: Engine, m: Memory) {
   }
 }
 
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
 export const register: Register = (on, options) => {
   const m: Memory = {
     settings: {
@@ -583,6 +602,7 @@ export const register: Register = (on, options) => {
     isHome: false,
     refreshing: null,
     rg: null,
+    isNested: false,
   }
 
   on('session.start', async ($, e, next) => {
@@ -594,7 +614,10 @@ export const register: Register = (on, options) => {
       })
       .catch((error: unknown) => debug($, `the /tests command did not register: ${String(error)}`))
     await $.tool.register(NEIGHBOURHOOD_TOOL).catch((error: unknown) => debug($, `the tests_neighbourhood tool did not register: ${String(error)}`))
-    void refreshBranch($, m)
+    m.isNested = await isNested($)
+    if (!m.isNested) {
+      void refreshBranch($, m)
+    }
     return next(e)
   })
 
@@ -641,7 +664,7 @@ export const register: Register = (on, options) => {
 
   // The band's count is refreshed after the main loop's turns, at most every two minutes.
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId === undefined) {
+    if (e.agentId === undefined && !m.isNested) {
       void refreshIfStale($, m)
     }
     return next(e)

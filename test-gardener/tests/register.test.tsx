@@ -72,7 +72,7 @@ const dirOf = (path: string): string => path.slice(0, path.lastIndexOf('/'))
 const refLines = (...rows: string[]): string => rows.map(row => `${row}\n`).join('')
 
 /** Answers the host beneath the plugin: HOME, the files, rg, git and ripwire, the tools written through, the band beneath. */
-const world = (on: On, cwd: string): World => {
+const world = (on: On, cwd: string, env: Record<string, string> = {}): World => {
   const w: World = {
     files: new Map(),
     mtimes: new Map(),
@@ -99,7 +99,7 @@ const world = (on: On, cwd: string): World => {
     w.files.set(path, text)
     w.mtimes.set(path, ++w.stamp)
   }
-  mock.env(on, { HOME, PATH: `${BIN}:/usr/bin` })
+  mock.env(on, { HOME, PATH: `${BIN}:/usr/bin`, ...env })
   on('session.cwd', () => ({ value: w.cwd }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
@@ -858,4 +858,17 @@ test('rg that cannot start gives way to git ls-files; when git cannot list eithe
   }
   const left = [...w.files.keys()].filter(path => path.startsWith(`${PY_ROOT}/`)).length
   expect((await $.command.run(typed('tests', 'audit'))).text).toBe(`test-gardener audit: no test files under the project among the ${left} files git ls-files listed.`)
+})
+
+test("a session another session's process started counts no branch: nothing runs at its start or after its turns", async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  // What the engine hands every process a session starts.
+  const w = world(on, PY_ROOT, { CLAUDE_CODE_CHILD_SESSION: '1' })
+  seed(w, PY_FILES)
+  w.diff = branchDiff(38, 1204)
+  await $.session.start({ cwd: PY_ROOT, surface: null, isInteractive: false })
+  await clock.settle()
+  await $.turn.complete(TURN)
+  await clock.settle()
+  expect(w.ran).toEqual([])
 })

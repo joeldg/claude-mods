@@ -313,7 +313,7 @@ export const progress = (done: number, total: number): string =>
   `${JSON.stringify({ progress: { files_done: done, files_total: 40, bytes_done: done, bytes_total: total } })}\n`
 
 /** Answers the host beneath the plugin: the engine and git, the session, the screen, the prompt box and the model. */
-export function world(on: On): World {
+export function world(on: On, env: Record<string, string> = {}): World {
   const clock = mock.clock(on, { now: NOW })
   const w: World = {
     clock,
@@ -348,7 +348,7 @@ export function world(on: On): World {
     below: 'empty',
     turns: 0,
   }
-  mock.env(on, { HOME })
+  mock.env(on, { HOME, ...env })
   on('session.cwd', () => ({ value: CWD }))
   on('session.id', () => ({ value: w.sessionId }))
   on('session.turns', () => ({ value: w.turns }))
@@ -512,6 +512,7 @@ export const PANE_PROPS = {
 
 export const BAND = {
   hasSurvey: false,
+  isCollapsed: false,
   isWorking: false,
   maxRows: 10,
   bodyColumns: 140,
@@ -564,3 +565,12 @@ export async function band($: Engine, surface: (typeof SURFACES)[number] = 'term
   await ui.unmount()
   return { text, buttons }
 }
+
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+export type ToolInput = { tool: string; [key: string]: unknown }
+export type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: unknown; context?: string[] }
+export const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
