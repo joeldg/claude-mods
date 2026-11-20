@@ -25,6 +25,7 @@ A pane of your project's running dev servers, so you don't have to ask Claude to
 - When a command fails with "address already in use", Claude gets a note (and you a toast) naming the holder, e.g. `Port 4000 is held by node (pid 123, up 2h, in /Users/me/other)`.
 - Status line: `servers: :4000 :5173`.
 - Makes no model calls. The port scan is `netstat -anv -p tcp` (macOS) or `ss -ltnp` (Linux), never a bare `lsof`; `ps` and `lsof -d cwd` run once per new pid, one pid at a time. One open session scans per interval (15s by default) and writes `~/.claude/dev-servers/scan-cache.json` for the others; a slow scan doubles the interval, up to 5 minutes.
+- A session another session's process started (a hook's `claude -p`, say) scans nothing at start: the tool and `/servers` still answer when asked.
 
 ## downloads-drop
 
@@ -68,6 +69,7 @@ A **Jobs** pane for long-running work: training runs, downloads, extractions —
 - `/jobs` opens the pane, `/unwatch <label|id|done|all>` removes jobs.
 - Tools for Claude: `jobs_list` (every watched job's state, pid, progress, ETA, last-output age, exit code and log path), `jobs_watch` (`{ pid?, log?, name?, quietMinutes? }`: follow a process or log started elsewhere; it never starts commands) and `jobs_unwatch` (`{ name }`). The first message of each conversation says jobs are watched and names them, so Claude stops writing `until … sleep` loops and running `ps`. They need no permission prompt: they only read the mod's own list.
 - Makes no model calls: it reads logs with `tail`, checks processes with `ps` (one listing, or a per-pid lookup when only pids are watched), and runs `df`. A probe that times out or takes over 2 s is retried at a doubling interval, up to 5 minutes, until it is fast again. The debug log names a probe's pace only once it has held for two probes in a row, and at most once per five minutes per probe, so a pace that flips with the Mac's load leaves no trail.
+- A session another session's process started (a hook's `claude -p`, say) runs no ticks and gets no block about jobs.
 
 Settings (in `/config`): stall minutes (10), stall reminder minutes (60; 0 = first stall only), stall reminders per silence (3; 0 = none), refresh seconds (10), how long finished jobs stay (120 min; a timer leaves after a minute), auto-open (on), which disks to show.
 
@@ -121,9 +123,10 @@ Keeps an eye on Modal so idle GPU containers don't burn credits — in the proje
 - Status line while containers run: `Modal: 1 running (2 containers)`. Deployed apps with no containers cost nothing, so they stay off it.
 - A toast when an app has had containers up longer than `alertMinutes` (30), repeated at most every 30 minutes.
 - `/modal` opens a pane of apps with state, containers and uptime. **Stop** asks for Confirm, then runs `modal app stop`. Nothing is stopped any other way.
-- Shows today's spend and alerts on a `budgetToday` where the Modal CLI supports `billing report` (1.3.3+, Team/Enterprise workspaces). Otherwise `/modal` says why spend isn't shown.
+- Shows today's spend and alerts on a `budgetToday` where the Modal CLI supports `billing report` (1.3.3+, Team/Enterprise workspaces). Otherwise `/modal` says why spend isn't shown, and a CLI without the command is asked again a week later, not daily.
 - Finds the CLI as `modal` or `python3 -m modal`. It checks `PATH` first rather than running a command that can only fail, and never retries one that isn't there. When the CLI runs but refuses — no token (`Token missing. Could not authenticate client.`), a config error, a usage error — it reads the reason out of the CLI's error box, shows it on the status line and in the pane as `Modal: <reason> · retry in 60m`, logs the whole message once, and leaves the CLI alone for `cliRetryMinutes` (60) in every open session, through the shared cache; `/modal` retries at once. A timeout is Modal being slow, which the backoff above handles.
 - Makes no model calls: only the Modal CLI, never at session start — the first read runs in the background.
+- A session another session's process started (a hook's `claude -p`, say) is not checked for Modal and polls nothing.
 
 Settings: `modalCommand` (empty = `modal`, then `python3 -m modal`), `pollSeconds` (60), `alertMinutes` (30), `budgetToday` (0 = off), `alwaysPoll` (off), `cliRetryMinutes` (60).
 

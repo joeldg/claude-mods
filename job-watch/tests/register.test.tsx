@@ -125,7 +125,8 @@ const world = (on: On, now: () => number): World => {
     w.tools.push(e)
     return { value: { tool: `mcp__job-watch__${e.name}` } }
   })
-  on('tool.check', () => ({ decision: 'ask' as const }))
+  // The engine asks about a tool unless a hook allows it; a Bash call is allowed, or the kit denies it with no one to ask.
+  on('tool.check', (_$, e) => ({ decision: e.tool === 'Bash' ? ('allow' as const) : ('ask' as const) }))
   on('prompt.context', (_$, e) => ({ blocks: e.blocks }))
   return w
 }
@@ -931,4 +932,17 @@ test('a task described as a server, whatever its program, and a watched pid that
   w.ps = ' 4242 ./bin/thing --listen\n'
   await clock.advance(10_000)
   expect(w.toasts).toEqual(['other exited after 20m'])
+})
+
+test("a session another session's process started checks nothing and is told nothing about jobs", SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const w = world(on, clock.now)
+  // What the engine hands every process a session starts.
+  mock.env(on, { HOME: '/home/dev', CLAUDE_CODE_CHILD_SESSION: '1' })
+  await $.session.start({ cwd: '/home/dev/app', surface: null, isInteractive: false })
+  await clock.settle()
+  await clock.advance(60_000)
+  expect(w.psRuns).toEqual([])
+  expect(w.statuses).toEqual([])
+  expect((await $.prompt.context(firstContext)).blocks.map(block => block.name)).toEqual(['currentDate'])
 })

@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import type { Engine } from 'claude-code/testing'
 
 import type { ModalCache, ModalShared } from '../types'
 
@@ -110,6 +111,15 @@ const cacheFile = (over: Partial<Omit<ModalCache, 'data'>> = {}, data: Partial<M
   JSON.stringify({ ts: NOW - 10_000, by: 'sess-b', intervalMs: MIN, ...over, data: { ...SHARED, ...data } })
 
 type Reply = string | { exitCode: number; stdout?: string; stderr?: string } | { deny: string }
+
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: unknown; context?: string[] }
+const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
 
 type World = {
   /** How the Modal CLI runs on this machine (`modal`, `python3 -m modal`); null: not installed. */
@@ -732,11 +742,11 @@ test('a Bash command that runs modal starts watching; one that only mentions it 
   await $.session.start(START)
   await clock.settle()
 
-  await $.tool.call({ tool: 'Bash', command: 'rg -n modal README.md' })
+  await callTool($, { tool: 'Bash', command: 'rg -n modal README.md' })
   await clock.settle()
   expect(cliRuns(w)).toEqual([])
 
-  await $.tool.call({ tool: 'Bash', command: 'cd /work && python3 -m modal deploy app.py' })
+  await callTool($, { tool: 'Bash', command: 'cd /work && python3 -m modal deploy app.py' })
   await clock.settle()
   expect(cliRuns(w).slice(0, 2)).toEqual(['modal --version', 'modal app list --json'])
   expect(w.statuses.at(-1)).toBe('Modal: 1 running (2 containers) · 1 deployed')
@@ -810,7 +820,7 @@ test('while another session holds the lock the CLI is not run and the stale cach
   expect(JSON.parse(w.files.get(LOCK) ?? 'null')).toEqual({ ts: NOW + 2 * MIN, by: 'sess-a' })
 })
 
-test('a CLI without billing report is remembered for every session for a day', { timeoutMs: 30_000 }, async ($, on) => {
+test('a CLI without billing report is remembered for every session for a week', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = world(on)
   await $.session.start(START)
@@ -821,11 +831,11 @@ test('a CLI without billing report is remembered for every session for a day', {
   expect(written(w).data).toMatchObject({ billingUnsupportedAt: NOW, spendToday: null })
   expect(written(w).data.spendNote).toMatch(/^this Modal CLI has no `billing report` command/)
 
-  // Another session's knowledge, 23 hours old, spares this one the try; a day old, it tries once more.
-  w.files.set(CACHE, cacheFile({ ts: NOW - 2 * MIN }, { billingUnsupportedAt: NOW - 23 * 60 * MIN }))
+  // Another session's knowledge, six days old, spares this one the try; a week old, it tries once more.
+  w.files.set(CACHE, cacheFile({ ts: NOW - 2 * MIN }, { billingUnsupportedAt: NOW - 6 * 24 * 60 * MIN }))
   await clock.advance(MIN)
   expect(ran(w, 'modal billing report --for today --json')).toBe(1)
-  w.files.set(CACHE, cacheFile({ ts: NOW - 2 * MIN }, { billingUnsupportedAt: NOW - 25 * 60 * MIN }))
+  w.files.set(CACHE, cacheFile({ ts: NOW - 2 * MIN }, { billingUnsupportedAt: NOW - (7 * 24 + 1) * 60 * MIN }))
   await clock.advance(MIN)
   expect(ran(w, 'modal billing report --for today --json')).toBe(2)
 })
@@ -891,4 +901,15 @@ test('session.start returns before the first poll resolves', { timeoutMs: 30_000
   expect(w.statuses).toEqual([])
   await clock.advance(5000)
   expect(w.statuses.at(-1)).toBe('Modal: 1 running (2 containers) · 1 deployed')
+})
+
+test("a session another session's process started is not checked for Modal and polls nothing", { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // What the engine hands every process a session starts.
+  const w = world(on, 'modal', { env: { CLAUDE_CODE_CHILD_SESSION: '1' } })
+  await $.session.start({ cwd: CWD, surface: null, isInteractive: false })
+  await clock.settle()
+  await clock.advance(10 * 60_000)
+  expect(w.ran).toEqual([])
+  expect(w.statuses).toEqual([])
 })

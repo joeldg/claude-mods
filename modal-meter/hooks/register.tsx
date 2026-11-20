@@ -53,7 +53,7 @@ const SPEND_EVERY_MS = 5 * 60_000
 /** After `billing report` failed for a reason other than not existing, wait this long to ask again. */
 const SPEND_RETRY_MS = 60 * 60_000
 /** Once a CLI is known to lack `billing report`, no session tries it again for this long. */
-const BILLING_RECHECK_MS = 24 * 60 * 60_000
+const BILLING_RECHECK_MS = 7 * 24 * 60 * 60_000
 /** Another session's lock is stale once its poll interval and this much (one probe timeout) have passed since it was taken. */
 const LOCK_STALE_MS = LIST_TIMEOUT_MS
 /** Plain output: no ANSI styling from rich (FORCE_COLOR still adds bold, which the parser strips). */
@@ -202,7 +202,7 @@ const spendOf = (shared: ModalShared): SpendPart => ({
 /**
  * Today's spend from `modal billing report --for today --json`, where this CLI has it and a read
  * is due; else `kept` as the last session left it. A CLI without the command is remembered for a
- * day, for every session.
+ * week, for every session: a daily retry was a failing process a day that an upgrade alone would change.
  */
 async function readSpend($: Engine, argv: readonly string[], now: number, isForced: boolean, kept: SpendPart): Promise<SpendPart> {
   if (kept.billingUnsupportedAt !== null && now - kept.billingUnsupportedAt < BILLING_RECHECK_MS) {
@@ -544,6 +544,23 @@ const positive = (value: unknown, fallback: number): number => {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
 export const register: Register = (on, options) => {
   config = {
     command: String(options.modalCommand ?? '').trim(),
@@ -566,7 +583,10 @@ export const register: Register = (on, options) => {
       name: 'modal',
       description: 'Open the Modal pane: running apps, containers, spend; stop an app',
     })
-    void begin($, e.cwd)
+    // A session another session's process started (a hook's `claude -p`) is not checked for Modal and polls nothing.
+    if (!(await isNested($))) {
+      void begin($, e.cwd)
+    }
     return next(e)
   })
 

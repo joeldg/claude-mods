@@ -1,6 +1,6 @@
 {
   "name": "modal-meter",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Watches your Modal apps from the CLI, in projects that use Modal: running apps and containers on the status line, a toast when one has been up too long, today's spend where the CLI reports it, and a pane to stop an app (after you confirm). One session polls for all the open ones; a CLI that refuses (no token, a config error) is left alone for an hour, with its own reason shown. No model calls.",
   "author": {
     "name": "joeldg"

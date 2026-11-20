@@ -808,6 +808,23 @@ async function conflictNote($: Engine, command: string, output: string): Promise
   return `dev-servers: ${note}.${own}`
 }
 
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
 export const register: Register = (on, options) => {
   configure(options)
 
@@ -820,9 +837,12 @@ export const register: Register = (on, options) => {
     await $.tool
       .register(TOOL_SPEC)
       .catch(error => $.ui.log(`dev-servers: the ${TOOL} tool did not register: ${String(error)}`, { to: 'debug' }))
-    ensureTimer($)
-    // The first scan runs from a timer of its own: starting the session never waits on netstat, ps or lsof.
-    $.clock.after(0, () => void refresh($, false))
+    // A session another session's process started (a hook's `claude -p`) scans nothing until it is asked.
+    if (!(await isNested($))) {
+      ensureTimer($)
+      // The first scan runs from a timer of its own: starting the session never waits on netstat, ps or lsof.
+      $.clock.after(0, () => void refresh($, false))
+    }
     return next(e)
   })
 

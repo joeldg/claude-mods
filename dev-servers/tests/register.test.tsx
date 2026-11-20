@@ -266,8 +266,17 @@ const answerProcess = async (w: World, host: Host, e: { argv: readonly string[];
   return { deny: `${tool}: not faked` }
 }
 
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: unknown; context?: string[] }
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const callTool = ($: any, input: ToolInput): Promise<ToolOutcome> => ($.tool.call as (input: ToolInput) => Promise<ToolOutcome>)(input)
+
 /** Answers the host beneath the plugin: the commands, the project's and the shared files, toasts, status and panes. */
-const world = (on: On, procs: Proc[]): World => {
+const world = (on: On, procs: Proc[], env: Record<string, string> = {}): World => {
   const w: World = {
     procs: procs.map(proc => ({ ...proc })),
     files: { [`${ROOT}/package.json`]: PACKAGE },
@@ -302,7 +311,7 @@ const world = (on: On, procs: Proc[]): World => {
     },
     scan: row => scanRows(w, lingering, row),
   }
-  mock.env(on, { HOME: '/Users/me' })
+  mock.env(on, { HOME: '/Users/me', ...env })
   on('session.cwd', () => ({ value: ROOT }))
   on('session.id', () => ({ value: w.sessionId }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -312,7 +321,8 @@ const world = (on: On, procs: Proc[]): World => {
     return { value: { tool: `mcp__dev-servers__${e.name}` } }
   })
   on('tool.check', (_$, e) =>
-    w.denied.includes(e.tool) ? { decision: 'deny' as const, reason: 'denied in settings' } : { decision: 'ask' as const },
+    // A Bash call is allowed: the kit denies one that is asked about with no one there to answer.
+    w.denied.includes(e.tool) ? { decision: 'deny' as const, reason: 'denied in settings' } : { decision: e.tool === 'Bash' ? ('allow' as const) : ('ask' as const) },
   )
   on('fs.list', () => ({
     value: w.names.map(name => ({ name, kind: 'file' as const, size: 0, mtimeMs: 0, isLink: false })),
@@ -604,7 +614,7 @@ test('EADDRINUSE in Bash output adds a note naming the holder', SLOW, async ($, 
     result: 'Error: listen EADDRINUSE: address already in use :::4000',
     text: 'Error: listen EADDRINUSE: address already in use :::4000\n    at Server.setupListenHandle [as _listen2] (node:net:1872:16)',
   }
-  const failed = await $.tool.call({ tool: 'Bash', command: 'npm run dev' })
+  const failed = await callTool($, { tool: 'Bash', command: 'npm run dev' })
   expect(failed.context).toEqual(['dev-servers: Port 4000 is held by node (pid 123, up 2h, in /Users/me/other).'])
   expect(w.toasts).toEqual(['Port 4000 is held by node (pid 123, up 2h, in /Users/me/other)'])
   // The holder is looked up without lsof's listen scan: netstat for the port, then ps and lsof for that one pid.
@@ -614,13 +624,13 @@ test('EADDRINUSE in Bash output adds a note naming the holder', SLOW, async ($, 
   // No port in the message: the command's own --port names it; this holder is one of the project's own.
   w.procs[0] = { ...w.procs[0]!, pid: 124, ports: [8001], cwd: `${ROOT}/docs` }
   answer = { result: { stdout: '', stderr: '' }, text: 'OSError: [Errno 48] Address already in use' }
-  const python = await $.tool.call({ tool: 'Bash', command: 'python3 -m http.server --port 8001' })
+  const python = await callTool($, { tool: 'Bash', command: 'python3 -m http.server --port 8001' })
   expect(python.context).toEqual([
     `dev-servers: Port 8001 is held by node (pid 124, up 2h, in ${ROOT}/docs). It is one of this project's servers; /servers can restart or stop it.`,
   ])
 
   answer = { result: { stdout: 'ok', stderr: '' }, text: 'ready on http://localhost:3000' }
-  const fine = await $.tool.call({ tool: 'Bash', command: 'npm run dev' })
+  const fine = await callTool($, { tool: 'Bash', command: 'npm run dev' })
   expect(fine.context).toBeUndefined()
   expect(w.toasts).toHaveLength(2)
 })
@@ -841,7 +851,8 @@ test('the dev_servers tool is registered for the model, allowed without asking, 
     expect(spec?.description).toContain(word)
   }
   expect(await $.tool.check({ tool: TOOL, input: {} })).toMatchObject({ decision: 'allow' })
-  expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })).decision).toBe('ask')
+  // Another tool's check is left as it came (the world allows Bash, so one it asks about).
+  expect((await $.tool.check({ tool: 'Write', input: { file_path: '/tmp/x', content: 'x' } })).decision).toBe('ask')
   // A deny in settings stands.
   w.denied = [TOOL]
   expect(await $.tool.check({ tool: TOOL, input: {} })).toMatchObject({ decision: 'deny', reason: 'denied in settings' })
@@ -850,7 +861,7 @@ test('the dev_servers tool is registered for the model, allowed without asking, 
   // dev was started from the pane: its log has been written since the process started.
   w.files[`${LOGS}/dev.log`] = 'VITE ready'
   w.mtimes[`${LOGS}/dev.log`] = 1_000_000 - 7_000_000
-  const ran = await $.tool.call({ tool: TOOL })
+  const ran = await callTool($, { tool: TOOL })
   expect(ran.result).toBe(
     [
       `Running in ${ROOT}:`,
@@ -864,7 +875,7 @@ test('the dev_servers tool is registered for the model, allowed without asking, 
 
   // An older log is another run's; all: true lists every other listener with its port and process.
   w.mtimes[`${LOGS}/dev.log`] = 1_000_000 - 8_000_000
-  const everything = String((await $.tool.call({ tool: TOOL, all: true })).result)
+  const everything = String((await callTool($, { tool: TOOL, all: true })).result)
   expect(everything).not.toContain('· log ')
   expect(everything).toContain(
     ['Other listeners on this machine:', '  :5432 · postgres · pid 986 · in /opt/homebrew/var/postgresql', '  :53480 · rapportd · pid 646'].join('\n'),
@@ -902,8 +913,8 @@ test("Claude Code's own sessions are left out of the servers, the other listener
     await ui.unmount()
   }
 
-  expect(String((await $.tool.call({ tool: TOOL })).result)).toContain('2 other listeners on this machine (all: true lists them).')
-  const everything = String((await $.tool.call({ tool: TOOL, all: true })).result)
+  expect(String((await callTool($, { tool: TOOL })).result)).toContain('2 other listeners on this machine (all: true lists them).')
+  const everything = String((await callTool($, { tool: TOOL, all: true })).result)
   expect(everything).toContain(
     [
       'Other listeners on this machine:',
@@ -937,4 +948,14 @@ test("a session another scan found but has not looked up: netstat's `claude` nam
   expect(shown.some(text => /claude|28890/.test(text))).toBe(false)
   expect(shown).toContain('1 other listener on this machine')
   await ui.unmount()
+})
+
+test("a session another session's process started scans nothing until it is asked", SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // What the engine hands every process a session starts.
+  const w = world(on, [VITE], { CLAUDE_CODE_CHILD_SESSION: '1' })
+  await $.session.start({ cwd: ROOT, surface: null, isInteractive: false })
+  await clock.settle()
+  await clock.advance(60_000)
+  expect(w.ran).toEqual([])
 })
