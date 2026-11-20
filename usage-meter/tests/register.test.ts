@@ -9,6 +9,7 @@ const DIR = `${HOME}/.claude/usage-meter`
 const TURNS = `${DIR}/turns`
 const HITS = `${DIR}/hits.json`
 const SUMMARY = `${DIR}/summary.json`
+const ALERTS = `${DIR}/alerts.json`
 const TOOL = 'mcp__usage-meter__usage_status'
 const LA = 'America/Los_Angeles'
 const MINUTE = 60_000
@@ -22,6 +23,10 @@ const RESET = 1_789_086_600_000
 const START = HIT_AT - 3 * HOUR
 const LIMIT = "You've hit your session limit · resets 5:30pm (America/Los_Angeles)"
 const SLOW = { timeoutMs: 60_000 }
+/** 2026-11-17 19:24Z, 11:24am PST: a real Fable-limit hit, `resets Nov 20 at 10am (America/Los_Angeles)`. */
+const WEEK_HIT_AT = Date.UTC(2026, 10, 17, 19, 24)
+/** 2026-11-20 18:00Z, 10am PST. */
+const WEEK_RESET = Date.UTC(2026, 10, 20, 18, 0)
 
 /** A main-loop turn: 13,000 effective tokens. */
 const MAIN: TurnUsage = { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 50_000, cache_creation_input_tokens: 3000, model: 'claude-opus-5-5' }
@@ -41,6 +46,15 @@ type World = {
   rateLimits: SessionRateLimit[]
   uuid: number
 }
+
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: unknown; context?: string[] }
+const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
 
 /** Answers the host beneath the plugin: HOME, the files, the session, the API's windows, toasts and the status line. */
 const world = (on: On, clock: MockClock, env: Record<string, string> = { HOME }): World => {
@@ -169,7 +183,7 @@ test('every turn is counted into this session’s file, a subagent’s flagged, 
   expect(w.toasts).toEqual([])
 })
 
-test('the API’s five-hour reading rides on the turn line and leads the status line while fresh', SLOW, async ($, on) => {
+test('the API’s five-hour and seven-day readings ride on the turn line; the five-hour one leads the status line while fresh', SLOW, async ($, on) => {
   const clock = mock.clock(on, { now: START })
   const w = world(on, clock)
   w.rateLimits = [
@@ -178,11 +192,11 @@ test('the API’s five-hour reading rides on the turn line and leads the status 
   ]
   await begin($)
   await turn($, MAIN)
-  expect(turnsOf(w, 'sess-a')).toEqual([{ ts: START, in: 1000, cr: 50_000, cw: 3000, out: 200, sub: false, u: 58.5, r: RESET }])
-  expect(w.statuses.at(-1)).toBe('usage 5h: 13K eff · 59% used · resets 5:30pm')
+  expect(turnsOf(w, 'sess-a')).toEqual([{ ts: START, in: 1000, cr: 50_000, cw: 3000, out: 200, sub: false, u: 58.5, r: RESET, w: 12 }])
+  expect(w.statuses.at(-1)).toBe('usage 5h: 13K eff · 59% used · resets 5:30pm · week 12%')
   // Sixteen minutes on with no turn anywhere: the percentage is stale, the reset still ahead.
   await clock.advance(16 * MINUTE)
-  expect(w.statuses.at(-1)).toBe('usage 5h: 13K eff · resets 5:30pm')
+  expect(w.statuses.at(-1)).toBe('usage 5h: 13K eff · resets 5:30pm · week 12%')
   // The contract carries the estimate's fields alone.
   expect(summaryOf(w)).toMatchObject({ effective: 13_000, capEstimate: null, pct: null, nextResetAt: null })
 })
@@ -271,7 +285,7 @@ test('a limit message learns a hit and the cap, toasts once whichever hook hears
   expect(summaryOf(w)).toMatchObject({ capEstimate: 19_100_000, pct: 126, nextResetAt: Date.UTC(2026, 8, 11, 5, 30) })
 })
 
-test('a hit another session already counted is not recorded twice, but this session is still told', SLOW, async ($, on) => {
+test('a hit another session already counted is not recorded twice, and is not said twice: this session shows the error itself', SLOW, async ($, on) => {
   const clock = mock.clock(on, { now: HIT_AT })
   const w = world(on, clock)
   const earlier: Hit = { at: HIT_AT - 10 * MINUTE, resetAt: RESET, effectiveAtHit: 13_000_000, zone: LA }
@@ -280,7 +294,7 @@ test('a hit another session already counted is not recorded twice, but this sess
   await turn($, MAIN)
   await row($, w, LIMIT)
   expect(hitsOf(w)).toEqual([earlier])
-  expect(w.toasts).toEqual(['Session limit hit · resets 5:30pm · 13K eff in the last 5h, cap estimate updated'])
+  expect(w.toasts).toEqual([])
   expect(summaryOf(w)).toMatchObject({ capEstimate: 13_000_000, pct: 0, lastHitAt: HIT_AT - 10 * MINUTE, nextResetAt: RESET })
 })
 
@@ -399,7 +413,7 @@ test('/meter prints the totals, the estimate, the API reading, the sessions, the
   expect((await $.command.run(typed('meter'))).text).toBe(expected)
   expect(await $.tool.check({ tool: TOOL, input: {} })).toMatchObject({ decision: 'allow' })
   expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })).decision).toBe('ask')
-  expect(String((await $.tool.call({ tool: TOOL })).result)).toBe(expected)
+  expect(String((await callTool($, { tool: TOOL })).result)).toBe(expected)
   // The API's fresh reading leads: no warning from the estimate, and the status line shows the reading.
   expect(w.toasts).toEqual([])
   expect(w.statuses.at(-1)).toBe('usage 5h: 34K eff · 59% used · resets 5:30pm')
@@ -445,4 +459,68 @@ test('without HOME nothing is written and nothing shown', SLOW, async ($, on) =>
   expect(w.writes).toEqual([])
   expect(w.statuses).toEqual([])
   expect((await $.command.run(typed('meter'))).text).toBe('usage-meter: HOME is not set, so there is nowhere to keep the turns.')
+})
+
+test('the newer wordings are hits too: the five-hour limit by its name feeds the cap; the weekly limit and a model’s own are kept apart, said once, and shown until they lift', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: WEEK_HIT_AT })
+  const w = world(on, clock)
+  await begin($)
+  await turn($, MAIN)
+  await row($, w, "You've hit your 5-hour limit · resets 5:50pm (America/Los_Angeles)")
+  expect(hitsOf(w)).toEqual([{ at: WEEK_HIT_AT, resetAt: Date.UTC(2026, 10, 18, 1, 50), effectiveAtHit: 13_000, zone: LA }])
+  expect(w.toasts).toEqual(['Session limit hit · resets 5:50pm · 13K eff in the last 5h, cap estimate updated'])
+
+  // The weekly limit and Fable's own name the same reset: two limits, each recorded once, neither a sample of the five-hour cap.
+  await row($, w, "You've hit your weekly limit · resets Nov 20 at 10am (America/Los_Angeles)")
+  const fable = "You've hit your Fable limit · resets Nov 20 at 10am (America/Los_Angeles). Switch to another model, or manage usage credits at https://claude.ai/settings/usage"
+  await row($, w, fable)
+  await row($, w, fable)
+  expect(hitsOf(w)?.slice(1)).toEqual([
+    { at: WEEK_HIT_AT, resetAt: WEEK_RESET, effectiveAtHit: 13_000, zone: LA, kind: 'weekly' },
+    { at: WEEK_HIT_AT, resetAt: WEEK_RESET, effectiveAtHit: 13_000, zone: LA, kind: 'model', model: 'Fable' },
+  ])
+  expect(w.toasts.slice(1)).toEqual(['Weekly limit hit · resets Nov 20 10:00am', 'Fable limit hit · resets Nov 20 10:00am · other models still run'])
+  expect(summaryOf(w)).toMatchObject({
+    capEstimate: 13_000,
+    limits: [
+      { kind: 'weekly', model: null, resetAt: WEEK_RESET },
+      { kind: 'model', model: 'Fable', resetAt: WEEK_RESET },
+    ],
+  })
+  expect(w.statuses.at(-1)).toBe('usage 5h: 13K eff · 100% of last limit · resets 5:50pm · weekly limit until Nov 20 10:00am · Fable limit until Nov 20 10:00am')
+  expect(String((await callTool($, { tool: TOOL })).result)).toContain('In force: the Fable limit, until Nov 20 10:00am')
+})
+
+test('one session says a crossing for the whole Mac: the first to see a window cross notes it, the others stay quiet; the seven-day window has its own', SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  const w = world(on, clock)
+  w.rateLimits = [{ kind: 'five_hour', percentUsed: 85, resetsAt: new Date(RESET).toISOString() }]
+  // Another session saw this five-hour window cross a moment ago.
+  w.files.set(ALERTS, { text: `${JSON.stringify({ [`warn:${RESET}`]: START - 5_000 })}\n`, mtimeMs: START - 5_000 })
+  await begin($)
+  await turn($, MAIN)
+  expect(w.toasts).toEqual([])
+
+  // The seven-day window crossing is this session's to say, once, and it notes it for the others.
+  w.rateLimits = [...w.rateLimits, { kind: 'seven_day', percentUsed: 82, resetsAt: new Date(WEEK_RESET).toISOString() }]
+  await turn($, MAIN)
+  await turn($, MAIN)
+  expect(w.toasts).toEqual(['Usage at 82% of the weekly limit · resets Nov 20 10:00am'])
+  expect(JSON.parse(w.files.get(ALERTS)?.text ?? '{}')).toEqual({ [`warn:${RESET}`]: START - 5_000, [`week:${WEEK_RESET}`]: START })
+  expect(w.statuses.at(-1)).toBe('usage 5h: 39K eff · 85% used · resets 5:30pm · week 82%')
+  expect(summaryOf(w)).toMatchObject({ pct: 85, weekPct: 82, weekResetAt: WEEK_RESET })
+})
+
+test("a session another session's process started has its turns counted and does nothing else", SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  // What the engine hands every process a session starts.
+  const w = world(on, clock, { HOME, CLAUDE_CODE_CHILD_SESSION: '1' })
+  w.rateLimits = [{ kind: 'five_hour', percentUsed: 85, resetsAt: new Date(RESET).toISOString() }]
+  await $.session.start({ cwd: '/home/dev/app', surface: null, isInteractive: false })
+  await turn($, MAIN)
+  await clock.advance(5 * MINUTE)
+  expect(turnsOf(w, 'sess-a')).toHaveLength(1)
+  expect(w.statuses).toEqual([])
+  expect(w.toasts).toEqual([])
+  expect(w.files.has(SUMMARY)).toBe(false)
 })

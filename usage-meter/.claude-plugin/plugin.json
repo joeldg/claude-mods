@@ -1,6 +1,6 @@
 {
   "name": "usage-meter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A machine-wide meter of the plan's rolling 5-hour usage: every session's turns summed as effective tokens, the cap learned from each session-limit hit, the burn on the status line, a toast before the wall, /usage and a usage_status tool so Claude can pace itself. No process runs, no model calls.",
   "author": {
     "name": "joeldg"

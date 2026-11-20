@@ -1,8 +1,10 @@
-import type { ApiReading, Hit, SessionUsageRow, Summary, TurnLine, UsageSettings, WindowTotals } from '../types'
+import type { ActiveLimit, ApiReading, Hit, HitKind, SessionUsageRow, Summary, TurnLine, UsageSettings, WindowTotals } from '../types'
 
 export const HOUR_MS = 3_600_000
 /** A reading of the API's own five-hour window counts as current for this long. */
 export const API_FRESH_MS = 15 * 60_000
+/** A reading of the seven-day window counts as current for this long: it moves a point in hours, not minutes. */
+export const WEEK_FRESH_MS = 6 * HOUR_MS
 /** How many hits hits.json keeps. */
 export const KEPT_HITS = 20
 
@@ -52,6 +54,12 @@ export const parseTurns = (text: string): TurnLine[] => {
     if (isCount(o.r)) {
       turn.r = o.r
     }
+    if (isCount(o.w)) {
+      turn.w = o.w
+    }
+    if (isCount(o.wr)) {
+      turn.wr = o.wr
+    }
     turns.push(turn)
   }
   return turns
@@ -68,6 +76,8 @@ export type Window = {
   sessions: SessionUsageRow[]
   /** The newest reading of the API's own five-hour window among them; null when none carried one. */
   api: ApiReading | null
+  /** The newest reading of the API's seven-day window among them; null when none carried one. */
+  week: ApiReading | null
 }
 
 /** Adds up the turns inside the window ending at `now`, file by file, and finds the newest API reading. */
@@ -76,6 +86,7 @@ export const sumWindow = (files: readonly { id: string; turns: readonly TurnLine
   const totals: WindowTotals = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
   const sessions: SessionUsageRow[] = []
   let api: ApiReading | null = null
+  let week: ApiReading | null = null
   for (const file of files) {
     const inside = pruneTurns(file.turns, since)
     if (inside.length === 0) {
@@ -94,6 +105,9 @@ export const sumWindow = (files: readonly { id: string; turns: readonly TurnLine
       if (turn.u !== undefined && (api === null || turn.ts > api.ts)) {
         api = { ts: turn.ts, percentUsed: turn.u, resetsAt: turn.r ?? null, sessionId: file.id }
       }
+      if (turn.w !== undefined && (week === null || turn.ts > week.ts)) {
+        week = { ts: turn.ts, percentUsed: turn.w, resetsAt: turn.wr ?? null, sessionId: file.id }
+      }
     }
     totals.input += own.in
     totals.cacheRead += own.cr
@@ -103,30 +117,58 @@ export const sumWindow = (files: readonly { id: string; turns: readonly TurnLine
   }
   sessions.sort((a, b) => b.effective - a.effective || a.id.localeCompare(b.id))
   const effective = effectiveOf({ in: totals.input, cr: totals.cacheRead, cw: totals.cacheWrite, out: totals.output })
-  return { totals, effective, sessions, api }
+  return { totals, effective, sessions, api, week }
 }
 
 /**
- * The limit message as the API's error row reads it:
- * `You've hit your session limit · resets 10:30pm (America/Los_Angeles)`,
- * also with a bullet, with `Resets at`, or with no zone.
+ * The limit message as the API's error row reads it, in each of its wordings:
+ * `You've hit your session limit · resets 10:30pm (America/Los_Angeles)` (also `usage limit`, `Resets at`, no zone),
+ * `You've hit your 5-hour limit · resets 5:50pm (…)`, `You've hit your weekly limit · resets Nov 20 at 10am (…)`,
+ * and one model's own, `You've hit your Fable limit · resets Nov 20 at 10am (…). Switch to another model, …`.
  */
-const LIMIT = /hit your (?:session|usage) limit.*?\bresets?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b(?:\s*\(([^)]+)\))?/i
+const LIMIT =
+  /hit your ([\w .-]{1,24}?) limit\b.*?\bresets?(?:\s+at)?\s+(?:([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b(?:\s*\(([^)]+)\))?/i
 
-/** The clock time and zone a limit message names; null when the text is not one, or names no time. */
-export const parseLimit = (text: string): { hour: number; minute: number; zone: string | null } | null => {
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const FIVE_HOUR = /^(?:session|usage|5[- ]?hour|five[- ]hour)$/i
+const WEEKLY = /^(?:weekly|week|7[- ]?day|seven[- ]day)$/i
+
+/** What a limit message says: which limit, and when it resets. A five-hour one names a clock time, the others a date too. */
+export type ParsedLimit = { hour: number; minute: number; zone: string | null; kind?: 'weekly' | 'model'; model?: string; month?: number; day?: number }
+
+/**
+ * The limit, clock time, date and zone a limit message names; null when the text is not one, or names no time. A
+ * five-hour limit carries no `kind`; a model's own carries the model's name as the message wrote it.
+ */
+export const parseLimit = (text: string): ParsedLimit | null => {
   const match = LIMIT.exec(text)
   if (!match) {
     return null
   }
-  const h12 = Number(match[1])
-  const minute = Number(match[2] ?? '0')
-  const half = (match[3] ?? '').toLowerCase()
+  const name = (match[1] ?? '').trim()
+  const h12 = Number(match[4])
+  const minute = Number(match[5] ?? '0')
+  const half = (match[6] ?? '').toLowerCase()
   if (h12 < 1 || h12 > 12 || minute > 59) {
     return null
   }
-  const zone = match[4]?.trim() || null
-  return { hour: (h12 % 12) + (half === 'pm' ? 12 : 0), minute, zone }
+  const parsed: ParsedLimit = { hour: (h12 % 12) + (half === 'pm' ? 12 : 0), minute, zone: match[7]?.trim() || null }
+  if (WEEKLY.test(name)) {
+    parsed.kind = 'weekly'
+  } else if (!FIVE_HOUR.test(name)) {
+    parsed.kind = 'model'
+    parsed.model = name
+  }
+  if (match[2] !== undefined && match[3] !== undefined) {
+    const month = MONTHS.indexOf(match[2].slice(0, 3).toLowerCase()) + 1
+    const day = Number(match[3])
+    if (month === 0 || day < 1 || day > 31) {
+      return null
+    }
+    parsed.month = month
+    parsed.day = day
+  }
+  return parsed
 }
 
 type Wall = { year: number; month: number; day: number; hour: number; minute: number; second: number }
@@ -206,6 +248,43 @@ export const nextClockTime = (now: number, hour: number, minute: number, zone: s
   return nextClockTimeLocal(now, hour, minute)
 }
 
+/**
+ * A clock time on a month and day in a zone, as a weekly limit's message names its reset (`Nov 20 at 10am`): this
+ * year's, or next year's when this year's is more than a day behind `now`.
+ */
+export const clockTimeOn = (now: number, month: number, day: number, hour: number, minute: number, zone: string | null): number => {
+  for (const z of zonesToTry(zone)) {
+    const wall = wallIn(now, z)
+    if (wall === null) {
+      continue
+    }
+    for (const year of [wall.year, wall.year + 1]) {
+      const target = Date.UTC(year, month - 1, day, hour, minute, 0)
+      const offset = offsetIn(target, z)
+      if (offset === null) {
+        break
+      }
+      let at = target - offset
+      const exact = offsetIn(at, z)
+      if (exact !== null && exact !== offset) {
+        at = target - exact
+      }
+      if (at > now - 24 * HOUR_MS) {
+        return at
+      }
+    }
+  }
+  const d = new Date(now)
+  const at = new Date(d.getFullYear(), month - 1, day, hour, minute, 0, 0).getTime()
+  return at > now - 24 * HOUR_MS ? at : new Date(d.getFullYear() + 1, month - 1, day, hour, minute, 0, 0).getTime()
+}
+
+/** When the limit a message names resets: its date and clock time, or the clock time's next occurrence. */
+export const resetOfLimit = (now: number, parsed: ParsedLimit): number =>
+  parsed.month !== undefined && parsed.day !== undefined
+    ? clockTimeOn(now, parsed.month, parsed.day, parsed.hour, parsed.minute, parsed.zone)
+    : nextClockTime(now, parsed.hour, parsed.minute, parsed.zone)
+
 /** `5:30pm`, the way the limit message says it, in the zone (the local zone when it is unknown). */
 export const formatClock = (ms: number, zone: string | null): string => {
   for (const z of zonesToTry(zone)) {
@@ -256,9 +335,16 @@ export const formatHours = (ms: number): string => {
   return `${Number.isInteger(hours) ? hours : Number(hours.toFixed(1))}h`
 }
 
-/** The median effective total of the last three hits: the cap as the hits have shown it. Null without a hit. */
+/** A hit of the five-hour limit: the only kind an older build recorded, and the only kind the cap is estimated from. */
+export const isFiveHour = (hit: Hit): boolean => hit.kind === undefined || hit.kind === 'five_hour'
+
+/** The same limit, seen again: its kind, its model and its reset time. */
+const isSameLimit = (a: Hit, b: Hit): boolean => (a.kind ?? 'five_hour') === (b.kind ?? 'five_hour') && (a.model ?? '') === (b.model ?? '') && a.resetAt === b.resetAt
+
+/** The median effective total of the last three five-hour hits: the cap as the hits have shown it. Null without one. */
 export const capEstimate = (hits: readonly Hit[]): number | null => {
   const last = hits
+    .filter(isFiveHour)
     .slice(-3)
     .map(hit => hit.effectiveAtHit)
     .sort((a, b) => a - b)
@@ -271,7 +357,33 @@ export const capEstimate = (hits: readonly Hit[]): number | null => {
 
 /** The hits with one more, unless one with the same reset time is already there (the same limit, seen again); the last `keep` kept. */
 export const withHit = (hits: readonly Hit[], hit: Hit, keep: number): { hits: Hit[]; isNew: boolean } =>
-  hits.some(known => known.resetAt === hit.resetAt) ? { hits: [...hits], isNew: false } : { hits: [...hits, hit].slice(-keep), isNew: true }
+  hits.some(known => isSameLimit(known, hit)) ? { hits: [...hits], isNew: false } : { hits: [...hits, hit].slice(-keep), isNew: true }
+
+/** How long a line of alerts.json is kept: past the longest window a limit names. */
+export const ALERTS_KEPT_MS = 8 * 24 * HOUR_MS
+
+/** What alerts.json holds: when each alert (a threshold crossed in one window, a limit hit) was said, by its key; {} for a missing or unreadable file. */
+export const parseAlerts = (text: string | null): Record<string, number> => {
+  if (text === null) {
+    return {}
+  }
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    return {}
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return {}
+  }
+  const out: Record<string, number> = {}
+  for (const [key, at] of Object.entries(value as Record<string, unknown>)) {
+    if (isCount(at)) {
+      out[key] = at
+    }
+  }
+  return out
+}
 
 /** The hits hits.json holds; nothing for a missing or unreadable file. */
 export const parseHits = (text: string | null): Hit[] => {
@@ -296,7 +408,14 @@ export const parseHits = (text: string | null): Hit[] => {
     if (!isCount(o.at) || !isCount(o.resetAt) || !isCount(o.effectiveAtHit)) {
       continue
     }
-    hits.push({ at: o.at, resetAt: o.resetAt, effectiveAtHit: o.effectiveAtHit, zone: typeof o.zone === 'string' && o.zone !== '' ? o.zone : null })
+    const hit: Hit = { at: o.at, resetAt: o.resetAt, effectiveAtHit: o.effectiveAtHit, zone: typeof o.zone === 'string' && o.zone !== '' ? o.zone : null }
+    if (o.kind === 'weekly' || o.kind === 'model') {
+      hit.kind = o.kind as HitKind
+      if (typeof o.model === 'string' && o.model !== '') {
+        hit.model = o.model
+      }
+    }
+    hits.push(hit)
   }
   return hits
 }
@@ -310,10 +429,12 @@ export const buildSummary = (window: Window, hits: readonly Hit[], now: number, 
   const api = isFreshReading(window.api, now) ? window.api : null
   let last: Hit | null = null
   for (const hit of hits) {
-    if (last === null || hit.at >= last.at) {
+    if (isFiveHour(hit) && (last === null || hit.at >= last.at)) {
       last = hit
     }
   }
+  const week = isFreshWeek(window.week, now) ? window.week : null
+  const limits = activeLimits(hits, now)
   return {
     ts: now,
     windowMs,
@@ -325,8 +446,33 @@ export const buildSummary = (window: Window, hits: readonly Hit[], now: number, 
     lastHitAt: last === null ? null : last.at,
     nextResetAt:
       api !== null && api.resetsAt !== null && api.resetsAt > now ? api.resetsAt : last !== null && last.resetAt > now ? last.resetAt : null,
+    ...(week !== null ? { weekPct: Math.round(week.percentUsed), ...(week.resetsAt !== null ? { weekResetAt: week.resetsAt } : {}) } : {}),
+    ...(limits.length > 0 ? { limits } : {}),
   }
 }
+
+/** Whether a reading of the seven-day window is still current: recent enough, and its window not yet reset. */
+export const isFreshWeek = (week: ApiReading | null, now: number): week is ApiReading =>
+  week !== null && now - week.ts <= WEEK_FRESH_MS && (week.resetsAt === null || week.resetsAt > now)
+
+/** The weekly and per-model limits still in force, the soonest to lift first, each limit once. */
+export const activeLimits = (hits: readonly Hit[], now: number): ActiveLimit[] => {
+  const out: ActiveLimit[] = []
+  for (const hit of hits) {
+    if (isFiveHour(hit) || hit.resetAt <= now) {
+      continue
+    }
+    const limit: ActiveLimit = { kind: hit.kind === 'weekly' ? 'weekly' : 'model', model: hit.kind === 'model' ? (hit.model ?? null) : null, resetAt: hit.resetAt }
+    if (!out.some(known => known.kind === limit.kind && known.model === limit.model && known.resetAt === limit.resetAt)) {
+      out.push(limit)
+    }
+  }
+  return out.sort((a, b) => a.resetAt - b.resetAt)
+}
+
+/** `weekly limit`, `Fable limit`. */
+export const limitName = (limit: { kind?: HitKind; model?: string | null }): string =>
+  limit.kind === 'weekly' ? 'weekly limit' : limit.kind === 'model' ? `${limit.model ?? 'model'} limit` : 'five-hour limit'
 
 /** The estimate alone: the window's effective tokens against the last learned limit, whatever pct carries. */
 export const estimatePct = (summary: Summary): number | null =>
@@ -370,6 +516,14 @@ export const statusLine = (summary: Summary, api: ApiReading | null, now: number
   if (reset !== null) {
     parts.push(`resets ${formatClock(reset, zone)}`)
   }
+  if (summary.weekPct !== undefined) {
+    parts.push(`week ${summary.weekPct}%`)
+  }
+  for (const limit of summary.limits ?? []) {
+    if (limit.resetAt > now) {
+      parts.push(`${limitName(limit)} until ${formatDay(limit.resetAt, zone)}`)
+    }
+  }
   return parts.join(' · ')
 }
 
@@ -382,6 +536,16 @@ export const warnMessage = (share: Share, summary: Summary, api: ApiReading | nu
       : `Usage at ${share.pct}% of the last session limit · ${formatTokens(summary.effective)} of ${formatTokens(summary.capEstimate ?? 0)} eff ${window}`
   const reset = resetOf(summary, api, now)
   return reset === null ? head : `${head} · resets ${formatClock(reset, zone)}`
+}
+
+/** The toast when the seven-day window first crosses the threshold. */
+export const weekWarnMessage = (pct: number, resetAt: number | null, zone: string | null): string =>
+  `Usage at ${pct}% of the weekly limit${resetAt === null ? '' : ` · resets ${formatDay(resetAt, zone)}`}`
+
+/** The toast at a weekly or per-model hit: which limit, when it lifts, and for a model's own, that the others still run. */
+export const limitMessage = (hit: Hit, zone: string | null): string => {
+  const name = limitName(hit)
+  return `${name.charAt(0).toUpperCase()}${name.slice(1)} hit · resets ${formatDay(hit.resetAt, hit.zone ?? zone)}${hit.kind === 'model' ? ' · other models still run' : ''}`
 }
 
 /** The toast at the hit itself. */
@@ -423,6 +587,14 @@ export const describeUsage = (
     const reset = api.resetsAt !== null && api.resetsAt > now ? ` · resets ${formatClock(api.resetsAt, zone)}` : ''
     lines.push(`API five-hour window: ${Math.round(api.percentUsed)}% used${reset} · read ${formatAgo(now - api.ts)} by session ${api.sessionId.slice(0, 8)}`)
   }
+  if (window.week !== null) {
+    const week = window.week
+    const reset = week.resetsAt !== null && week.resetsAt > now ? ` · resets ${formatDay(week.resetsAt, zone)}` : ''
+    lines.push(`API seven-day window: ${Math.round(week.percentUsed)}% used${reset} · read ${formatAgo(now - week.ts)} by session ${week.sessionId.slice(0, 8)}`)
+  }
+  for (const limit of summary.limits ?? []) {
+    lines.push(`In force: the ${limitName(limit)}, until ${formatDay(limit.resetAt, zone)}`)
+  }
   lines.push(`Sessions in the window: ${window.sessions.length}`)
   const rows = window.sessions.map(session => ({
     id: session.id.slice(0, 8).padEnd(8),
@@ -442,7 +614,11 @@ export const describeUsage = (
   } else {
     lines.push(`Limit hits, newest first (${hits.length} kept, ${KEPT_HITS} at most):`)
     for (const hit of [...hits].sort((a, b) => b.at - a.at)) {
-      lines.push(`  ${formatDay(hit.at, zone)} · resets ${formatClock(hit.resetAt, hit.zone ?? zone)} · ${formatTokens(hit.effectiveAtHit)} eff in the window then`)
+      lines.push(
+        isFiveHour(hit)
+          ? `  ${formatDay(hit.at, zone)} · resets ${formatClock(hit.resetAt, hit.zone ?? zone)} · ${formatTokens(hit.effectiveAtHit)} eff in the window then`
+          : `  ${formatDay(hit.at, zone)} · ${limitName(hit)} · resets ${formatDay(hit.resetAt, hit.zone ?? zone)}`,
+      )
     }
   }
   lines.push(WEIGHTS_LINE, `Settings: window ${formatHours(settings.windowHours * HOUR_MS)} · refresh every ${settings.refreshSeconds}s · warn at ${settings.warnAt}%`)

@@ -2,23 +2,28 @@ import type { EngineInterface, Register, TurnUsage } from 'claude-code'
 
 import type { Hit, Summary, TurnLine, UsageAlerts, UsageSettings } from '../types'
 import {
+  ALERTS_KEPT_MS,
   HOUR_MS,
   KEPT_HITS,
   buildSummary,
   describeUsage,
   hitMessage,
   isSameSummary,
+  limitMessage,
   localZone,
-  nextClockTime,
+  parseAlerts,
   parseHits,
   parseLimit,
   parseTurns,
   pruneTurns,
+  resetOf,
+  resetOfLimit,
   shareOf,
   statusLine,
   sumWindow,
   turnLine,
   warnMessage,
+  weekWarnMessage,
   withHit,
 } from './meter'
 import type { Window } from './meter'
@@ -34,7 +39,7 @@ const PRUNE_EVERY_MS = HOUR_MS
 /** How many reset times this session remembers having toasted. */
 const KEPT_RESETS = 20
 /** The API's limit error as its own row of the conversation reads, and nothing but it. */
-const LIMIT_ROW = /^\s*You(?:'|’)ve hit your (?:session|usage) limit\b/i
+const LIMIT_ROW = /^\s*You(?:'|’)ve hit your [\w .-]{1,24} limit\b/i
 const LIMIT_ROW_MAX = 240
 
 const DEFAULTS: UsageSettings = { windowHours: 5, refreshSeconds: 30, warnAt: 80 }
@@ -42,13 +47,14 @@ const DEFAULTS: UsageSettings = { windowHours: 5, refreshSeconds: 30, warnAt: 80
 const TOOL_DESCRIPTION =
   "The plan's rolling five-hour usage across every Claude Code session on this Mac: effective tokens in the window, " +
   "the share of the limit used (the API's own reading when fresh, else the estimate against the last limit hit), when the window resets, " +
-  'each session’s share and the limit hits seen. ' +
+  "each session’s share, the limit hits seen, the API's seven-day window when it reported one, and any weekly or per-model limit still in force. " +
   'Check it before fanning out subagents or starting optional work when the budget is tight; it reads the shared files and makes no model call.'
 
 const COMMAND_DESCRIPTION =
-  "The plan's five-hour usage across every session: effective tokens, the share of the limit, the reset, each session's share, the limit hits, the weights"
+  "The plan's five-hour usage across every session: effective tokens, the share of the limit, the reset, the week, limits in force, each session's share, the limit hits, the weights"
 
-type Paths = { turns: string; hits: string; summary: string }
+/** `alerts` is the file every session shares to say a thing once for the Mac. */
+type Paths = { turns: string; hits: string; summary: string; alerts: string }
 
 /**
  * One activation's memory, made in `register` and handed to every function
@@ -72,6 +78,8 @@ type Memory = {
   /** Serializes the writes of this session's file: subagents end turns side by side. */
   writing: Promise<void>
   refreshing: Promise<void> | null
+  /** Another session's process started this one: its turns are counted, and nothing else happens. */
+  isNested: boolean
 }
 
 /** A number option: finite and at least `least`, else the default. */
@@ -104,7 +112,7 @@ async function where($: Engine, m: Memory): Promise<Paths | null> {
     const home = await $.env.get('HOME')
     if (home) {
       const dir = `${home}/.claude/usage-meter`
-      m.paths = { turns: `${dir}/turns`, hits: `${dir}/hits.json`, summary: `${dir}/summary.json` }
+      m.paths = { turns: `${dir}/turns`, hits: `${dir}/hits.json`, summary: `${dir}/summary.json`, alerts: `${dir}/alerts.json` }
     } else {
       m.paths = null
       await debug($, 'HOME is not set: nothing is counted')
@@ -146,20 +154,56 @@ async function alerts($: Engine): Promise<UsageAlerts> {
   return value ?? FRESH_ALERTS
 }
 
-/** One toast when the share first crosses the threshold; armed again once it is back below. */
-async function warn($: Engine, m: Memory, { summary, window, now }: Figures) {
-  const share = shareOf(summary, window.api, now)
-  if (share === null) {
-    return
+/**
+ * Whether this session is the one to say `key` (a threshold crossed in one window, a limit hit): the first to note it
+ * in the file every session shares. Twenty sessions each watching the same window used to toast the same crossing.
+ */
+async function claim($: Engine, p: Paths, key: string, now: number): Promise<boolean> {
+  const known = parseAlerts(await readText($, p.alerts))
+  if (known[key] !== undefined) {
+    return false
   }
+  const kept = Object.fromEntries(Object.entries(known).filter(([, at]) => now - at < ALERTS_KEPT_MS))
+  await $.fs.write(p.alerts, `${JSON.stringify({ ...kept, [key]: now })}\n`).catch(() => undefined)
+  return true
+}
+
+/**
+ * One toast when a window's share first crosses the threshold, from one session for the whole Mac; armed again once
+ * the share is back below. The five-hour window and the seven-day one each have their own.
+ */
+async function warn($: Engine, m: Memory, p: Paths, { summary, window, now }: Figures) {
   const known = await alerts($)
-  if (share.pct >= m.settings.warnAt) {
-    if (!known.isWarned) {
-      await $.state.set(ALERTS, { ...known, isWarned: true })
-      $.ui.toast(warnMessage(share, summary, window.api, now, m.windowMs, m.zone), { timeoutMs: 12_000 })
+  let next = known
+  const share = shareOf(summary, window.api, now)
+  if (share !== null) {
+    if (share.pct >= m.settings.warnAt) {
+      if (!known.isWarned) {
+        next = { ...next, isWarned: true }
+        // The window is the one every session reads: its reset names it, else the stretch of the clock it falls in.
+        const windowKey = resetOf(summary, window.api, now) ?? `about ${Math.floor(now / m.windowMs)}`
+        if (await claim($, p, `warn:${windowKey}`, now)) {
+          $.ui.toast(warnMessage(share, summary, window.api, now, m.windowMs, m.zone), { timeoutMs: 12_000 })
+        }
+      }
+    } else if (known.isWarned) {
+      next = { ...next, isWarned: false }
     }
-  } else if (known.isWarned) {
-    await $.state.set(ALERTS, { ...known, isWarned: false })
+  }
+  if (summary.weekPct !== undefined) {
+    if (summary.weekPct >= m.settings.warnAt) {
+      if (!known.isWeekWarned) {
+        next = { ...next, isWeekWarned: true }
+        if (await claim($, p, `week:${summary.weekResetAt ?? 'unknown'}`, now)) {
+          $.ui.toast(weekWarnMessage(summary.weekPct, summary.weekResetAt ?? null, m.zone), { timeoutMs: 12_000 })
+        }
+      }
+    } else if (known.isWeekWarned) {
+      next = { ...next, isWeekWarned: false }
+    }
+  }
+  if (next !== known) {
+    await $.state.set(ALERTS, next)
   }
 }
 
@@ -178,7 +222,7 @@ async function doRefresh($: Engine, m: Memory) {
     await $.fs.write(p.summary, `${JSON.stringify(summary)}\n`)
   }
   showStatus($, m, statusLine(summary, window.api, now, m.windowMs, m.zone))
-  await warn($, m, { summary, window, now })
+  await warn($, m, p, { summary, window, now })
 }
 
 /** One refresh at a time: a caller while one runs gets that one. */
@@ -202,16 +246,27 @@ function stopTicker(m: Memory) {
   m.ticker = null
 }
 
-/** The API's reading of its own five-hour window, when the last response carried one. */
-async function apiReading($: Engine): Promise<{ u: number; r?: number } | null> {
+/** The API's readings of its own five-hour and seven-day windows, as the turn's line keeps them; null when the last response carried neither. */
+async function apiReading($: Engine): Promise<Pick<TurnLine, 'u' | 'r' | 'w' | 'wr'> | null> {
   try {
     const usage = await $.session.usage()
-    const five = usage.rateLimits.find(limit => limit.kind === 'five_hour')
-    if (!five || !Number.isFinite(five.percentUsed)) {
+    const read = (kind: string): { pct: number; reset: number | undefined } | null => {
+      const limit = usage.rateLimits.find(one => one.kind === kind)
+      if (!limit || !Number.isFinite(limit.percentUsed)) {
+        return null
+      }
+      const resetsAt = limit.resetsAt === undefined ? NaN : Date.parse(limit.resetsAt)
+      return { pct: limit.percentUsed, reset: Number.isFinite(resetsAt) ? resetsAt : undefined }
+    }
+    const five = read('five_hour')
+    const week = read('seven_day')
+    if (five === null && week === null) {
       return null
     }
-    const resetsAt = five.resetsAt === undefined ? NaN : Date.parse(five.resetsAt)
-    return Number.isFinite(resetsAt) ? { u: five.percentUsed, r: resetsAt } : { u: five.percentUsed }
+    return {
+      ...(five !== null ? { u: five.pct, ...(five.reset !== undefined ? { r: five.reset } : {}) } : {}),
+      ...(week !== null ? { w: week.pct, ...(week.reset !== undefined ? { wr: week.reset } : {}) } : {}),
+    }
   } catch {
     return null
   }
@@ -225,10 +280,7 @@ async function record($: Engine, m: Memory, turn: TurnLine) {
   }
   const api = await apiReading($)
   if (api !== null) {
-    turn.u = api.u
-    if (api.r !== undefined) {
-      turn.r = api.r
-    }
+    Object.assign(turn, api)
   }
   const job = m.writing.then(async () => {
     const path = `${p.turns}/${await whoAmI($, m)}.jsonl`
@@ -246,7 +298,11 @@ async function record($: Engine, m: Memory, turn: TurnLine) {
   await job
 }
 
-/** A session-limit error: one hit per reset time, counted machine-wide once, told to this session once. */
+/**
+ * A limit error, in any of its wordings (the five-hour limit, the weekly one, one model's own): one hit per limit and
+ * reset time, recorded once for the Mac and toasted by the session that recorded it. Every session that runs into the
+ * limit shows the error itself; the toast is for the others, and one is enough.
+ */
 async function onLimit($: Engine, m: Memory, text: string, now: number) {
   const parsed = parseLimit(text)
   if (parsed === null) {
@@ -256,21 +312,34 @@ async function onLimit($: Engine, m: Memory, text: string, now: number) {
   if (p === null) {
     return
   }
-  const resetAt = nextClockTime(now, parsed.hour, parsed.minute, parsed.zone)
+  const resetAt = resetOfLimit(now, parsed)
+  const isFive = parsed.kind === undefined
+  const key = `${parsed.kind ?? 'five_hour'}:${parsed.model ?? ''}:${resetAt}`
   const known = await alerts($)
-  if (known.toastedResets.includes(resetAt)) {
+  if ((known.toldLimits ?? []).includes(key) || (isFive && known.toastedResets.includes(resetAt))) {
     return
   }
-  // The hit is this window's warning: no warn toast beside it.
-  await $.state.set(ALERTS, { isWarned: true, toastedResets: [...known.toastedResets, resetAt].slice(-KEPT_RESETS) })
+  // A five-hour hit is its window's warning: no warn toast beside it.
+  await $.state.set(ALERTS, { ...known, ...(isFive ? { isWarned: true } : {}), toldLimits: [...(known.toldLimits ?? []), key].slice(-KEPT_RESETS) })
   const window = await readWindow($, m, p, now)
-  const hit: Hit = { at: now, resetAt, effectiveAtHit: window.effective, zone: parsed.zone }
+  const hit: Hit = {
+    at: now,
+    resetAt,
+    effectiveAtHit: window.effective,
+    zone: parsed.zone,
+    ...(parsed.kind !== undefined ? { kind: parsed.kind } : {}),
+    ...(parsed.model !== undefined ? { model: parsed.model } : {}),
+  }
   const { hits, isNew } = withHit(await readHits($, p), hit, KEPT_HITS)
   if (isNew) {
     await $.fs.write(p.hits, `${JSON.stringify(hits)}\n`)
+    if (!m.isNested) {
+      $.ui.toast(isFive ? hitMessage(resetAt, window.effective, m.windowMs, parsed.zone ?? m.zone) : limitMessage(hit, m.zone), { timeoutMs: 15_000 })
+    }
   }
-  $.ui.toast(hitMessage(resetAt, window.effective, m.windowMs, parsed.zone ?? m.zone), { timeoutMs: 15_000 })
-  await refresh($, m)
+  if (!m.isNested) {
+    await refresh($, m)
+  }
 }
 
 /** What /meter and the usage_status tool print. */
@@ -283,6 +352,23 @@ async function describe($: Engine, m: Memory): Promise<string> {
   const window = await readWindow($, m, p, now)
   const hits = await readHits($, p)
   return describeUsage(window, buildSummary(window, hits, now, m.windowMs), hits, m.settings, now, await whoAmI($, m), m.zone)
+}
+
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -305,6 +391,7 @@ export const register: Register = (on, options) => {
     lastSummary: null,
     writing: Promise.resolve(),
     refreshing: null,
+    isNested: false,
   }
 
   on('session.start', async ($, e, next) => {
@@ -314,8 +401,13 @@ export const register: Register = (on, options) => {
     await $.tool
       .register({ name: 'usage_status', description: TOOL_DESCRIPTION, inputSchema: { type: 'object', properties: {} }, isDeferred: false })
       .catch(error => debug($, `the usage_status tool did not register: ${String(error)}`))
-    await refresh($, m)
-    ensureTicker($, m)
+    // A session another session's process started (a hook's `claude -p`) spends tokens like any other: its turns are
+    // counted, and a limit it runs into is recorded, but it shows no status, keeps no ticker and toasts nothing.
+    m.isNested = await isNested($)
+    if (!m.isNested) {
+      await refresh($, m)
+      ensureTicker($, m)
+    }
     return next(e)
   })
 
@@ -330,8 +422,10 @@ export const register: Register = (on, options) => {
       if (e.reason === 'error') {
         await onLimit($, m, e.answer, now)
       }
-      ensureTicker($, m)
-      await refresh($, m)
+      if (!m.isNested) {
+        ensureTicker($, m)
+        await refresh($, m)
+      }
     } catch (error) {
       await debug($, `could not count the turn: ${String(error)}`)
     }

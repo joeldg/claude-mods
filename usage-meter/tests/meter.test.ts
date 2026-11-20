@@ -1,8 +1,10 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  activeLimits,
   buildSummary,
   capEstimate,
+  clockTimeOn,
   describeUsage,
   effectiveOf,
   formatAgo,
@@ -12,16 +14,20 @@ import {
   formatTokens,
   hitMessage,
   isSameSummary,
+  limitMessage,
   nextClockTime,
+  parseAlerts,
   parseHits,
   parseLimit,
   parseTurns,
   pruneTurns,
+  resetOfLimit,
   shareOf,
   statusLine,
   sumWindow,
   turnLine,
   warnMessage,
+  weekWarnMessage,
   withHit,
 } from '../hooks/meter'
 import type { ApiReading, Hit, Summary, TurnLine, UsageSettings } from '../types'
@@ -94,7 +100,7 @@ test('sumWindow adds every session inside the window, drops the rest, and finds 
     { id: 'sess-b', turns: 2, subTurns: 0, effective: 16_000 },
   ])
   expect(window.api).toEqual({ ts: now - HOUR, percentUsed: 58.5, resetsAt: null, sessionId: 'sess-b' })
-  expect(sumWindow([], now, WINDOW)).toEqual({ totals: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }, effective: 0, sessions: [], api: null })
+  expect(sumWindow([], now, WINDOW)).toEqual({ totals: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }, effective: 0, sessions: [], api: null, week: null })
 })
 
 test('parseLimit reads the clock time and the zone out of the limit message, in its spellings', () => {
@@ -104,7 +110,14 @@ test('parseLimit reads the clock time and the zone out of the limit message, in 
   expect(parseLimit("You've hit your usage limit. Resets at 3pm.")).toEqual({ hour: 15, minute: 0, zone: null })
   expect(parseLimit('API Error: 429 You have hit your usage limit · resets 12pm')).toEqual({ hour: 12, minute: 0, zone: null })
   expect(parseLimit('Rate limit reached for requests')).toBeNull()
-  expect(parseLimit("You've hit your weekly limit · resets Oct 20, 10:30am (America/Los_Angeles)")).toBeNull()
+  // The newer wordings: the five-hour limit by its name; the weekly limit and a model's own, with the date they lift.
+  expect(parseLimit("You've hit your 5-hour limit · resets 5:50pm (America/Los_Angeles)")).toEqual({ hour: 17, minute: 50, zone: LA })
+  expect(parseLimit("You've hit your weekly limit · resets Nov 20 at 10am (America/Los_Angeles)")).toEqual({ hour: 10, minute: 0, zone: LA, kind: 'weekly', month: 11, day: 20 })
+  expect(parseLimit("You've hit your weekly limit · resets Oct 20, 10:30am (America/Los_Angeles)")).toEqual({ hour: 10, minute: 30, zone: LA, kind: 'weekly', month: 10, day: 20 })
+  expect(
+    parseLimit("You've hit your Fable limit · resets Nov 20 at 10am (America/Los_Angeles). Switch to another model, or manage usage credits at https://claude.ai/settings/usage"),
+  ).toEqual({ hour: 10, minute: 0, zone: LA, kind: 'model', model: 'Fable', month: 11, day: 20 })
+  expect(parseLimit("You've hit your weekly limit · resets Smarch 20 at 10am")).toBeNull()
   expect(parseLimit("You've hit your session limit")).toBeNull()
 })
 
@@ -274,4 +287,45 @@ test('describeUsage prints the totals, the estimate, the API reading, the sessio
       'Settings: window 5h · refresh every 30s · warn at 80%',
     ].join('\n'),
   )
+})
+
+test('a weekly limit and a model’s own: the dated reset, hits kept apart from the five-hour cap, the limits in force, their words, and the shared alerts', () => {
+  // 11:24am PST on Nov 17: `resets Nov 20 at 10am` is 18:00Z that day. A month already past is next year's; an hour after the reset it is still this one.
+  const at = Date.UTC(2026, 10, 17, 19, 24)
+  const reset = Date.UTC(2026, 10, 20, 18, 0)
+  expect(clockTimeOn(at, 11, 20, 10, 0, LA)).toBe(reset)
+  expect(clockTimeOn(Date.UTC(2026, 11, 30, 20, 0), 1, 2, 10, 0, LA)).toBe(Date.UTC(2027, 0, 2, 18, 0))
+  expect(clockTimeOn(reset + HOUR, 11, 20, 10, 0, LA)).toBe(reset)
+  expect(resetOfLimit(at, { hour: 10, minute: 0, zone: LA, kind: 'weekly', month: 11, day: 20 })).toBe(reset)
+  expect(resetOfLimit(at, { hour: 17, minute: 50, zone: LA })).toBe(Date.UTC(2026, 10, 18, 1, 50))
+
+  const five: Hit = { at: at - HOUR, resetAt: at + HOUR, effectiveAtHit: 100_000_000, zone: LA }
+  const weekly: Hit = { at, resetAt: reset, effectiveAtHit: 40_000_000, zone: LA, kind: 'weekly' }
+  const fable: Hit = { ...weekly, kind: 'model', model: 'Fable' }
+  // One reset time, two limits: each is new once.
+  const kept = withHit(withHit([five, weekly], fable, 20).hits, fable, 20)
+  expect(kept).toEqual({ hits: [five, weekly, fable], isNew: false })
+  expect(parseHits(JSON.stringify(kept.hits))).toEqual(kept.hits)
+  // Only the five-hour hit is a sample of the five-hour cap.
+  expect(capEstimate(kept.hits)).toBe(100_000_000)
+  expect(capEstimate([weekly, fable])).toBeNull()
+  expect(activeLimits(kept.hits, at)).toEqual([
+    { kind: 'weekly', model: null, resetAt: reset },
+    { kind: 'model', model: 'Fable', resetAt: reset },
+  ])
+  expect(activeLimits(kept.hits, reset)).toEqual([])
+  expect(limitMessage(weekly, LA)).toBe('Weekly limit hit · resets Nov 20 10:00am')
+  expect(limitMessage(fable, LA)).toBe('Fable limit hit · resets Nov 20 10:00am · other models still run')
+  expect(weekWarnMessage(82, reset, LA)).toBe('Usage at 82% of the weekly limit · resets Nov 20 10:00am')
+  expect(weekWarnMessage(82, null, LA)).toBe('Usage at 82% of the weekly limit')
+  // The seven-day reading and the limits in force ride on the summary and the status line while they hold.
+  const window = { ...sumWindow([{ id: 'sess-a', turns: [line(at - MINUTE, { w: 61.4, wr: reset })] }], at, WINDOW) }
+  expect(window.week).toEqual({ ts: at - MINUTE, percentUsed: 61.4, resetsAt: reset, sessionId: 'sess-a' })
+  const told = buildSummary(window, [fable], at, WINDOW)
+  expect(told).toMatchObject({ weekPct: 61, weekResetAt: reset, limits: [{ kind: 'model', model: 'Fable', resetAt: reset }], capEstimate: null })
+  expect(statusLine(told, null, at, WINDOW, LA)).toBe('usage 5h: 13K eff · week 61% · Fable limit until Nov 20 10:00am')
+  expect(buildSummary({ ...window, week: null }, [], at, WINDOW)).not.toHaveProperty('weekPct')
+  expect(parseAlerts(JSON.stringify({ 'warn:1': 5, bad: 'x' }))).toEqual({ 'warn:1': 5 })
+  expect(parseAlerts('not json')).toEqual({})
+  expect(parseAlerts(null)).toEqual({})
 })
