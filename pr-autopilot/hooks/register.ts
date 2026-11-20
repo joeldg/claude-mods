@@ -538,10 +538,72 @@ async function cleanupLinked($: Engine, pr: WatchedPr, at: Checkout, tree: Workt
   await deleteRemote($, at.cwd, pr, at.base, out)
 }
 
+/** How long a merge stays noted as said, and how long a number stays known as no PR. */
+const MERGE_SAID_MS = 7 * 24 * 60 * 60_000
+const NOT_A_PR_MS = 24 * 60 * 60_000
+/** What gh says of a number no pull request answers to (an issue's, say). */
+const NOT_A_PR = /Could not resolve to a PullRequest|no pull requests? found/i
+
+/** Where the notes every session shares are kept; null when HOME is unknown. */
+async function sharedDir($: Engine): Promise<string | null> {
+  try {
+    const home = await $.env.get('HOME')
+    return home ? `${home.replace(/\/+$/, '')}/.claude/pr-autopilot` : null
+  } catch {
+    return null
+  }
+}
+
+/** A shared note file, key to when it was noted, the notes older than `keptMs` left out; {} when missing or unreadable. */
+async function readNotes($: Engine, path: string, now: number, keptMs: number): Promise<Record<string, number>> {
+  try {
+    const value: unknown = JSON.parse(await $.fs.read(path))
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return {}
+    }
+    const out: Record<string, number> = {}
+    for (const [key, at] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof at === 'number' && Number.isFinite(at) && now - at < keptMs) {
+        out[key] = at
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Whether this session is the first to note a merge in the file the sessions share: the one that says it for the
+ * Mac. With no HOME to keep the file in, every session is first, as before.
+ */
+async function claimMerge($: Engine, pr: WatchedPr): Promise<boolean> {
+  const dir = await sharedDir($)
+  if (dir === null) {
+    return true
+  }
+  const now = await $.clock.now()
+  const path = `${dir}/merged.json`
+  const key = `${pr.repo.toLowerCase()}#${pr.number}`
+  const known = await readNotes($, path, now, MERGE_SAID_MS)
+  if (known[key] !== undefined) {
+    return false
+  }
+  await $.fs.write(path, `${JSON.stringify({ ...known, [key]: now })}\n`).catch(() => undefined)
+  return true
+}
+
 async function finishMerged($: Engine, pr: WatchedPr) {
   await patch($, pr, { cleaned: true })
   const out = await cleanup($, pr)
   const steps = out.steps.length > 0 ? out.steps.join(' · ') : 'nothing to clean up'
+  // Said where it is this session's news (a PR it opened, or its own worktree's branch), else by one session for the
+  // Mac: four sessions of one repository each used to toast the same merge and suggest the same next prompt.
+  const isFirst = await claimMerge($, pr)
+  if (!pr.isOwn && out.ownWorktree === null && !isFirst) {
+    await debug($, `#${pr.number} merged → ${steps} (said by another session)`)
+    return
+  }
   $.ui.toast(`#${pr.number} merged → ${steps}`, { timeoutMs: 12_000 })
   // The suggestion is the person's next prompt: it tells Claude the worktree is theirs to remove, never as a command to run.
   const text =
@@ -678,8 +740,21 @@ async function forcePoll($: Engine): Promise<void> {
 async function ciContext($: Engine, number: number, pr: WatchedPr | null): Promise<string | null> {
   const repo = pr?.repo ?? null
   const repoArgs = repo ? ['--repo', repo] : []
+  // A number that is no watched PR may be no PR at all (an issue's, in a prompt about failing checks): what gh said of
+  // it is remembered for a day, for every session in this folder, so it is asked once.
+  const dir = pr === null ? await sharedDir($) : null
+  const notes = dir === null ? null : `${dir}/not-prs.json`
+  const key = `${await $.session.cwd().catch(() => '')}#${number}`
+  const now = await $.clock.now()
+  if (notes !== null && (await readNotes($, notes, now, NOT_A_PR_MS))[key] !== undefined) {
+    return null
+  }
   // `gh pr checks` exits 1 when a check failed and 8 while one is pending: its table is on stdout either way.
   const checks = await exec($, ['gh', 'pr', 'checks', String(number), ...repoArgs])
+  if (notes !== null && !checks.ok && NOT_A_PR.test(checks.err)) {
+    await $.fs.write(notes, `${JSON.stringify({ ...(await readNotes($, notes, now, NOT_A_PR_MS)), [key]: now })}\n`).catch(() => undefined)
+    return null
+  }
   const runId = failingRunIds(checks.out)[0] ?? pr?.runIds[0] ?? null
   const log = runId === null ? null : await exec($, ['gh', 'run', 'view', String(runId), ...repoArgs, '--log-failed'], undefined, 60_000)
   return ciAttachment({

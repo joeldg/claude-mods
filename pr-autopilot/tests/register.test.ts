@@ -112,6 +112,15 @@ const LINKED_ON_PR_BRANCH: Record<string, Answer> = {
   'git branch -D codex/faster': { code: 1, err: `error: cannot delete branch 'codex/faster' used by worktree at '${WT}'\n` },
 }
 
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: unknown; context?: string[] }
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const callTool = ($: any, input: ToolInput): Promise<ToolOutcome> => ($.tool.call as (input: ToolInput) => Promise<ToolOutcome>)(input)
+
 /** Answers the host beneath the plugin: commands by argv, toasts, the status line, the prompt box. */
 const world = (on: On, cwd = CWD): World => {
   const w: World = { answers: new Map(), ran: [], toasts: [], statuses: [], suggested: [], bash: [], logs: [], tools: [] }
@@ -198,7 +207,7 @@ test('a PR opened with gh pr create is watched and shown on the status line', as
   const w = world(on)
   createPr(w, () => [run('lint', 'IN_PROGRESS', '')])
 
-  await $.tool.call({ tool: 'Bash', command: 'git push -u origin codex/faster && gh pr create --fill --base main' })
+  await callTool($, { tool: 'Bash', command: 'git push -u origin codex/faster && gh pr create --fill --base main' })
   expect(w.bash).toHaveLength(1)
   expect(w.ran.map(one => one.argv)).toEqual([VIEW_219])
   expect(w.statuses.at(-1)).toBe('PRs: #219 CI…')
@@ -210,7 +219,7 @@ test('a PR opened with gh pr create is watched and shown on the status line', as
 test('other Bash commands are left alone', async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on)
-  await $.tool.call({ tool: 'Bash', command: `echo ${URL_219}` })
+  await callTool($, { tool: 'Bash', command: `echo ${URL_219}` })
   expect(w.ran).toEqual([])
   expect(w.statuses).toEqual([])
 })
@@ -220,7 +229,7 @@ test('a poll that sees CI fail toasts the failing check, and again when it passe
   const w = world(on)
   let rollup: unknown[] = [run('lint', 'IN_PROGRESS', ''), run('test', 'QUEUED', '')]
   createPr(w, () => rollup)
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   await clock.advance(60_000)
   expect(w.toasts).toEqual([])
@@ -247,7 +256,7 @@ test('a merge runs the cleanup once, in order, and suggests carrying on', async 
   for (const [argv, answer] of Object.entries(CLEAN_ON_PR_BRANCH)) {
     w.answers.set(argv, answer)
   }
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
   expect(w.statuses.at(-1)).toBe('PRs: #219 ✓')
 
   state = 'MERGED'
@@ -291,7 +300,7 @@ test('the cleanup never switches or pulls with uncommitted changes', async ($, o
   w.answers.set('git worktree list --porcelain', {
     out: `worktree ${CWD}\nHEAD ${HEAD}\nbranch refs/heads/codex/faster\n\n`,
   })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -314,7 +323,7 @@ test('the cleanup keeps a local branch whose tip is not the merged head', async 
   }
   w.answers.set('git branch --show-current', { out: 'main\n' })
   w.answers.set('git rev-parse --verify --quiet refs/heads/codex/faster', { out: `${'c'.repeat(40)}\n` })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -333,7 +342,7 @@ test('the cleanup is skipped in a folder that is not a clone of the repository',
   let state = 'OPEN'
   createPr(w, () => [], () => state)
   w.answers.set('git remote get-url origin', { out: 'https://github.com/someone/else.git\n' })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -349,7 +358,7 @@ test('a merge seen while a turn runs is cleaned up when the turn ends', async ($
   for (const [argv, answer] of Object.entries(CLEAN_ON_PR_BRANCH)) {
     w.answers.set(argv, answer)
   }
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   await $.turn.start({ text: 'start #214', turnId: 't1' })
   state = 'MERGED'
@@ -368,7 +377,7 @@ test('a PR closed without merging stops being watched', async ($, on) => {
   const w = world(on)
   let state = 'OPEN'
   createPr(w, () => [], () => state)
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
   expect(w.statuses.at(-1)).toBe('PRs: #219')
 
   state = 'CLOSED'
@@ -459,6 +468,75 @@ test("a session another session's process started adopts nothing and looks nothi
   expect(w.statuses.at(-1)).toBeUndefined()
 })
 
+/** HOME and the files beneath it, for the notes the sessions share. */
+const sharedFiles = (on: On): Map<string, string> => {
+  const files = new Map<string, string>()
+  mock.env(on, { HOME: '/Users/me' })
+  on('fs.read', (_$, e) => (files.has(e.path) ? { value: files.get(e.path) ?? '' } : { deny: `ENOENT: no such file, ${e.path}` }))
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  return files
+}
+
+test('the merge of a PR adopted from the repository is said by one session for the Mac: here the ritual runs, and nothing is toasted or suggested twice', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const files = sharedFiles(on)
+  const w = world(on)
+  let state = 'OPEN'
+  adoptable(w, () => (state === 'OPEN' ? [JSON.parse(view219('OPEN', [run('lint', 'COMPLETED', 'SUCCESS')]))] : []))
+  w.answers.set(VIEW_219, () => ({ out: view219(state, [run('lint', 'COMPLETED', 'SUCCESS')]) }))
+  for (const [argv, answer] of Object.entries(CLEAN_ON_PR_BRANCH)) {
+    w.answers.set(argv, answer)
+  }
+  // Another session of this repository has said the merge already.
+  files.set('/Users/me/.claude/pr-autopilot/merged.json', JSON.stringify({ 'acme/widgets#219': 0 }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(w.statuses.at(-1)).toBe('PRs: #219 ✓')
+
+  state = 'MERGED'
+  await clock.advance(60_000)
+  expect(gitRan(w)).toContain('git fetch --prune origin')
+  expect(w.toasts).toEqual([])
+  expect(w.suggested).toEqual([])
+})
+
+test('the first session to see an adopted PR merged says it, and notes it for the others', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const files = sharedFiles(on)
+  const w = world(on)
+  let state = 'OPEN'
+  adoptable(w, () => (state === 'OPEN' ? [JSON.parse(view219('OPEN', [run('lint', 'COMPLETED', 'SUCCESS')]))] : []))
+  w.answers.set(VIEW_219, () => ({ out: view219(state, [run('lint', 'COMPLETED', 'SUCCESS')]) }))
+  for (const [argv, answer] of Object.entries(CLEAN_ON_PR_BRANCH)) {
+    w.answers.set(argv, answer)
+  }
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  state = 'MERGED'
+  await clock.advance(60_000)
+  expect(w.toasts).toEqual(['#219 merged → main pulled · branch codex/faster deleted'])
+  expect(JSON.parse(files.get('/Users/me/.claude/pr-autopilot/merged.json') ?? '{}')).toEqual({ 'acme/widgets#219': 60_000 })
+})
+
+test('a number no PR answers to is remembered for a day, for every session in the folder: an issue number in a prompt about failing checks is asked of gh once', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const files = sharedFiles(on)
+  const w = world(on)
+  w.answers.set('gh pr checks 549', { code: 1, err: 'GraphQL: Could not resolve to a PullRequest with the number of 549. (repository.pullRequest)\n' })
+  const ask = () => $.prompt.submit({ text: 'Issue #549 is failing its checks again', wait: false, origin: { kind: 'composer' } })
+  expect((await ask()).context).toBeUndefined()
+  expect((await ask()).context).toBeUndefined()
+  expect(w.ran.map(one => one.argv)).toEqual(['gh pr checks 549'])
+  expect(JSON.parse(files.get('/Users/me/.claude/pr-autopilot/not-prs.json') ?? '{}')).toEqual({ [`${CWD}#549`]: 0 })
+  // A day on, it is asked again: an issue number may be a PR's by then nowhere, but the note is not kept for ever.
+  await clock.advance(24 * 60 * 60_000 + 1)
+  await ask()
+  expect(w.ran.filter(one => one.argv === 'gh pr checks 549')).toHaveLength(2)
+})
+
 test('/prs watch adds a PR by number in this folder’s repository', async ($, on) => {
   mock.clock(on, { now: 0 })
   const w = world(on)
@@ -510,7 +588,7 @@ test('a watched failing PR is found from "CI failed" alone, with its repository'
     out: 'lint\tfail\t1m\thttps://github.com/acme/widgets/actions/runs/555/job/1\t\n',
   })
   w.answers.set('gh run view 555 --repo acme/widgets --log-failed', { out: 'lint\tRun eslint\tboom\n' })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
   rollup = [run('lint', 'COMPLETED', 'FAILURE', 555)]
   await clock.advance(60_000)
 
@@ -540,7 +618,7 @@ test('with deleteRemoteBranch on, the merged branch on origin is deleted too', {
   }
   w.answers.set('git ls-remote --heads origin codex/faster', { out: `${HEAD}\trefs/heads/codex/faster\n` })
   w.answers.set('git push origin --delete codex/faster', { err: ' - [deleted]         codex/faster\n' })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -557,7 +635,7 @@ test('with deleteRemoteBranch on, a branch that moved on origin since the merge 
     w.answers.set(argv, answer)
   }
   w.answers.set('git ls-remote --heads origin codex/faster', { out: `${'c'.repeat(40)}\trefs/heads/codex/faster\n` })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -582,7 +660,7 @@ test(
     w.answers.set(VIEW_219, { code: 1, err: CHECKS_DENIED })
     w.answers.set(PLAIN_VIEW_219, () => ({ out: plain219('OPEN') }))
 
-    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
     expect(argvs(w)).toEqual([VIEW_219, PLAIN_VIEW_219])
     expect(w.statuses.at(-1)).toBe('PRs: #219 CI?')
     expect(w.toasts).toHaveLength(1)
@@ -608,7 +686,7 @@ test(
     expect(w.logs).toHaveLength(2)
 
     // The tool says so too, without asking gh again: the data is fresh.
-    const told = String((await $.tool.call({ tool: TOOL })).result)
+    const told = String((await callTool($, { tool: TOOL })).result)
     expect(told.split('\n')).toEqual([
       "#219 Faster widgets · open · codex/faster · CI unknown — gh token can't read checks · https://github.com/acme/widgets/pull/219",
       'Refreshed just now.',
@@ -627,7 +705,7 @@ test(
     w.answers.set(VIEW_219, { code: 1, err: NOT_LOGGED_IN })
     w.answers.set(PLAIN_VIEW_219, { code: 1, err: NOT_LOGGED_IN })
 
-    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
     expect(argvs(w)).toEqual([VIEW_219, PLAIN_VIEW_219])
     expect(w.statuses.at(-1)).toBe("PRs: gh can't read them")
     expect(w.toasts).toHaveLength(1)
@@ -654,7 +732,7 @@ test('/prs retries at once, and a read that works again clears the hold', { time
   const w = world(on)
   w.answers.set(VIEW_219, { code: 1, err: CHECKS_DENIED })
   w.answers.set(PLAIN_VIEW_219, () => ({ out: plain219('OPEN') }))
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
   await clock.advance(60_000)
   expect(count(w, VIEW_219)).toBe(1)
 
@@ -683,7 +761,7 @@ test('a rate limit holds polling for five minutes', { timeoutMs: 30_000 }, async
   const w = world(on)
   let answer: Answer = { out: view219('OPEN', [run('lint', 'IN_PROGRESS', '')]) }
   w.answers.set(VIEW_219, () => answer)
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
   expect(w.statuses.at(-1)).toBe('PRs: #219 CI…')
 
   answer = { code: 1, err: 'HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/graphql)' }
@@ -713,7 +791,7 @@ test(
     const w = world(on)
     let answer: Answer = { out: view219('OPEN', [run('lint', 'IN_PROGRESS', '')]) }
     w.answers.set(VIEW_219, () => answer)
-    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
     answer = { code: 1, err: 'GraphQL: Something went wrong while executing your query. This may be the result of a timeout.' }
 
     // The seconds at which a poll ran: at 60s, then 120s later, 240s later, 480s later, then every 600s.
@@ -759,17 +837,17 @@ test(
 
     let answer: Answer = { out: view219('OPEN', [run('lint', 'IN_PROGRESS', '')]) }
     w.answers.set(VIEW_219, () => answer)
-    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
     const ghCalls = () => argvs(w).filter(argv => argv.startsWith('gh ')).length
     expect(ghCalls()).toBe(1)
 
     await clock.advance(30_000)
-    const fresh = await $.tool.call({ tool: TOOL })
+    const fresh = await callTool($, { tool: TOOL })
     expect(String(fresh.result)).toBe(
       '#219 Faster widgets · open · codex/faster · CI running · https://github.com/acme/widgets/pull/219\nRefreshed 30s ago.',
     )
     expect(ghCalls()).toBe(1)
-    expect(String((await $.tool.call({ tool: TOOL, number: 300 })).result)).toBe(
+    expect(String((await callTool($, { tool: TOOL, number: 300 })).result)).toBe(
       '#300 is not watched (watched: #219); /prs watch 300 adds it.\nRefreshed 30s ago.',
     )
 
@@ -780,7 +858,7 @@ test(
     answer = { out: view219('OPEN', [run('lint', 'COMPLETED', 'FAILURE', 5)]) }
     await clock.advance(60_000)
     expect(ghCalls()).toBe(2)
-    const stale = await $.tool.call({ tool: TOOL, number: 219 })
+    const stale = await callTool($, { tool: TOOL, number: 219 })
     expect(ghCalls()).toBe(3)
     expect(String(stale.result)).toBe(
       '#219 Faster widgets · open · codex/faster · CI failing: lint · https://github.com/acme/widgets/pull/219\nRefreshed just now.',
@@ -834,7 +912,7 @@ test("in a linked worktree a merge of this worktree's branch fetches, never swit
   for (const [argv, answer] of Object.entries(LINKED_ON_PR_BRANCH)) {
     w.answers.set(argv, answer)
   }
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -872,7 +950,7 @@ test('in a linked worktree on another branch, nothing is switched or pulled, and
     out: `worktree ${CWD}\nHEAD ${'2'.repeat(40)}\nbranch refs/heads/main\n\nworktree ${WT}\nHEAD ${'3'.repeat(40)}\nbranch refs/heads/codex/other\n\n`,
   })
   w.answers.set('git branch -D codex/faster', { out: 'Deleted branch codex/faster (was bbbbbbb).\n' })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -907,7 +985,7 @@ test('in a linked worktree, a merged branch another worktree has checked out is 
       `worktree ${WT}\nHEAD ${HEAD}\nbranch refs/heads/codex/faster\n\n` +
       `worktree ${other}\nHEAD ${'3'.repeat(40)}\nbranch refs/heads/codex/other\n\n`,
   })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -925,7 +1003,7 @@ test('when git cannot say which worktree this is, the ritual runs as in the prim
     w.answers.set(argv, answer)
   }
   w.answers.set(REV_PARSE, { code: 129, err: "error: unknown option `path-format=absolute'\n" })
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
 
   state = 'MERGED'
   await clock.advance(60_000)
@@ -959,12 +1037,12 @@ test("CI flips on PRs adopted from the repository do not toast, unless the PR is
   expect(asked).toHaveLength(2)
   expect(asked.every(one => one.cwd === CWD)).toBe(true)
   // The quiet PR is still reported.
-  expect(String((await $.tool.call({ tool: TOOL, number: 219 })).result)).toMatch(
+  expect(String((await callTool($, { tool: TOOL, number: 219 })).result)).toMatch(
     /^#219 Faster widgets · open · codex\/faster · CI passed · /,
   )
 
   // `gh pr create` for a PR already adopted (gh says it exists) makes it this session's own: its flips toast from then on.
-  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await callTool($, { tool: 'Bash', command: 'gh pr create --fill' })
   rollup219 = [run('lint', 'COMPLETED', 'FAILURE', 7)]
   await clock.advance(60_000)
   expect(w.toasts).toEqual(['CI failed on #221: lint', 'CI failed on #219: lint'])

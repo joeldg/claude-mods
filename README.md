@@ -159,6 +159,8 @@ Settings:
 - `deleteRemoteBranch` (off): deletes the branch on GitHub too, only while it still points at the merged commit. GitHub's own "Automatically delete head branches" setting does the same job.
 - `toastAdoptedCi` (off): toast the CI results of PRs adopted from the repository too, as every PR's used to; with several worktree sessions of one repo, each would toast.
 - A session another session's process started (a hook's `claude -p`, say) adopts nothing, polls nothing and looks no number up in its prompt: a summarizer's prompt holds a whole conversation log, and its issue numbers were being asked of `gh pr checks`.
+- **A merge is said once for the Mac.** A session toasts a merge, and suggests the next prompt, when the PR is one it opened or its own worktree is on the PR's branch; the merge of a PR merely adopted from the repository is said by the first session to see it (noted in `~/.claude/pr-autopilot/merged.json`), and the others run their clean-up quietly. Four sessions of one repository each used to toast the same merge.
+- A `#N` in a prompt about failing checks that turns out to be no PR (an issue's number: gh says "Could not resolve to a PullRequest") is remembered for a day in `~/.claude/pr-autopilot/not-prs.json`, for every session in that folder, and not asked of gh again meanwhile.
 
 It never closes issues; put "Closes #N" in PR bodies for that.
 
