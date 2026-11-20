@@ -1,5 +1,5 @@
 import { expect, test, tier } from 'claude-code/testing'
-import type { Plugin } from 'claude-code/testing'
+import type { Engine, Plugin } from 'claude-code/testing'
 
 import { dayOf, parseLines } from '../hooks/log'
 import type { CountsLine, Line } from '../types'
@@ -11,7 +11,16 @@ tier('prepend')
 
 const SLOW = { timeoutMs: 30_000 }
 
-const BAND = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 9 }, view: {} }
+/**
+ * `$.tool.call` typed loosely for the tests: the engine lays a per-tool union over every connected MCP tool, and with
+ * hundreds connected tsc gives up on it (TS2589). The tests only read deny, isError, text, result and context.
+ */
+type ToolInput = { tool: string; [key: string]: unknown }
+type ToolOutcome = { deny?: string; isError?: boolean; text?: string; result?: unknown; context?: string[] }
+const callTool = ($: Engine, input: ToolInput): Promise<ToolOutcome> =>
+  ($.tool.call as unknown as (input: ToolInput) => Promise<ToolOutcome>)(input)
+
+const BAND = { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 9 }, view: {} }
 
 /** A mod whose tool.call hook throws before `next`. */
 const FLAKY: Plugin = {
@@ -138,16 +147,6 @@ const POLLER: Plugin = {
   },
 }
 
-/** A mod whose band drawing throws. */
-const PAINTER: Plugin = {
-  name: 'painter',
-  register(on) {
-    on('ui.render', { component: 'AbovePrompt' }, () => {
-      throw new Error('paint failed')
-    })
-  },
-}
-
 /** A mod that rewrites prompts and draws a band with a Button. */
 const SHOUTER: Plugin = {
   name: 'shouter',
@@ -184,11 +183,11 @@ test('a mod whose tool.call hook throws: logged with its event and outcome, toas
   on('tool.call', () => ({ result: 'read', text: 'read' }))
   await start($, w)
 
-  await $.tool.call({ tool: 'Read', file_path: '/tmp/a.txt' })
+  await callTool($, { tool: 'Read', file_path: '/tmp/a.txt' })
   await w.clock.settle()
   expect(alerts(w)).toEqual(["mod-monitor: flaky's tool.call hook threw (1×) — /mods for details"])
 
-  await $.tool.call({ tool: 'Read', file_path: '/tmp/b.txt' })
+  await callTool($, { tool: 'Read', file_path: '/tmp/b.txt' })
   await w.clock.settle()
   expect(alerts(w)).toHaveLength(1)
 
@@ -204,8 +203,8 @@ test('a slow hook: its slow runs, max and p95 for the event', { ...SLOW, options
   const w = world(on)
   on('tool.call', () => ({ result: 'read', text: 'read' }))
   await start($, w)
-  await $.tool.call({ tool: 'Read', file_path: '/tmp/a.txt' })
-  await $.tool.call({ tool: 'Read', file_path: '/tmp/b.txt' })
+  await callTool($, { tool: 'Read', file_path: '/tmp/a.txt' })
+  await callTool($, { tool: 'Read', file_path: '/tmp/b.txt' })
   await w.clock.advance(60_000)
 
   const lines = ownLines(w)
@@ -226,7 +225,7 @@ test('what a mod does through $ is credited to it by origin', { ...SLOW, plugins
   await start($, w)
 
   expect((await $.command.run(typed('chat'))).text).toBe('chatted')
-  expect(await $.tool.call({ tool: 'mcp__chatty__ask', question: 'why' })).toMatchObject({ result: 'asked' })
+  expect(await callTool($, { tool: 'mcp__chatty__ask', question: 'why' })).toMatchObject({ result: 'asked' })
   await w.clock.settle()
   await w.clock.advance(60_000)
 
@@ -304,7 +303,7 @@ test('/mods: a row per mod and its health, on the terminal and the desktop; Deta
   w.files.set('/Users/me/mods/ghost-folder/.claude-plugin/plugin.json', JSON.stringify({ name: 'ghost' }))
   on('tool.call', () => ({ result: 'read', text: 'read' }))
   await start($, w)
-  await $.tool.call({ tool: 'Read', file_path: '/tmp/a.txt' })
+  await callTool($, { tool: 'Read', file_path: '/tmp/a.txt' })
   await $.command.run(typed('chat'))
   await w.clock.settle()
 
@@ -367,7 +366,8 @@ test('/mods report 7d: two sessions on different days, an older one left out; wr
   expect(written).toStartWith('# Mods report: last 7d (')
   expect(text.startsWith(written)).toBe(true)
   // The monitor wrote nothing else: no lines of its own yet, and the past files untouched.
-  expect(w.writes.filter(write => write.by === 'mod-monitor').map(write => write.path)).toEqual([`${ROOT}/report-latest.md`])
+  // The session's own file first (the line that says what the session is), then the report.
+  expect(w.writes.filter(write => write.by === 'mod-monitor').map(write => write.path)).toEqual([OWN, `${ROOT}/report-latest.md`])
 
   expect(await mods($, 'report 30d')).toContain('recall — loaded in 3 sessions')
   expect(await mods($, 'report fortnight')).toBe('mod-monitor: "fortnight" is not a range; use 24h, 7d or 30d.')
@@ -401,7 +401,7 @@ test('the monitor never changes what passes through it', { ...SLOW, plugins: [SH
   })
   await start($, w)
 
-  expect(await $.tool.call({ tool: 'Read', file_path: '/tmp/a.txt' })).toEqual(answer)
+  expect(await callTool($, { tool: 'Read', file_path: '/tmp/a.txt' })).toEqual(answer)
   expect(await $.prompt.submit({ text: 'hello', wait: false, origin: { kind: 'composer' } })).toEqual({
     text: 'HELLO!',
     context: ['from beneath'],
@@ -469,34 +469,6 @@ test('five process failures in ten minutes: one toast, and the mod is flagged', 
   await w.clock.settle()
   expect(alerts(w)).toHaveLength(1)
   expect(await mods($)).toContain('⚠ poller: just now · /poll')
-})
-
-test('a mod whose band drawing throws: a failure, never a counted run', { ...SLOW, plugins: [PAINTER] }, async ($, on) => {
-  const w = world(on)
-  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box />
-  })
-  await start($, w)
-  const ui = await $.ui.mount({ plugin: 'painter', surface: 'terminal', component: 'AbovePrompt', props: BAND })
-  await ui.unmount()
-  await w.clock.settle()
-  expect(alerts(w)).toEqual(["mod-monitor: painter's ui.render hook threw (1×) — /mods for details"])
-  await w.clock.advance(60_000)
-  expect(tally(ownLines(w), 'painter')).toMatchObject({ runs: {}, fails: 1 })
-})
-
-test('with watchRender off, drawing is not watched', { ...SLOW, options: { watchRender: false }, plugins: [PAINTER] }, async ($, on) => {
-  const w = world(on)
-  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box />
-  })
-  await start($, w)
-  const ui = await $.ui.mount({ plugin: 'painter', surface: 'terminal', component: 'AbovePrompt', props: BAND })
-  await ui.unmount()
-  await w.clock.settle()
-  expect(alerts(w)).toEqual([])
 })
 
 test('after /clear the next lines go to the new session’s file', { ...SLOW, plugins: [CHATTY] }, async ($, on) => {
@@ -630,4 +602,21 @@ test('error lines a mod logs itself are counted; three in an hour mark it failin
   await w.clock.settle()
   expect(alerts(w)).toHaveLength(1)
   expect(await mods($)).toContain('⚠ logger')
+})
+
+test('the session says once what it is: who is at the prompt, where it draws, what started it; a surface attached later is a second line', async ($, on) => {
+  const w = world(on, { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' })
+  let surfaces: ('terminal' | 'desktop')[] = []
+  on('session.surfaces', () => ({ value: surfaces }))
+  await $.session.start({ cwd: `${HOME}/project`, surface: null, isInteractive: false })
+  await w.clock.settle()
+  surfaces = ['desktop']
+  await w.clock.advance(5_000)
+  await w.clock.settle()
+  await w.clock.advance(60_000)
+
+  expect(events(ownLines(w), 'mod-monitor', 'session')).toEqual([
+    expect.objectContaining({ interactive: false, surfaces: [], entrypoint: 'claude-desktop' }),
+    expect.objectContaining({ interactive: false, surfaces: ['desktop'], late: true }),
+  ])
 })

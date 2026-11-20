@@ -104,6 +104,7 @@ Watches how the other mods behave in real use, without changing them. It is list
 - **`/mods report [24h|7d|30d]`:** a per-mod report across all sessions, also written to `~/.claude/mods/monitor/report-latest.md` for a scheduled review or Claude to read.
 - **`/mods failures [7d]`:** failures and failed subprocesses only.
 - **Logs:** `~/.claude/mods/monitor/<date>/<session>.jsonl`, flushed every minute and at session end, with secrets masked and old days removed after 30 days.
+- **What each session is:** one `session` line per session says whether a person is at the prompt, which surfaces it draws on (none for a `-p` run), and what started it; a surface the host attaches a few seconds in is a second line. A hook that spawns `claude -p` loads every mod in the child too, and these lines tell such runs from your own sessions when the log is read. They belong to no mod and do not count as a session in the reports.
 - Makes no model calls and adds no measurable latency.
 - **Error lines mods log themselves** (`$.ui.log` with wording like "failed" or "could not"): shown in Details and in `/mods failures`. Three in an hour mark the mod ⚠ and raise one toast. That is how effort-router's per-request hook, which runs inside the response stream where no monitor should sit, reports a failure. It also always sends the request on unchanged.
 - **Transcript-row hooks** (secret-guard masks `/secrets` records there) are watched for failures and slow runs, but not counted per run.

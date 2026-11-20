@@ -144,3 +144,10 @@ describe('reports', () => {
     expect(failuresText({ ...input, mods: aggregate([], WEEK) })).toContain('No hook failures or process errors.')
   })
 })
+
+test('a session line is about the session, not a mod: it makes no summary, and reads plainly in the details', () => {
+  const line = event('mod-monitor', NOW, { kind: 'session', interactive: false, surfaces: [] })
+  expect(aggregate([{ session: 'cccc3333', day: dayOf(NOW), lines: [line] }]).size).toBe(0)
+  expect(eventText(line)).toBe('session: no person at the prompt, draws on nothing')
+  expect(eventText(event('mod-monitor', NOW, { kind: 'session', interactive: true, surfaces: ['terminal'] }))).toBe('session: a person at the prompt, draws on terminal')
+})

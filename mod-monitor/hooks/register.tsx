@@ -1065,7 +1065,8 @@ async function report($: Engine, arg: string | undefined, kind: 'report' | 'fail
   const at = now()
   const since = at - range.ms
   const files = await readRange($, since, at)
-  const sessions = new Set(files.map(file => file.session)).size
+  // A file holding nothing but the line that says what the session is saw no mod at all: not a session of the report.
+  const sessions = new Set(files.filter(file => file.lines.some(line => line.t !== 'event' || line.kind !== 'session')).map(file => file.session)).size
   const input = { now: at, since, range: range.label, sessions, expected, mods: aggregate(files, since) }
   if (kind === 'failures') {
     return failuresText(input)
@@ -1091,6 +1092,39 @@ async function runMods($: Engine, args: string): Promise<string> {
 }
 
 const COLORS: Record<RowMark, string | undefined> = { '✓': 'green', '⚠': 'yellow', '✗': 'red', '·': undefined }
+
+/** How long after the start the surfaces are read again: a host may attach its surface once the session runs. */
+const SURFACES_AGAIN_MS = 5_000
+
+/** The surfaces the session draws on now; none where nothing draws (a `-p` run) or the engine cannot say. */
+async function surfacesNow($: Engine): Promise<string[]> {
+  try {
+    return [...(await $.session.surfaces())].map(String)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Says once what kind of session this is: whether a person is at the prompt, where it draws, what started it. A `-p`
+ * run that a hook spawns loads every mod too; these lines tell such runs from a person's sessions when the log is read.
+ */
+async function describeSession($: Engine, isInteractive: boolean) {
+  try {
+    const entrypoint = (await $.env.get('CLAUDE_CODE_ENTRYPOINT').catch(() => undefined)) || undefined
+    const first = await surfacesNow($)
+    logEvent({ t: 'event', ts: now(), plugin: SELF, kind: 'session', interactive: isInteractive, surfaces: first, ...(entrypoint ? { entrypoint: keep(entrypoint, 40) } : {}) })
+    $.clock.after(SURFACES_AGAIN_MS, () => {
+      void surfacesNow($).then(later => {
+        if (later.join(',') !== first.join(',')) {
+          logEvent({ t: 'event', ts: now(), plugin: SELF, kind: 'session', interactive: isInteractive, surfaces: later, late: true })
+        }
+      })
+    })
+  } catch (error) {
+    await debug($, `could not describe the session: ${String(error)}`)
+  }
+}
 
 export const register: Register = (on, options) => {
   const slowMs = Math.max(1, Number(options.slowMs ?? DEFAULTS.slowMs) || DEFAULTS.slowMs)
@@ -1156,6 +1190,7 @@ export const register: Register = (on, options) => {
       }
       ensureTimer($)
       void ensureStarted($)
+      void describeSession($, e.isInteractive)
     }
   })
 

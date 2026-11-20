@@ -208,6 +208,10 @@ export function aggregate(files: readonly SessionFile[], since = -Infinity): Map
       if (line.ts < since && num(line.t === 'event' ? line.last : 0) < since) {
         continue
       }
+      if (line.t === 'event' && line.kind === 'session') {
+        // About the session, not a mod: no summary of its own.
+        continue
+      }
       let mod = mods.get(line.plugin)
       if (!mod) {
         mod = blank(line.plugin)
@@ -263,6 +267,8 @@ export function eventText(line: EventLine): string {
       return `/${line.command}${line.hasArgs ? ' …' : ''}${line.by === 'composer' ? '' : ` (from ${line.by})`}${n}`
     case 'register':
       return `registered ${line.what === 'command' ? `/${line.name}` : `tool ${line.name}`}`
+    case 'session':
+      return `session: ${line.interactive ? 'a person at the prompt' : 'no person at the prompt'}, draws on ${line.surfaces.join(', ') || 'nothing'}`
   }
 }
 

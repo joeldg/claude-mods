@@ -40,6 +40,9 @@ export type EventLine = EventBase &
     | { kind: 'write'; dir: string }
     | { kind: 'command'; command: string; hasArgs: boolean; by: string }
     | { kind: 'register'; what: 'command' | 'tool'; name: string }
+    // About the session, not a mod: whether a person is at the prompt, the surfaces it draws on (none for a `-p`
+    // run), what started it. `late` marks a reading a few seconds in that differs from the start's.
+    | { kind: 'session'; interactive: boolean; surfaces: string[]; entrypoint?: string; late?: true }
   )
 
 export type EventKind = EventLine['kind']
