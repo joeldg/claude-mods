@@ -605,7 +605,8 @@ test('error lines a mod logs itself are counted; three in an hour mark it failin
 })
 
 test('the session says once what it is: who is at the prompt, where it draws, what started it; a surface attached later is a second line', async ($, on) => {
-  const w = world(on, { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' })
+  // The session id handed down is another session's: a hook of that one started this run.
+  const w = world(on, { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop', CLAUDE_CODE_SESSION_ID: 'aaaaaaaa-0000-4000-8000-00000000000a', CLAUDE_CODE_CHILD_SESSION: '1' })
   let surfaces: ('terminal' | 'desktop')[] = []
   on('session.surfaces', () => ({ value: surfaces }))
   await $.session.start({ cwd: `${HOME}/project`, surface: null, isInteractive: false })
@@ -616,7 +617,7 @@ test('the session says once what it is: who is at the prompt, where it draws, wh
   await w.clock.advance(60_000)
 
   expect(events(ownLines(w), 'mod-monitor', 'session')).toEqual([
-    expect.objectContaining({ interactive: false, surfaces: [], entrypoint: 'claude-desktop' }),
+    expect.objectContaining({ interactive: false, surfaces: [], entrypoint: 'claude-desktop', nested: true, child: true }),
     expect.objectContaining({ interactive: false, surfaces: ['desktop'], late: true }),
   ])
 })

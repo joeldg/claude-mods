@@ -1112,8 +1112,24 @@ async function surfacesNow($: Engine): Promise<string[]> {
 async function describeSession($: Engine, isInteractive: boolean) {
   try {
     const entrypoint = (await $.env.get('CLAUDE_CODE_ENTRYPOINT').catch(() => undefined)) || undefined
+    // A session's process hands its id to every process it starts: one that is not this session's own means another
+    // session's hook or Bash started this one.
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID').catch(() => undefined)) || ''
+    const own = await $.session.id().catch(() => '')
+    const nested = handed !== '' && own !== '' && handed !== own
+    const child = ((await $.env.get('CLAUDE_CODE_CHILD_SESSION').catch(() => undefined)) || '') === '1'
     const first = await surfacesNow($)
-    logEvent({ t: 'event', ts: now(), plugin: SELF, kind: 'session', interactive: isInteractive, surfaces: first, ...(entrypoint ? { entrypoint: keep(entrypoint, 40) } : {}) })
+    logEvent({
+      t: 'event',
+      ts: now(),
+      plugin: SELF,
+      kind: 'session',
+      interactive: isInteractive,
+      surfaces: first,
+      ...(entrypoint ? { entrypoint: keep(entrypoint, 40) } : {}),
+      nested,
+      child,
+    })
     $.clock.after(SURFACES_AGAIN_MS, () => {
       void surfacesNow($).then(later => {
         if (later.join(',') !== first.join(',')) {

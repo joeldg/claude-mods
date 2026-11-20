@@ -41,8 +41,10 @@ export type EventLine = EventBase &
     | { kind: 'command'; command: string; hasArgs: boolean; by: string }
     | { kind: 'register'; what: 'command' | 'tool'; name: string }
     // About the session, not a mod: whether a person is at the prompt, the surfaces it draws on (none for a `-p`
-    // run), what started it. `late` marks a reading a few seconds in that differs from the start's.
-    | { kind: 'session'; interactive: boolean; surfaces: string[]; entrypoint?: string; late?: true }
+    // run or a session no window shows), what started it. `nested`: another session's process started this one (its
+    // hook or its Bash ran `claude`), told by the session id that process handed down not being this session's own;
+    // `child`: the variable every such process is given is set. `late`: a reading a few seconds in that differs.
+    | { kind: 'session'; interactive: boolean; surfaces: string[]; entrypoint?: string; nested?: boolean; child?: boolean; late?: true }
   )
 
 export type EventKind = EventLine['kind']
