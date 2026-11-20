@@ -5,6 +5,7 @@ import {
   agoText,
   announce,
   coresContext,
+  coresBackToast,
   coresToast,
   criticalDenial,
   echoes,
@@ -348,27 +349,49 @@ test('parked performance cores show on the status line, in the report, and in wh
   expect(coresContext(parked)).toBe(
     'machine-guard: macOS is scheduling on 4 of 16 CPU cores right now (12 parked by its performance controller), so CPU-bound work runs slower than usual: size worker counts to 4 cores and tell the user if it matters.',
   )
-  expect(coresToast(parked)).toBe(
-    'macOS has parked 12 of 16 CPU cores: scheduling on 4 (kern.sched_recommended_cores = 15). CPU-bound work will crawl until it clears — check thermal pressure (sudo powermetrics --samplers thermal -n 1); a sleep/wake or reboot resets a stuck controller.',
+  expect(coresToast({ ...parked, gpuPct: 12 })).toBe(
+    'macOS has parked 12 of 16 CPU cores: scheduling on 4 (kern.sched_recommended_cores = 15). CPU-bound work will crawl until it clears. `pmset -g therm` shows a thermal limit when heat is the cause; a sleep/wake or reboot resets a controller stuck after the load is gone.',
   )
-  expect(coresToast(SNAPSHOT)).toBe('All 16 CPU cores are back.')
+  // A busy GPU is named: parkings have come and gone with a heavy GPU job, with no thermal warning.
+  expect(coresToast({ ...parked, gpuPct: 86 })).toContain(
+    'will crawl until it clears. The GPU is at 86%: cores have been parked like this while a heavy GPU job ran, with no thermal warning, and came back when it eased. `pmset -g therm`',
+  )
+  expect(coresBackToast(SNAPSHOT, { since: 950_000, parkings: 1, backSince: 1_040_000 }, 1_640_000)).toBe('All 16 CPU cores are back, and have stayed back for 10m.')
+  expect(coresBackToast(SNAPSHOT, { since: 950_000, parkings: 6, backSince: 7_250_000 }, 7_850_000)).toBe(
+    'All 16 CPU cores are back, and have stayed back for 10m. macOS parked them 6 times over 1h45m.',
+  )
 })
 
-test('the sampler toasts a parking once it has lasted long enough, its end once, and a critical episode once, recording each in the sample', () => {
+test('the sampler toasts a parking once it has lasted, and its end once the cores have stayed back: parkings in between are one spell; a critical episode once', () => {
   const parked: Snapshot = { ...SNAPSHOT, cpuRecommended: 4, cpuMask: 15, cpuParkedSince: 950_000 }
   // Fifty seconds in: nothing, and nothing recorded.
   expect(announce(parked, null, 1_000_000, true)).toEqual({ snapshot: parked, toasts: [] })
-  // A minute in: toasted, and the start recorded as toasted.
+  // A minute in: toasted, the start recorded as toasted, a spell opened.
   const told = announce({ ...parked, at: 1_010_000 }, parked, 1_010_000, true)
   expect(told.toasts).toEqual([coresToast(parked)])
   expect(told.snapshot.cpuToastedAt).toBe(950_000)
+  expect(told.snapshot.cpuSpell).toEqual({ since: 950_000, parkings: 1, backSince: null })
   // The next sample carries the record, whichever session takes it: nothing more.
   const later = announce({ ...parked, at: 1_025_000 }, told.snapshot, 1_025_000, true)
-  expect(later).toEqual({ snapshot: { ...parked, at: 1_025_000, cpuToastedAt: 950_000 }, toasts: [] })
-  // The cores back: toasted once, the record cleared; the sample after says nothing.
+  expect(later).toEqual({ snapshot: { ...parked, at: 1_025_000, cpuToastedAt: 950_000, cpuSpell: { since: 950_000, parkings: 1, backSince: null } }, toasts: [] })
+  // The cores back: not said yet, they may be parked again in a minute; the spell notes since when.
   const back = announce({ ...SNAPSHOT, at: 1_040_000 }, later.snapshot, 1_040_000, true)
-  expect(back).toEqual({ snapshot: { ...SNAPSHOT, at: 1_040_000 }, toasts: ['All 16 CPU cores are back.'] })
-  expect(announce({ ...SNAPSHOT, at: 1_055_000 }, back.snapshot, 1_055_000, true).toasts).toEqual([])
+  expect(back).toEqual({ snapshot: { ...SNAPSHOT, at: 1_040_000, cpuSpell: { since: 950_000, parkings: 1, backSince: 1_040_000 } }, toasts: [] })
+  // Parked again four minutes on: the same spell, counted and not toasted, however long it lasts.
+  const again: Snapshot = { ...parked, at: 1_280_000, cpuParkedSince: 1_280_000 }
+  const second = announce(again, back.snapshot, 1_280_000, true)
+  expect(second.toasts).toEqual([])
+  expect(second.snapshot.cpuSpell).toEqual({ since: 950_000, parkings: 2, backSince: null })
+  expect(announce({ ...again, at: 1_700_000 }, second.snapshot, 1_700_000, true).toasts).toEqual([])
+  // Back, and still back ten minutes later: said once, with the count; the sample after says nothing.
+  const home = announce({ ...SNAPSHOT, at: 1_760_000 }, second.snapshot, 1_760_000, true)
+  expect(home.toasts).toEqual([])
+  const settled = announce({ ...SNAPSHOT, at: 2_360_000 }, home.snapshot, 2_360_000, true)
+  expect(settled).toEqual({ snapshot: { ...SNAPSHOT, at: 2_360_000 }, toasts: ['All 16 CPU cores are back, and have stayed back for 10m. macOS parked them 2 times over 14m.'] })
+  expect(announce({ ...SNAPSHOT, at: 2_375_000 }, settled.snapshot, 2_375_000, true).toasts).toEqual([])
+  // A sample of an older build that toasted its parking carries no spell: one opens, and its end waits like any other.
+  const old = announce({ ...SNAPSHOT, at: 1_040_000 }, { ...parked, cpuToastedAt: 950_000 }, 1_040_000, true)
+  expect(old).toEqual({ snapshot: { ...SNAPSHOT, at: 1_040_000, cpuSpell: { since: 950_000, parkings: 1, backSince: 1_040_000 } }, toasts: [] })
   // A parking that ends before it was toasted ends in silence.
   expect(announce(SNAPSHOT, parked, 1_000_000, true).toasts).toEqual([])
 
@@ -388,14 +411,17 @@ test('the sampler toasts a parking once it has lasted long enough, its end once,
 
 test('with toastScope every, a session echoes what the sampler recorded since its own last sample', () => {
   const parked: Snapshot = { ...SNAPSHOT, cpuRecommended: 4, cpuMask: 15, cpuParkedSince: 950_000 }
-  const toldParked: Snapshot = { ...parked, cpuToastedAt: 950_000 }
+  const spell = { since: 950_000, parkings: 1, backSince: null }
+  const toldParked: Snapshot = { ...parked, cpuToastedAt: 950_000, cpuSpell: spell }
   expect(echoes(parked, null, true)).toEqual([])
-  // A session starting mid-episode, or one whose last sample was untold: the parking; the same record again: nothing.
+  // A session starting mid-spell, or one whose last sample was untold: the parking; the same spell again: nothing.
   expect(echoes(toldParked, null, true)).toEqual([coresToast(parked)])
   expect(echoes(toldParked, parked, true)).toEqual([coresToast(parked)])
   expect(echoes(toldParked, toldParked, true)).toEqual([])
-  // The return, only of a parking that was toasted.
-  expect(echoes(SNAPSHOT, toldParked, true)).toEqual(['All 16 CPU cores are back.'])
+  // The cores back inside the spell: nothing yet. The spell closed: its end, once.
+  const backInSpell: Snapshot = { ...SNAPSHOT, at: 1_040_000, cpuSpell: { ...spell, backSince: 1_040_000 } }
+  expect(echoes(backInSpell, toldParked, true)).toEqual([])
+  expect(echoes({ ...SNAPSHOT, at: 1_640_000 }, backInSpell, true)).toEqual(['All 16 CPU cores are back, and have stayed back for 10m.'])
   expect(echoes(SNAPSHOT, parked, true)).toEqual([])
   expect(echoes(SNAPSHOT, SNAPSHOT, true)).toEqual([])
   const critical: Snapshot = { ...SNAPSHOT, pressure: 'critical', level: 4, freePct: 6, memoryToastedAt: 1_000_000 }

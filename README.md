@@ -95,6 +95,8 @@ Memory, swap and GPU on the status line, a `machine_status` tool for Claude, and
 - Remote runs (`modal run`, `ssh`), tests (`pytest`) and installs are never treated as heavy.
 - Add your own heavy commands with the "Also heavy" setting (a regex), e.g. `overnight_|nightly_run\.sh`.
 - The "Who toasts" setting (`toastScope`) picks who shows the parked-cores and memory-critical toasts: `sampler` (default) — the session that took the sample, once per episode for the whole Mac; `every` — each open session, once per episode each (the behaviour before 0.4.0); `off` — none. The status line shows both regardless, and the guard's own toasts (a blocked job, a reservation) are not affected.
+- **Parked cores are told as a spell.** A parking that has lasted (a minute with half the cores gone, five otherwise) is toasted once; if the cores come back and are parked again within ten minutes, as they are every few minutes under a long GPU job, that is the same spell and nothing more is toasted until they have stayed back ten minutes: then one toast says so, and how often they were parked. Two afternoons of such flapping had raised 31 toasts. The toast names the GPU's load when it is busy (those parkings came with the GPU near 85% and no thermal warning from macOS) and points at `pmset -g therm` to tell heat from that.
+- A session another session's process started (a hook's `claude -p`, say) does not sample, toast or set a status line; a heavy job it starts is still checked.
 
 ## mod-monitor
 

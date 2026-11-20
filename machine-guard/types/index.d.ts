@@ -2,6 +2,9 @@ export type Pressure = 'normal' | 'warn' | 'critical'
 
 export type AppMemory = { name: string; gb: number }
 
+/** A spell of core parkings: when the first toasted one began, how many parkings so far, and since when the cores are back (null while parked). */
+export type CpuSpell = { since: number; parkings: number; backSince: number | null }
+
 export type Snapshot = {
   at: number
   pressure: Pressure
@@ -39,6 +42,12 @@ export type Snapshot = {
    */
   cpuToastedAt: number | null
   memoryToastedAt: number | null
+  /**
+   * The spell of parkings the Mac was told of, while it lasts: a parking that was toasted opens it, a parking that
+   * comes back before the cores have stayed back a while is counted in it and not toasted, and it closes, with one
+   * toast, once they have stayed back. Absent when none is open, and in a sample an older build wrote.
+   */
+  cpuSpell?: CpuSpell | null
   /** The apps holding the most memory, helpers summed into their app, from the last process table; [] when none is fresh. */
   top: AppMemory[]
   /** When that table was taken, and when one was last tried: ps runs on demand or under pressure, at most once a minute. */

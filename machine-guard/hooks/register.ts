@@ -369,6 +369,23 @@ async function machineStatus($: Engine): Promise<string> {
   return statusReport(snapshot, reservation, paused, now, { sampleMs: config.sampleMs, intervalMs, blockOnCritical: config.blockOnCritical })
 }
 
+/**
+ * Whether another session's process started this one (its hook or its Bash ran `claude`): the engine hands every
+ * process a session starts CLAUDE_CODE_CHILD_SESSION=1 and that session's id. A desktop session reads as a `-p` run in
+ * every other way (no person at the prompt, no surface until a window shows it), so this is what tells them apart.
+ */
+async function isNested($: Engine): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) === '1') {
+      return true
+    }
+    const handed = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+    return handed !== '' && handed !== (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
 export const register: Register = (on, options) => {
   let extra: RegExp | null = null
   try {
@@ -405,6 +422,11 @@ export const register: Register = (on, options) => {
     await $.tool
       .register({ name: 'machine_status', description: TOOL_DESCRIPTION, inputSchema: { type: 'object', properties: {} }, isDeferred: false })
       .catch(error => $.ui.log(`machine-guard: the machine_status tool did not register: ${String(error)}`, { to: 'debug' }))
+    // A session another session's process started (a hook's `claude -p`) does not sample or toast; a heavy job it starts
+    // is still checked, and that starts its sampling.
+    if (await isNested($)) {
+      return next(e)
+    }
     const now = await $.clock.now()
     const reservation = await readReservation($, now)
     if (reservation) {

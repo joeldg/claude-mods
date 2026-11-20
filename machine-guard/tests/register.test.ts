@@ -58,7 +58,7 @@ const vmStat = (freePct: number): string => {
 }
 
 /** Answers the host beneath the plugin: macOS probes, files, the session, toasts, the status line and the log. */
-const world = (on: On, clock: MockClock): World => {
+const world = (on: On, clock: MockClock, env: Record<string, string> = {}): World => {
   const w: World = {
     level: 1,
     freePct: 40,
@@ -76,7 +76,7 @@ const world = (on: On, clock: MockClock): World => {
     probeAt: [],
     ran: [],
   }
-  mock.env(on, { HOME })
+  mock.env(on, { HOME, ...env })
   on('process.run', async (_$, e) => {
     // The CPU read is a second sysctl call, told apart by its keys and recorded as `cores`.
     const command = e.argv[0] === 'sysctl' && e.argv.includes('hw.ncpu') ? 'cores' : (e.argv[0] ?? '')
@@ -116,7 +116,8 @@ const world = (on: On, clock: MockClock): World => {
     w.tools.push(e)
     return { value: { tool: `mcp__machine-guard__${e.name}` } }
   })
-  on('tool.check', () => ({ decision: 'ask' as const }))
+  // A Bash call is allowed: the kit denies one that is asked about with no one there to answer.
+  on('tool.check', (_$, e) => ({ decision: e.tool === 'Bash' ? ('allow' as const) : ('ask' as const) }))
   on('ui.toast', (_$, e) => {
     w.toasts.push(e.text)
     return { value: undefined }
@@ -151,7 +152,15 @@ const shared = (w: World) =>
     ttlMs: number
     probeMs: number
     n: number
-    data: { at: number; pressure: string; gpuPct: number | null; cpuParkedSince: number | null; cpuToastedAt: number | null; memoryToastedAt: number | null }
+    data: {
+      at: number
+      pressure: string
+      gpuPct: number | null
+      cpuParkedSince: number | null
+      cpuToastedAt: number | null
+      cpuSpell?: { since: number; parkings: number; backSince: number | null }
+      memoryToastedAt: number | null
+    }
   } | null
 
 type Outcome = { deny?: string; isError?: boolean; text?: string }
@@ -214,6 +223,7 @@ const writtenBy = (w: World, clock: MockClock, other: Other) => {
     cpuMask: other.mask,
     cpuParkedSince: other.parkedSince,
     cpuToastedAt: other.cpuToastedAt,
+    ...(other.cpuToastedAt === null ? {} : { cpuSpell: { since: other.cpuToastedAt, parkings: 1, backSince: null } }),
     memoryToastedAt: other.memoryToastedAt ?? null,
     top: [],
     topAt: null,
@@ -233,7 +243,7 @@ const follow = async (w: World, clock: MockClock, count: number, other: Other) =
 }
 
 const parkedToasts = (w: World) => w.toasts.filter(text => text.startsWith('macOS has parked'))
-const backToasts = (w: World) => w.toasts.filter(text => text === 'All 16 CPU cores are back.')
+const backToasts = (w: World) => w.toasts.filter(text => text.startsWith('All 16 CPU cores are back'))
 const memoryToasts = (w: World) => w.toasts.filter(text => text.startsWith('Memory critical'))
 
 test('refuses a heavy job while memory is critical and lets light commands through', SLOW, async ($, on) => {
@@ -560,7 +570,8 @@ test('machine_status gives the model the numbers, the verdict and the biggest ap
   expect(spec).toMatchObject({ name: 'machine_status', isDeferred: false, inputSchema: { type: 'object', properties: {} } })
   expect(spec?.description).toMatch(/instead of .*ps.*top.*vm_stat.*memory_pressure.*project scripts/)
   expect(await $.tool.check({ tool: TOOL, input: {} })).toMatchObject({ decision: 'allow' })
-  expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })).decision).toBe('ask')
+  // Another tool's check is left as it came (the world allows Bash, so one it asks about).
+  expect((await $.tool.check({ tool: 'Write', input: { file_path: '/tmp/x', content: 'x' } })).decision).toBe('ask')
 
   const first = await callTool($, { tool: TOOL })
   expect(first.result).toBe(
@@ -642,17 +653,28 @@ test('parked performance cores show on the status line and toast once per episod
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91% · CPU 6/16 cores')
   expect(parked()).toHaveLength(1)
 
-  // All cores back: one toast, and the segment leaves the status line.
+  // All cores back: the segment leaves the status line; the toast waits until they have stayed back.
   w.mask = 65535
   await clock.advance(15_000)
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91%')
-  expect(w.toasts.filter(text => text === 'All 16 CPU cores are back.')).toHaveLength(1)
+  expect(backToasts(w)).toHaveLength(0)
 
-  // Parked again: a new episode, a new toast once it has lasted a minute.
+  // Parked again within minutes, as under a long GPU job: the same spell, no second toast however long it lasts.
   w.mask = 15
-  await clock.advance(60_000)
+  await clock.advance(75_000)
   expect(parked()).toHaveLength(1)
+
+  // Back, and still back ten minutes later: said once, with how often they were parked.
+  w.mask = 65535
+  await clock.advance(10 * 60_000)
+  expect(backToasts(w)).toHaveLength(0)
   await clock.advance(15_000)
+  expect(backToasts(w)).toHaveLength(1)
+  expect(backToasts(w)[0]).toMatch(/^All 16 CPU cores are back, and have stayed back for 10m\. macOS parked them 2 times over \d+m\.$/)
+
+  // A parking after the spell is over is a new one: toasted once it has lasted a minute.
+  w.mask = 15
+  await clock.advance(75_000)
   expect(parked()).toHaveLength(2)
 })
 
@@ -676,7 +698,7 @@ test('a mild parking is shown at once but toasted only once it has lasted five m
   await start($, clock)
   expect(w.statuses.at(-1)).toBe('RAM 40% free · swap 7.8/8G · GPU 91% · CPU 12/16 cores')
   const parked = () => w.toasts.filter(text => text.startsWith('macOS has parked'))
-  const back = () => w.toasts.filter(text => text === 'All 16 CPU cores are back.')
+  const back = () => w.toasts.filter(text => text.startsWith('All 16 CPU cores are back'))
   expect(parked()).toHaveLength(0)
 
   // A blip that clears within a sample toasts nothing, coming or going.
@@ -684,7 +706,7 @@ test('a mild parking is shown at once but toasted only once it has lasted five m
   await clock.advance(15_000)
   expect(back()).toHaveLength(0)
 
-  // Parked again and staying: the toast comes once five minutes have passed, and the return is then announced.
+  // Parked again and staying: the toast comes once five minutes have passed; the return once the cores have stayed back ten.
   w.mask = 15615
   await clock.advance(15_000)
   await clock.advance(4 * 60_000)
@@ -694,7 +716,9 @@ test('a mild parking is shown at once but toasted only once it has lasted five m
   expect(parked()[0]).toMatch(/^macOS has parked 4 of 16 CPU cores: scheduling on 12 /)
   w.mask = 65535
   await clock.advance(15_000)
-  expect(back()).toHaveLength(1)
+  expect(back()).toHaveLength(0)
+  await clock.advance(10 * 60_000)
+  expect(back()).toEqual(['All 16 CPU cores are back, and have stayed back for 10m.'])
 })
 
 test("following another session's pace is logged once per change of pace, never per adopted sample", SLOW, async ($, on) => {
@@ -774,7 +798,7 @@ test('a session adopting another session’s sample never toasts the cores: the 
   expect(w.statuses.at(-1)).toBe('RAM 21% free · swap 16.7/18G · GPU 3%')
 })
 
-test('a sampler taking over mid-episode does not toast a parking already toasted, and toasts the cores’ return once', SLOW, async ($, on) => {
+test('a sampler taking over mid-spell does not toast a parking already toasted, and toasts the cores’ return once they have stayed back', SLOW, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const w = world(on, clock)
   w.mask = 15
@@ -793,13 +817,16 @@ test('a sampler taking over mid-episode does not toast a parking already toasted
   await clock.advance(15_000)
   expect(w.toasts).toEqual([])
 
-  // The cores come back: toasted once, by this session now, and the record cleared.
+  // The cores come back: said once they have stayed back ten minutes, by this session now, and the spell closed.
   w.mask = 65535
   await clock.advance(15_000)
-  expect(w.toasts).toEqual(['All 16 CPU cores are back.'])
-  expect(shared(w)).toMatchObject({ data: { cpuParkedSince: null, cpuToastedAt: null } })
+  expect(w.toasts).toEqual([])
+  expect(shared(w)).toMatchObject({ data: { cpuParkedSince: null, cpuToastedAt: null, cpuSpell: { since: 900_000, parkings: 1 } } })
+  await clock.advance(10 * 60_000)
+  expect(w.toasts).toEqual(['All 16 CPU cores are back, and have stayed back for 10m.'])
+  expect(shared(w)?.data.cpuSpell).toBeUndefined()
   await clock.advance(15_000)
-  expect(w.toasts).toEqual(['All 16 CPU cores are back.'])
+  expect(w.toasts).toHaveLength(1)
 })
 
 test('a parking the old sampler had not toasted yet is toasted once by the new one, a minute after the start it recorded', SLOW, async ($, on) => {
@@ -852,6 +879,8 @@ test('toastScope every: each session toasts the parking and the return once, fol
   expect(parkedToasts(w)).toHaveLength(2)
   w.mask = 65535
   await clock.advance(15_000)
+  expect(backToasts(w)).toHaveLength(1)
+  await clock.advance(10 * 60_000)
   expect(backToasts(w)).toHaveLength(2)
 })
 
@@ -900,4 +929,25 @@ test('critical memory is toasted once per episode by the sampler alone: a follow
   await clock.advance(15_000)
   await clock.advance(15_000)
   expect(w.toasts).toHaveLength(1)
+})
+
+test("a session another session's process started does not sample or toast; a heavy job it starts is still checked", SLOW, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // What the engine hands every process a session starts.
+  const w = world(on, clock, { CLAUDE_CODE_CHILD_SESSION: '1' })
+  w.mask = 15
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }))
+  await $.session.start({ cwd: `${HOME}/app`, surface: null, isInteractive: false })
+  await clock.settle()
+  await clock.advance(5 * 60_000)
+  expect(w.probes).toEqual([])
+  expect(w.statuses).toEqual([])
+  expect(w.toasts).toEqual([])
+
+  // The guard itself still stands: a heavy job is checked against a sample taken then.
+  w.level = 4
+  w.freePct = 4
+  const ran = await callTool($, { tool: 'Bash', command: '.venv/bin/python -m experiments.coarse_model.train --epochs 3' })
+  expect(ran.deny).toMatch(/^machine-guard: memory pressure is critical/)
+  expect(w.probes.length).toBeGreaterThan(0)
 })

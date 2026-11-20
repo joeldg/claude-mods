@@ -1,4 +1,4 @@
-import type { AppMemory, Pressure, Reservation, SampleLock, SharedSample, Snapshot } from '../types'
+import type { AppMemory, CpuSpell, Pressure, Reservation, SampleLock, SharedSample, Snapshot } from '../types'
 
 /** Unused memory below this share is tight; below CRITICAL_BELOW_PCT with the swap this full, critical. */
 export const TIGHT_BELOW_PCT = 20
@@ -59,6 +59,10 @@ export const parseCores = (output: string): { cpuTotal: number; cpuRecommended: 
  */
 export const SEVERE_TOAST_MS = 60_000
 export const PARKED_TOAST_MS = 5 * 60_000
+/** How long the cores must stay back before a spell of parkings is over: parkings under a long GPU job come and go every few minutes. */
+export const BACK_QUIET_MS = 10 * 60_000
+/** From here the GPU is busy enough to be named beside a parking. */
+export const GPU_BUSY_PCT = 70
 
 /** Whether macOS is scheduling on fewer CPUs than the Mac has: the performance cores parked. */
 export const isParked = (snapshot: Snapshot | null): boolean =>
@@ -196,6 +200,7 @@ export const parseShared = (text: string | null): SharedSample | null => {
         cpuMask: numberOrNull(data.cpuMask),
         cpuParkedSince: numberOrNull(data.cpuParkedSince),
         cpuToastedAt: numberOrNull(data.cpuToastedAt),
+        cpuSpell: spellOf(data.cpuSpell) ?? undefined,
         memoryToastedAt: numberOrNull(data.memoryToastedAt),
         top: Array.isArray(data.top) ? data.top.filter(isAppMemory) : [],
         topAt: numberOrNull(data.topAt),
@@ -443,12 +448,35 @@ export const coresContext = (snapshot: Snapshot): string =>
   `machine-guard: macOS is scheduling on ${snapshot.cpuRecommended} of ${snapshot.cpuTotal} CPU cores right now (${(snapshot.cpuTotal ?? 0) - (snapshot.cpuRecommended ?? 0)} parked by its performance controller), ` +
   `so CPU-bound work runs slower than usual: size worker counts to ${snapshot.cpuRecommended} cores and tell the user if it matters.`
 
-/** The toast when the cores are parked, or back. */
+/**
+ * The toast when a parking has lasted: how many cores are gone, the GPU's load when it is busy (parkings have come
+ * and gone with a heavy GPU job, macOS recording no thermal warning), and what tells heat from that.
+ */
 export const coresToast = (snapshot: Snapshot): string =>
-  isParked(snapshot)
-    ? `macOS has parked ${(snapshot.cpuTotal ?? 0) - (snapshot.cpuRecommended ?? 0)} of ${snapshot.cpuTotal} CPU cores: scheduling on ${snapshot.cpuRecommended} (kern.sched_recommended_cores = ${snapshot.cpuMask}). ` +
-      'CPU-bound work will crawl until it clears — check thermal pressure (sudo powermetrics --samplers thermal -n 1); a sleep/wake or reboot resets a stuck controller.'
-    : `All ${snapshot.cpuTotal} CPU cores are back.`
+  `macOS has parked ${(snapshot.cpuTotal ?? 0) - (snapshot.cpuRecommended ?? 0)} of ${snapshot.cpuTotal} CPU cores: scheduling on ${snapshot.cpuRecommended} (kern.sched_recommended_cores = ${snapshot.cpuMask}). ` +
+  'CPU-bound work will crawl until it clears. ' +
+  (snapshot.gpuPct !== null && snapshot.gpuPct >= GPU_BUSY_PCT
+    ? `The GPU is at ${snapshot.gpuPct}%: cores have been parked like this while a heavy GPU job ran, with no thermal warning, and came back when it eased. `
+    : '') +
+  '`pmset -g therm` shows a thermal limit when heat is the cause; a sleep/wake or reboot resets a controller stuck after the load is gone.'
+
+/** The toast that ends a spell: the cores have stayed back, and how often they were parked when it was more than once. */
+export const coresBackToast = (snapshot: Snapshot, spell: CpuSpell, now: number): string => {
+  const backSince = spell.backSince ?? now
+  return (
+    `All ${snapshot.cpuTotal} CPU cores are back, and have stayed back for ${formatLeft(now - backSince)}.` +
+    (spell.parkings > 1 ? ` macOS parked them ${spell.parkings} times over ${formatLeft(backSince - spell.since)}.` : '')
+  )
+}
+
+/** A spell as a shared sample holds it, or null when the field is missing or malformed. */
+const spellOf = (value: unknown): CpuSpell | null => {
+  if (typeof value !== 'object' || value === null) {
+    return null
+  }
+  const { since, parkings, backSince } = value as Record<string, unknown>
+  return typeof since === 'number' && typeof parkings === 'number' ? { since, parkings, backSince: typeof backSince === 'number' ? backSince : null } : null
+}
 
 export const warnContext = (snapshot: Snapshot): string =>
   `machine-guard: memory is tight on this Mac (${figures(snapshot)}). Avoid starting more heavy jobs in parallel; prefer running one at a time.`
@@ -480,15 +508,29 @@ export const announce = (snapshot: Snapshot, last: Snapshot | null, now: number,
     toasts.push(memoryToast(snapshot, isBlocking))
   }
   let cpuToastedAt = last !== null && isParkingToasted(last) && last.cpuParkedSince === snapshot.cpuParkedSince ? snapshot.cpuParkedSince : null
+  // The spell the last sample carries; a sample of an older build that toasted its parking opens one here.
+  let spell: CpuSpell | null = last?.cpuSpell ?? (last !== null && isParkingToasted(last) ? { since: last.cpuParkedSince ?? last.at, parkings: 1, backSince: null } : null)
   if (isParked(snapshot)) {
-    if (cpuToastedAt === null && shouldAnnounceParked(snapshot, now)) {
-      cpuToastedAt = snapshot.cpuParkedSince
-      toasts.push(coresToast(snapshot))
+    if (spell === null) {
+      if (shouldAnnounceParked(snapshot, now)) {
+        cpuToastedAt = snapshot.cpuParkedSince
+        spell = { since: snapshot.cpuParkedSince ?? snapshot.at, parkings: 1, backSince: null }
+        toasts.push(coresToast(snapshot))
+      }
+    } else if (spell.backSince !== null) {
+      // Parked again before the cores had stayed back: the same spell, counted and not toasted again.
+      spell = { ...spell, parkings: spell.parkings + 1, backSince: null }
     }
-  } else if (snapshot.cpuTotal !== null && last !== null && isParkingToasted(last)) {
-    toasts.push(coresToast(snapshot))
+  } else if (spell !== null && snapshot.cpuTotal !== null) {
+    const backSince = spell.backSince ?? snapshot.at
+    if (now - backSince >= BACK_QUIET_MS) {
+      toasts.push(coresBackToast(snapshot, spell, now))
+      spell = null
+    } else {
+      spell = { ...spell, backSince }
+    }
   }
-  return { snapshot: { ...snapshot, cpuToastedAt, memoryToastedAt }, toasts }
+  return { snapshot: { ...snapshot, cpuToastedAt, memoryToastedAt, cpuSpell: spell ?? undefined }, toasts }
 }
 
 /**
@@ -500,12 +542,15 @@ export const echoes = (snapshot: Snapshot, previous: Snapshot | null, isBlocking
   if (snapshot.memoryToastedAt !== null && snapshot.memoryToastedAt !== previous?.memoryToastedAt) {
     toasts.push(memoryToast(snapshot, isBlocking))
   }
-  if (isParkingToasted(snapshot)) {
-    if (snapshot.cpuToastedAt !== previous?.cpuToastedAt) {
+  const spell = snapshot.cpuSpell ?? null
+  const before = previous?.cpuSpell ?? null
+  if (spell !== null) {
+    // A spell this session has not shown yet, while the cores are parked.
+    if (spell.since !== before?.since && isParked(snapshot)) {
       toasts.push(coresToast(snapshot))
     }
-  } else if (!isParked(snapshot) && snapshot.cpuTotal !== null && previous !== null && isParkingToasted(previous)) {
-    toasts.push(coresToast(snapshot))
+  } else if (before !== null && !isParked(snapshot) && snapshot.cpuTotal !== null) {
+    toasts.push(coresBackToast(snapshot, before, snapshot.at))
   }
   return toasts
 }
